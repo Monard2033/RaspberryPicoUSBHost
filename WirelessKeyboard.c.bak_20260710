@@ -1,0 +1,216 @@
+
+#include <stdio.h>
+#include <string.h>
+#include "pico/stdlib.h"
+#include "hardware/clocks.h"
+#include "hardware/spi.h"
+#include "hardware/gpio.h"
+#include "bsp/board_api.h"
+#include "tusb.h"
+#include "host/usbh.h"
+#include "pio_usb.h"
+
+/*--------------------------------------------------------------------+
+ *  Pin assignments
+ *--------------------------------------------------------------------*/
+#define USB_HOST_DP_PIN   4   // D+  (D- is forced to DP_PIN + 1 = GP5 by the lib)
+
+#define SPI_PORT          spi0
+#define SPI_BAUD_HZ       4000000
+#define PIN_SPI_SCK       18
+#define PIN_SPI_MOSI      19
+#define PIN_SPI_MISO      16   // not used by the protocol, wired for completeness
+#define PIN_SPI_CSN       17
+
+#define KBD_REPORT_LEN    8    // boot report: modifier, reserved, key1..key6
+
+/*--------------------------------------------------------------------+
+ *  Shared state between the USB HID callback and the main loop
+ *--------------------------------------------------------------------*/
+static volatile uint8_t  kbd_report[KBD_REPORT_LEN];
+static volatile bool     report_dirty = false;
+static uint8_t           kbd_dev_addr = 0;
+static uint8_t           kbd_instance = 0;
+
+enum { BLINK_NOT_MOUNTED = 250, BLINK_MOUNTED = 1000, BLINK_SUSPENDED = 2500 };
+static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
+
+/*--------------------------------------------------------------------+
+ *  SPI master bridge to the nRF52840 (SPI slave)
+ *--------------------------------------------------------------------*/
+static void spi_master_init(void)
+{
+    spi_init(SPI_PORT, SPI_BAUD_HZ);
+    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+
+    gpio_set_function(PIN_SPI_SCK,  GPIO_FUNC_SPI);
+    gpio_set_function(PIN_SPI_MOSI, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_SPI_MISO, GPIO_FUNC_SPI);
+
+    // CSN is driven manually (not by the SPI peripheral) so we control exact
+    // frame boundaries the nRF SPIS peripheral can latch on.
+    gpio_init(PIN_SPI_CSN);
+    gpio_set_dir(PIN_SPI_CSN, GPIO_OUT);
+    gpio_put(PIN_SPI_CSN, 1);
+
+    printf("[SPI] Master init: %d Hz, SCK=%d MOSI=%d MISO=%d CSN=%d\n",
+           SPI_BAUD_HZ, PIN_SPI_SCK, PIN_SPI_MOSI, PIN_SPI_MISO, PIN_SPI_CSN);
+}
+
+static void spi_send_report(const uint8_t *report8)
+{
+    gpio_put(PIN_SPI_CSN, 0);
+    sleep_us(5);   // let the nRF SPIS latch CSN before clocking starts
+    spi_write_blocking(SPI_PORT, report8, KBD_REPORT_LEN);
+    sleep_us(2);
+    gpio_put(PIN_SPI_CSN, 1);
+}
+
+/* Called every loop iteration; only actually transfers when the report
+ * changed, so idle time produces no SPI traffic (and no nRF wake events). */
+static void spi_bridge_task(void)
+{
+    if (!report_dirty) return;
+
+    uint8_t snapshot[KBD_REPORT_LEN];
+    uint32_t irq = save_and_disable_interrupts();
+    memcpy(snapshot, (const void *)kbd_report, KBD_REPORT_LEN);
+    report_dirty = false;
+    restore_interrupts(irq);
+
+    spi_send_report(snapshot);
+
+    printf("[SPI TX] mod=%02x res=%02x keys=%02x %02x %02x %02x %02x %02x\n",
+           snapshot[0], snapshot[1], snapshot[2], snapshot[3],
+           snapshot[4], snapshot[5], snapshot[6], snapshot[7]);
+}
+
+/*--------------------------------------------------------------------+
+ *  USB HID host callbacks
+ *--------------------------------------------------------------------*/
+void tuh_mount_cb(uint8_t dev_addr)
+{
+    printf("\n*** DEVICE MOUNTED: addr=%u ***\n", dev_addr);
+    blink_interval_ms = BLINK_MOUNTED;
+
+    tusb_desc_device_t desc;
+    if (tuh_descriptor_get_device_sync(dev_addr, &desc, sizeof(desc)) == PICO_ERROR_NONE) {
+        printf("[MOUNT] VID=0x%04x PID=0x%04x\n", desc.idVendor, desc.idProduct);
+    }
+}
+
+void tuh_umount_cb(uint8_t dev_addr)
+{
+    printf("\n*** DEVICE UNMOUNTED: addr=%u ***\n", dev_addr);
+    blink_interval_ms = BLINK_NOT_MOUNTED;
+    if (dev_addr == kbd_dev_addr) kbd_dev_addr = 0;
+}
+
+void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
+                      uint8_t const *desc_report, uint16_t desc_len)
+{
+    uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+    printf("\n[HID] MOUNTED dev=%u inst=%u protocol=%s\n", dev_addr, instance,
+           itf_protocol == HID_ITF_PROTOCOL_KEYBOARD ? "KEYBOARD" :
+           itf_protocol == HID_ITF_PROTOCOL_MOUSE    ? "MOUSE"    : "NONE");
+    (void) desc_report; (void) desc_len;
+
+    if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
+        kbd_dev_addr = dev_addr;
+        kbd_instance = instance;
+
+        // Force BOOT protocol: guarantees a fixed 8-byte report with no
+        // report ID prefix (mod, reserved, key1..key6), matching what the
+        // nRF/receiver expect. Without this, some keyboards send REPORT
+        // protocol with a different, descriptor-defined layout.
+        if (!tuh_hid_set_protocol(dev_addr, instance, HID_PROTOCOL_BOOT)) {
+            printf("[HID] WARNING: failed to force boot protocol\n");
+        }
+    }
+
+    if (!tuh_hid_receive_report(dev_addr, instance)) {
+        printf("[ERROR] Failed to arm HID receive for dev=%u inst=%u\n", dev_addr, instance);
+    }
+}
+
+void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
+{
+    printf("[HID] UNMOUNTED dev=%u inst=%u\n", dev_addr, instance);
+    if (dev_addr == kbd_dev_addr && instance == kbd_instance) kbd_dev_addr = 0;
+}
+
+/* Invoked automatically once tuh_hid_set_protocol() completes. */
+void tuh_hid_set_protocol_complete_cb(uint8_t dev_addr, uint8_t instance, uint8_t protocol)
+{
+    printf("[HID] Protocol set complete: dev=%u inst=%u protocol=%u\n",
+           dev_addr, instance, protocol);
+}
+
+void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
+                                uint8_t const *report, uint16_t len)
+{
+    if (dev_addr == kbd_dev_addr && instance == kbd_instance && len >= KBD_REPORT_LEN) {
+        // Boot protocol keyboard report: report[0] IS the modifier byte,
+        // there is no report-ID prefix to skip.
+        uint32_t irq = save_and_disable_interrupts();
+        memcpy((void *)kbd_report, report, KBD_REPORT_LEN);
+        report_dirty = true;
+        restore_interrupts(irq);
+    }
+
+    // Re-arm the endpoint for the next report regardless of type.
+    if (!tuh_hid_receive_report(dev_addr, instance)) {
+        printf("[ERROR] Failed to re-arm receive for dev=%u inst=%u\n", dev_addr, instance);
+    }
+}
+
+/*--------------------------------------------------------------------+
+ *  LED task (link/mount status heartbeat)
+ *--------------------------------------------------------------------*/
+static void led_blinking_task(void)
+{
+    static uint32_t start_ms = 0;
+    static bool led_state = false;
+    if (!blink_interval_ms) return;
+    if (board_millis() - start_ms < blink_interval_ms) return;
+    start_ms += blink_interval_ms;
+    board_led_write(led_state);
+    led_state = !led_state;
+}
+
+/*--------------------------------------------------------------------+
+ *  MAIN
+ *--------------------------------------------------------------------*/
+int main(void)
+{
+    // PIO-USB requires the system clock to be a multiple that its internal
+    // PIO state machine timing depends on. MUST be set before board_init().
+    set_sys_clock_khz(120000, true);
+
+    board_init();
+    stdio_init_all();
+    sleep_ms(100);
+
+    printf("\n=== RP2040 USB HID HOST (PIO-USB) -> SPI BRIDGE ===\n");
+    printf("D+ = GP%d, D- = GP%d (forced D+ + 1)\n", USB_HOST_DP_PIN, USB_HOST_DP_PIN + 1);
+
+    // Configure Pico-PIO-USB as the RHPORT1 host driver. No manual GPIO
+    // pull-up on D+: the library owns line-state management, and a manual
+    // pull-up here actively conflicts with host-mode signalling.
+    pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+    pio_cfg.pin_dp = USB_HOST_DP_PIN;
+    tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
+
+    printf("[INIT] Initializing TinyUSB Host Stack (RHPORT %d, PIO-USB)...\n", BOARD_TUH_RHPORT);
+    tuh_init(BOARD_TUH_RHPORT);
+
+    spi_master_init();
+
+    printf("[INIT] Ready. Waiting for keyboard on D+/D-...\n\n");
+
+    while (1) {
+        tuh_task();
+        led_blinking_task();
+        spi_bridge_task();
+    }
+}
