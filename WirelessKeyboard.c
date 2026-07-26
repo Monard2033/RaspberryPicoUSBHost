@@ -17,13 +17,17 @@
 #define USB_HOST_DP_PIN   4   // D+  (D- is forced to DP_PIN + 1 = GP5 by the lib)
 
 #define SPI_PORT          spi0
-#define SPI_BAUD_HZ       4000000
+#define SPI_BAUD_HZ       8000000
 #define PIN_SPI_SCK       6    // SPI0 SCK  -> nRF P0.17
 #define PIN_SPI_MOSI      7    // SPI0 TX   -> nRF P0.20
 #define PIN_SPI_MISO      8    // unused (link is write-only); wire only -> nRF P0.08
 #define PIN_SPI_CSN       9    // manual GPIO -> nRF P0.22 (SPIS CSN)
 
 #define KBD_REPORT_LEN    8    // boot report: modifier, reserved, key1..key6
+#define HID_KEY_A         0x04
+#define HID_KEY_D         0x07
+#define HID_KEY_S         0x16
+#define HID_KEY_W         0x1A
 
 // --- Battery (read locally, RP2040 is the sole "brain" for this) --------
 #define PIN_BATT_ADC      28   // GP28 = ADC2. Battery divider tap goes here.
@@ -42,20 +46,37 @@
 #define LED_PWM_WRAP      255   // 8-bit duty resolution
 
 #ifndef SPI_LINK_TEST_MODE
-#define SPI_LINK_TEST_MODE 0
+#define SPI_LINK_TEST_MODE 0   /* 1 = send 0xAA+counter pattern every 1s (diagnostic only) */
+#endif
+
+#ifndef HOT_PATH_DEBUG
+#define HOT_PATH_DEBUG    0   /* Per-report UART logging breaks 1 kHz operation. */
+#endif
+
+#ifndef PERIODIC_DEBUG
+#define PERIODIC_DEBUG    0   /* Runtime UART summaries also pause USB servicing. */
+#endif
+
+#ifndef NULL_MOVEMENT_ENABLED
+#define NULL_MOVEMENT_ENABLED 1 /* Last-input-wins for A/D and W/S. */
 #endif
 
 /*--------------------------------------------------------------------+
- *  Shared state between the USB HID callback and the main loop
+ *  USB keyboard state
  *--------------------------------------------------------------------*/
-static volatile uint8_t  kbd_report[KBD_REPORT_LEN];
-static volatile bool     report_dirty = false;
 static uint8_t           kbd_dev_addr = 0;
 static uint8_t           kbd_instance = 0;
 static bool              kbd_is_mounted = false;
+static uint8_t           previous_physical_report[KBD_REPORT_LEN];
+static uint8_t           previous_output_report[KBD_REPORT_LEN];
+static uint8_t           active_ad_key;
+static uint8_t           active_ws_key;
+static bool              previous_physical_valid;
+static bool              previous_output_valid;
 
 static uint32_t total_hid_reports_received = 0;
 static uint32_t total_spi_frames_sent      = 0;
+static uint32_t total_output_reports_sent  = 0;
 
 enum { BLINK_NOT_MOUNTED = 250, BLINK_MOUNTED = 1000, BLINK_SUSPENDED = 2500 };
 static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
@@ -88,20 +109,24 @@ static void spi_master_init(void)
 
 static void spi_send_report(const uint8_t *report8)
 {
-    uint32_t t0 = time_us_32();
+#if HOT_PATH_DEBUG
+    uint32_t const t0 = time_us_32();
+#endif
 
     gpio_put(PIN_SPI_CSN, 0);
-    sleep_us(5);
+    sleep_us(1);
     spi_write_blocking(SPI_PORT, report8, KBD_REPORT_LEN);
-    sleep_us(2);
+    sleep_us(1);
     gpio_put(PIN_SPI_CSN, 1);
 
-    uint32_t dt_us = time_us_32() - t0;
     total_spi_frames_sent++;
+#if HOT_PATH_DEBUG
+    uint32_t const dt_us = time_us_32() - t0;
     printf("[SPI TX #%lu] took %lu us | bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
            (unsigned long)total_spi_frames_sent, (unsigned long)dt_us,
            report8[0], report8[1], report8[2], report8[3],
            report8[4], report8[5], report8[6], report8[7]);
+#endif
 }
 
 #if SPI_LINK_TEST_MODE
@@ -119,21 +144,132 @@ static void spi_link_test_task(void)
 }
 #endif
 
-static void spi_bridge_task(void)
+static bool report_has_key(const uint8_t report[KBD_REPORT_LEN], uint8_t key)
 {
-#if SPI_LINK_TEST_MODE
-    spi_link_test_task();
+    for (uint8_t i = 2; i < KBD_REPORT_LEN; ++i) {
+        if (report[i] == key) return true;
+    }
+    return false;
+}
+
+static void null_movement_reset(void)
+{
+    memset(previous_physical_report, 0, sizeof(previous_physical_report));
+    memset(previous_output_report, 0, sizeof(previous_output_report));
+    active_ad_key = 0;
+    active_ws_key = 0;
+    previous_physical_valid = false;
+    previous_output_valid = false;
+}
+
+static uint8_t select_last_input_key(bool first_now, bool second_now,
+                                     bool first_pressed, bool second_pressed,
+                                     uint8_t first_key, uint8_t second_key,
+                                     uint8_t previous_active)
+{
+    if (first_pressed != second_pressed) {
+        return first_pressed ? first_key : second_key;
+    }
+    if (first_now && second_now) {
+        if (previous_active == first_key || previous_active == second_key) {
+            return previous_active;
+        }
+        /* Both arrived in one USB poll, so their physical order is unknowable. */
+        return second_key;
+    }
+    if (first_now) return first_key;
+    if (second_now) return second_key;
+    return 0;
+}
+
+static void append_key_once(uint8_t output[KBD_REPORT_LEN],
+                            uint8_t *output_index, uint8_t key)
+{
+    if (key == 0 || *output_index >= KBD_REPORT_LEN) return;
+
+    for (uint8_t i = 2; i < *output_index; ++i) {
+        if (output[i] == key) return;
+    }
+    output[(*output_index)++] = key;
+}
+
+/*
+ * Implements the attached AutoHotkey script in firmware. Physical state and
+ * output state are kept separately: the most recently pressed key wins while
+ * both opposites are held, and releasing it restores the still-held key.
+ */
+static void filter_null_movement(const uint8_t input[KBD_REPORT_LEN],
+                                 uint8_t output[KBD_REPORT_LEN])
+{
+#if !NULL_MOVEMENT_ENABLED
+    memcpy(output, input, KBD_REPORT_LEN);
     return;
+#else
+    bool const a_now = report_has_key(input, HID_KEY_A);
+    bool const d_now = report_has_key(input, HID_KEY_D);
+    bool const w_now = report_has_key(input, HID_KEY_W);
+    bool const s_now = report_has_key(input, HID_KEY_S);
+    bool const a_before = previous_physical_valid &&
+                          report_has_key(previous_physical_report, HID_KEY_A);
+    bool const d_before = previous_physical_valid &&
+                          report_has_key(previous_physical_report, HID_KEY_D);
+    bool const w_before = previous_physical_valid &&
+                          report_has_key(previous_physical_report, HID_KEY_W);
+    bool const s_before = previous_physical_valid &&
+                          report_has_key(previous_physical_report, HID_KEY_S);
+
+    active_ad_key = select_last_input_key(a_now, d_now,
+                                         a_now && !a_before,
+                                         d_now && !d_before,
+                                         HID_KEY_A, HID_KEY_D, active_ad_key);
+    active_ws_key = select_last_input_key(w_now, s_now,
+                                         w_now && !w_before,
+                                         s_now && !s_before,
+                                         HID_KEY_W, HID_KEY_S, active_ws_key);
+
+    memset(output, 0, KBD_REPORT_LEN);
+    output[0] = input[0];
+    output[1] = input[1];
+    uint8_t output_index = 2;
+
+    for (uint8_t i = 2; i < KBD_REPORT_LEN; ++i) {
+        uint8_t const key = input[i];
+
+        if ((key == HID_KEY_A || key == HID_KEY_D) && key != active_ad_key) {
+            continue;
+        }
+        if ((key == HID_KEY_W || key == HID_KEY_S) && key != active_ws_key) {
+            continue;
+        }
+        append_key_once(output, &output_index, key);
+    }
+
+    memcpy(previous_physical_report, input, KBD_REPORT_LEN);
+    previous_physical_valid = true;
 #endif
-    if (!report_dirty) return;
+}
 
-    uint8_t snapshot[KBD_REPORT_LEN];
-    uint32_t irq = save_and_disable_interrupts();
-    memcpy(snapshot, (const void *)kbd_report, KBD_REPORT_LEN);
-    report_dirty = false;
-    restore_interrupts(irq);
+static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN])
+{
+    uint8_t output[KBD_REPORT_LEN];
 
-    spi_send_report(snapshot);
+    filter_null_movement(input, output);
+    if (previous_output_valid &&
+        memcmp(output, previous_output_report, KBD_REPORT_LEN) == 0) {
+        return;
+    }
+
+    spi_send_report(output);
+    memcpy(previous_output_report, output, KBD_REPORT_LEN);
+    previous_output_valid = true;
+    total_output_reports_sent++;
+
+#if HOT_PATH_DEBUG
+    printf("[HID->SPI #%lu] %02x %02x %02x %02x %02x %02x %02x %02x\n",
+           (unsigned long)total_output_reports_sent,
+           output[0], output[1], output[2], output[3],
+           output[4], output[5], output[6], output[7]);
+#endif
 }
 
 /*--------------------------------------------------------------------+
@@ -185,20 +321,26 @@ static void led_off(void)
 {
     led_mode = LED_OFF_MODE;
     led_apply(0, 0, 0);
+#if PERIODIC_DEBUG
     printf("[LED] OFF\n");
+#endif
 }
 
 static void led_solid(uint8_t r, uint8_t g, uint8_t b)
 {
     led_mode = LED_SOLID;
     led_apply(r ? LED_PWM_WRAP : 0, g ? LED_PWM_WRAP : 0, b ? LED_PWM_WRAP : 0);
+#if PERIODIC_DEBUG
     printf("[LED] SOLID r=%u g=%u b=%u\n", r, g, b);
+#endif
 }
 
 static void led_start(enum led_mode m, uint8_t r, uint8_t g, uint8_t b)
 {
     led_mode = m; led_r_on = r; led_g_on = g; led_b_on = b;
+#if PERIODIC_DEBUG
     printf("[LED] %s r=%u g=%u b=%u\n", m == LED_BLINK ? "BLINK" : "BREATHE", r, g, b);
+#endif
 }
 
 /* Non-blocking ticker: advances the active animation. Call every loop. */
@@ -262,8 +404,10 @@ static int battery_read(bool *charging)
     if (pct < 0)   pct = 0;
     if (pct > 100) pct = 100;
 
+#if PERIODIC_DEBUG
     printf("[BATT] raw=%u pin_mv=%lu batt_mv=%lu pct=%d charging=%d\n",
            raw, (unsigned long)pin_mv, (unsigned long)batt_mv, pct, *charging);
+#endif
     return pct;
 }
 
@@ -279,7 +423,17 @@ static void battery_boot_display(void)
     uint8_t r, g, b;
     battery_color_for_pct((uint8_t)pct, &r, &g, &b);
     led_solid(r, g, b);
-    sleep_ms(3000);
+
+    /*
+     * Keep servicing the USB host during the three-second battery display.
+     * A blocking sleep here used to leave an already connected keyboard
+     * unanswered immediately after boot.
+     */
+    absolute_time_t const display_end = make_timeout_time_ms(3000);
+    while (absolute_time_diff_us(get_absolute_time(), display_end) > 0) {
+        tuh_task();
+        tight_loop_contents();
+    }
 
     if (pct < BATT_LOW_PCT) led_start(LED_BLINK, 1, 0, 0);
     else                    led_off();
@@ -320,6 +474,7 @@ static void battery_task(void)
  *--------------------------------------------------------------------*/
 static void status_task(void)
 {
+#if PERIODIC_DEBUG
     static uint32_t last_print_ms = 0;
     uint32_t now = board_millis();
     if (now - last_print_ms < 3000) return;
@@ -329,6 +484,7 @@ static void status_task(void)
            (unsigned long)(now / 1000), kbd_is_mounted, kbd_dev_addr,
            (unsigned long)total_hid_reports_received,
            (unsigned long)total_spi_frames_sent);
+#endif
 }
 
 /*--------------------------------------------------------------------+
@@ -376,7 +532,14 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
 {
     printf("[HID] UNMOUNTED dev=%u inst=%u\n", dev_addr, instance);
-    if (dev_addr == kbd_dev_addr && instance == kbd_instance) { kbd_dev_addr = 0; kbd_is_mounted = false; }
+    if (dev_addr == kbd_dev_addr && instance == kbd_instance) {
+        uint8_t const released[KBD_REPORT_LEN] = { 0 };
+
+        spi_send_report(released);
+        null_movement_reset();
+        kbd_dev_addr = 0;
+        kbd_is_mounted = false;
+    }
 }
 
 void tuh_hid_set_protocol_complete_cb(uint8_t dev_addr, uint8_t instance, uint8_t protocol)
@@ -391,16 +554,16 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
     total_hid_reports_received++;
 
     if (dev_addr == kbd_dev_addr && instance == kbd_instance && len >= KBD_REPORT_LEN) {
-        uint32_t irq = save_and_disable_interrupts();
-        memcpy((void *)kbd_report, report, KBD_REPORT_LEN);
-        report_dirty = true;
-        restore_interrupts(irq);
+        forward_keyboard_report(report);
+#if HOT_PATH_DEBUG
         printf("[HID RX #%lu] mod=%02x res=%02x keys=%02x %02x %02x %02x %02x %02x\n",
                (unsigned long)total_hid_reports_received,
                report[0], report[1], report[2], report[3],
                report[4], report[5], report[6], report[7]);
+#endif
     }
 
+    /* Re-arm immediately; no UART output is allowed before this at 1 kHz. */
     if (!tuh_hid_receive_report(dev_addr, instance)) {
         printf("[HID][ERROR] Failed to re-arm receive for dev=%u inst=%u\n", dev_addr, instance);
     }
@@ -451,9 +614,11 @@ int main(void)
 
     while (1) {
         tuh_task();
+#if SPI_LINK_TEST_MODE
+        spi_link_test_task();
+#endif
         led_blinking_task();
         led_tick_task();
-        spi_bridge_task();
         battery_task();
         status_task();
     }

@@ -45,9 +45,9 @@
                 "-f",
                 "interface/cmsis-dap.cfg",
                 "-f",
-                "target/${command:raspberry-pi-pico.getTarget}.cfg",
+                "${workspaceFolder}/.vscode/rp2040-fixed.cfg",
                 "-c",
-                "adapter speed 5000; program \"${command:raspberry-pi-pico.launchTargetPath}\" verify reset exit"
+                "adapter speed 1000; program \"${command:raspberry-pi-pico.launchTargetPath}\" verify reset exit"
             ],
             "problemMatcher": [],
             "windows": {
