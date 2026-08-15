@@ -28,22 +28,35 @@
 #define HID_KEY_D         0x07
 #define HID_KEY_S         0x16
 #define HID_KEY_W         0x1A
+#define HID_KEY_CAPS_LOCK   0x39
+#define HID_KEY_SCROLL_LOCK 0x47
+#define HID_KEY_NUM_LOCK    0x53
+
+#define HID_LED_NUM_LOCK    0x01
+#define HID_LED_CAPS_LOCK   0x02
+#define HID_LED_SCROLL_LOCK 0x04
 
 // --- Battery (read locally, RP2040 is the sole "brain" for this) --------
 #define PIN_BATT_ADC      28   // GP28 = ADC2. Battery divider tap goes here.
 #define BATT_ADC_INPUT    2    // adc_select_input() channel matching GP28
-#define PIN_CHRG          27   // TP4056 CHRG pin (open-drain, LOW = charging)
 #define BATT_DIVIDER_RATIO 3   // Vbat--200k--node--100k--GND: node=Vbat/3
 #define BATT_MIN_MV        3430
 #define BATT_MAX_MV        4200
-#define BATT_LOW_PCT       20
-#define BATT_CHECK_MS      30000   // re-check battery every 30s
+#define BATT_CHECK_MS      1000
+#define BATT_BOOT_SHOW_MS  5000
+#define BATT_PULSE_WINDOW_MS 2000
+#define BATT_PULSE_PERIOD_MS 1000
+#define BATT_CHARGE_RISE_MV  12
+#define BATT_UNPLUG_DROP_MV  20
+#define BATT_ONE_PERCENT_MV   8
+#define BATT_TREND_SAMPLES    3
 
 // --- RGB LED, driven locally by RP2040 PWM, 3 consecutive free pins -----
 #define PIN_LED_R         10
 #define PIN_LED_G         11
 #define PIN_LED_B         12
 #define LED_PWM_WRAP      255   // 8-bit duty resolution
+#define LED_COMMON_ANODE  0     // 0 = common cathode to GND, 1 = common anode to 3V3
 
 #ifndef SPI_LINK_TEST_MODE
 #define SPI_LINK_TEST_MODE 0   /* 1 = send 0xAA+counter pattern every 1s (diagnostic only) */
@@ -73,6 +86,15 @@ static uint8_t           active_ad_key;
 static uint8_t           active_ws_key;
 static bool              previous_physical_valid;
 static bool              previous_output_valid;
+
+/* Locally simulated keyboard lock state. The radio protocol remains the
+ * original 8-byte, keyboard-to-dongle-only path. */
+static uint8_t           keyboard_led_state;
+static uint8_t           keyboard_led_tx_value;
+static uint8_t           keyboard_lock_pressed;
+static bool              keyboard_led_update_pending;
+static bool              keyboard_led_transfer_active;
+static uint32_t          keyboard_led_retry_after_ms;
 
 static uint32_t total_hid_reports_received = 0;
 static uint32_t total_spi_frames_sent      = 0;
@@ -150,6 +172,68 @@ static bool report_has_key(const uint8_t report[KBD_REPORT_LEN], uint8_t key)
         if (report[i] == key) return true;
     }
     return false;
+}
+
+static void keyboard_led_reset(void)
+{
+    keyboard_led_state = 0;
+    keyboard_led_tx_value = 0;
+    keyboard_lock_pressed = 0;
+    keyboard_led_update_pending = true;
+    keyboard_led_transfer_active = false;
+    keyboard_led_retry_after_ms = 0;
+}
+
+static void keyboard_led_toggle_on_press(
+    const uint8_t input[KBD_REPORT_LEN])
+{
+    static const struct {
+        uint8_t key;
+        uint8_t led;
+    } lock_keys[] = {
+        { HID_KEY_NUM_LOCK,    HID_LED_NUM_LOCK },
+        { HID_KEY_CAPS_LOCK,   HID_LED_CAPS_LOCK },
+        { HID_KEY_SCROLL_LOCK, HID_LED_SCROLL_LOCK },
+    };
+
+    uint8_t pressed_now = 0;
+
+    for (size_t i = 0; i < sizeof(lock_keys) / sizeof(lock_keys[0]); ++i) {
+        if (report_has_key(input, lock_keys[i].key)) {
+            pressed_now |= lock_keys[i].led;
+        }
+        if ((pressed_now & lock_keys[i].led) != 0 &&
+            (keyboard_lock_pressed & lock_keys[i].led) == 0) {
+            keyboard_led_state ^= lock_keys[i].led;
+            keyboard_led_update_pending = true;
+#if PERIODIC_DEBUG
+            printf("[KBD LED] local state=0x%02x\n", keyboard_led_state);
+#endif
+        }
+    }
+
+    keyboard_lock_pressed = pressed_now;
+}
+
+/* SET_REPORT is a control transfer, so keep its one-byte buffer alive and
+ * submit it from the main loop rather than from the input-report callback. */
+static void keyboard_led_task(void)
+{
+    if (!kbd_is_mounted || !keyboard_led_update_pending ||
+        keyboard_led_transfer_active ||
+        (int32_t)(board_millis() - keyboard_led_retry_after_ms) < 0) {
+        return;
+    }
+
+    keyboard_led_tx_value = keyboard_led_state;
+    if (tuh_hid_set_report(kbd_dev_addr, kbd_instance, 0,
+                           HID_REPORT_TYPE_OUTPUT,
+                           &keyboard_led_tx_value,
+                           sizeof(keyboard_led_tx_value))) {
+        keyboard_led_transfer_active = true;
+    } else {
+        keyboard_led_retry_after_ms = board_millis() + 100;
+    }
 }
 
 static void null_movement_reset(void)
@@ -253,6 +337,7 @@ static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN])
 {
     uint8_t output[KBD_REPORT_LEN];
 
+    keyboard_led_toggle_on_press(input);
     filter_null_movement(input, output);
     if (previous_output_valid &&
         memcmp(output, previous_output_report, KBD_REPORT_LEN) == 0) {
@@ -273,16 +358,16 @@ static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN])
 }
 
 /*--------------------------------------------------------------------+
- *  RGB LED engine — fully local to RP2040, PWM on GP10/11/12.
- *  Modes: OFF / SOLID / BLINK / BREATHE, same behaviour as before,
- *  just driven directly instead of relayed over SPI.
+ *  RGB battery LED — fully local to RP2040, PWM on GP10/11/12.
  *--------------------------------------------------------------------*/
-enum led_mode { LED_OFF_MODE, LED_SOLID, LED_BLINK, LED_BREATHE };
-static enum led_mode led_mode = LED_OFF_MODE;
-static uint8_t led_r_on, led_g_on, led_b_on;   /* which channels are active for this mode */
+struct rgb_color {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+};
 
 static uint slice_r, slice_g, slice_b;
-static uint chan_r,  chan_g,  chan_b;
+static uint chan_r, chan_g, chan_b;
 
 static void led_pwm_init(void)
 {
@@ -300,9 +385,10 @@ static void led_pwm_init(void)
     pwm_set_wrap(slice_r, LED_PWM_WRAP);
     pwm_set_wrap(slice_g, LED_PWM_WRAP);
     pwm_set_wrap(slice_b, LED_PWM_WRAP);
-    pwm_set_chan_level(slice_r, chan_r, 0);
-    pwm_set_chan_level(slice_g, chan_g, 0);
-    pwm_set_chan_level(slice_b, chan_b, 0);
+    uint8_t const off_level = LED_COMMON_ANODE ? LED_PWM_WRAP : 0;
+    pwm_set_chan_level(slice_r, chan_r, off_level);
+    pwm_set_chan_level(slice_g, chan_g, off_level);
+    pwm_set_chan_level(slice_b, chan_b, off_level);
     pwm_set_enabled(slice_r, true);
     pwm_set_enabled(slice_g, true);
     pwm_set_enabled(slice_b, true);
@@ -310,163 +396,223 @@ static void led_pwm_init(void)
     printf("[LED] PWM init OK: R=GP%d G=GP%d B=GP%d\n", PIN_LED_R, PIN_LED_G, PIN_LED_B);
 }
 
-static void led_apply(uint8_t r_duty, uint8_t g_duty, uint8_t b_duty)
+static uint8_t led_pwm_level(uint8_t brightness)
 {
-    pwm_set_chan_level(slice_r, chan_r, r_duty);
-    pwm_set_chan_level(slice_g, chan_g, g_duty);
-    pwm_set_chan_level(slice_b, chan_b, b_duty);
+#if LED_COMMON_ANODE
+    return LED_PWM_WRAP - brightness;
+#else
+    return brightness;
+#endif
+}
+
+static void led_apply(struct rgb_color color)
+{
+    pwm_set_chan_level(slice_r, chan_r, led_pwm_level(color.r));
+    pwm_set_chan_level(slice_g, chan_g, led_pwm_level(color.g));
+    pwm_set_chan_level(slice_b, chan_b, led_pwm_level(color.b));
 }
 
 static void led_off(void)
 {
-    led_mode = LED_OFF_MODE;
-    led_apply(0, 0, 0);
-#if PERIODIC_DEBUG
-    printf("[LED] OFF\n");
-#endif
+    led_apply((struct rgb_color) { 0, 0, 0 });
 }
 
-static void led_solid(uint8_t r, uint8_t g, uint8_t b)
+static struct rgb_color battery_color_for_pct(uint8_t pct)
 {
-    led_mode = LED_SOLID;
-    led_apply(r ? LED_PWM_WRAP : 0, g ? LED_PWM_WRAP : 0, b ? LED_PWM_WRAP : 0);
-#if PERIODIC_DEBUG
-    printf("[LED] SOLID r=%u g=%u b=%u\n", r, g, b);
-#endif
-}
-
-static void led_start(enum led_mode m, uint8_t r, uint8_t g, uint8_t b)
-{
-    led_mode = m; led_r_on = r; led_g_on = g; led_b_on = b;
-#if PERIODIC_DEBUG
-    printf("[LED] %s r=%u g=%u b=%u\n", m == LED_BLINK ? "BLINK" : "BREATHE", r, g, b);
-#endif
-}
-
-/* Non-blocking ticker: advances the active animation. Call every loop. */
-static void led_tick_task(void)
-{
-    static uint32_t last_tick_ms = 0;
-    static int phase = 0;   // 0..99
-
-    if (led_mode != LED_BLINK && led_mode != LED_BREATHE) return;
-
-    uint32_t now = board_millis();
-    if (now - last_tick_ms < 30) return;
-    last_tick_ms = now;
-
-    phase = (phase + 4) % 100;
-
-    if (led_mode == LED_BLINK) {
-        uint8_t on = (phase < 50) ? LED_PWM_WRAP : 0;
-        led_apply(led_r_on ? on : 0, led_g_on ? on : 0, led_b_on ? on : 0);
-    } else { // LED_BREATHE
-        int lvl = (phase < 50) ? phase : (100 - phase);       // triangle 0..50
-        uint8_t duty = (uint8_t)((lvl * LED_PWM_WRAP) / 50);
-        led_apply(led_r_on ? duty : 0, led_g_on ? duty : 0, led_b_on ? duty : 0);
-    }
-}
-
-static void battery_color_for_pct(uint8_t pct, uint8_t *r, uint8_t *g, uint8_t *b)
-{
-    if (pct >= 70)      { *r = 0; *g = 1; *b = 0; }   // green  70-100
-    else if (pct >= 30) { *r = 1; *g = 1; *b = 0; }   // yellow 30-70
-    else                { *r = 1; *g = 0; *b = 0; }   // red    1-30
+    if (pct >= 75) return (struct rgb_color) { 0, 255, 0 };   // green
+    if (pct >= 50) return (struct rgb_color) { 255, 255, 0 }; // yellow
+    if (pct >= 25) return (struct rgb_color) { 255, 80, 0 };  // orange
+    return (struct rgb_color) { 255, 0, 0 };                  // red
 }
 
 /*--------------------------------------------------------------------+
- *  Battery measurement — local ADC read, no devicetree, no SPI relay.
+ *  Battery measurement/state machine — local ADC only, no radio data.
  *--------------------------------------------------------------------*/
+enum battery_led_state {
+    BATT_LED_BOOT,
+    BATT_LED_IDLE,
+    BATT_LED_CHARGING,
+    BATT_LED_FULL,
+    BATT_LED_UNPLUG_SHOW,
+};
+
+static enum battery_led_state battery_led_state = BATT_LED_BOOT;
+static uint32_t battery_state_started_ms;
+static uint32_t battery_last_check_ms;
+static uint32_t battery_filtered_mv;
+static uint32_t battery_trend_reference_mv;
+static uint32_t battery_charge_peak_mv;
+static uint8_t battery_pct;
+static uint8_t battery_rise_samples;
+static uint8_t battery_drop_samples;
+static bool battery_charge_detected_during_boot;
+
 static void battery_adc_init(void)
 {
     adc_init();
     adc_gpio_init(PIN_BATT_ADC);
     adc_select_input(BATT_ADC_INPUT);
 
-    gpio_init(PIN_CHRG);
-    gpio_set_dir(PIN_CHRG, GPIO_IN);
-    gpio_pull_up(PIN_CHRG);
-
-    printf("[BATT] ADC init OK on GP%d (input %d), CHRG on GP%d\n",
-           PIN_BATT_ADC, BATT_ADC_INPUT, PIN_CHRG);
+    printf("[BATT] ADC init OK on GP%d (input %d)\n",
+           PIN_BATT_ADC, BATT_ADC_INPUT);
 }
 
-static int battery_read(bool *charging)
+static uint32_t battery_read_mv(void)
 {
     adc_select_input(BATT_ADC_INPUT);
-    uint16_t raw = adc_read();                       // 12-bit: 0-4095
-    uint32_t pin_mv = (uint32_t)raw * 3300 / 4095;    // RP2040 ADC ref = 3.3V
-    uint32_t batt_mv = pin_mv * BATT_DIVIDER_RATIO;
+    uint32_t raw_sum = 0;
 
-    *charging = (gpio_get(PIN_CHRG) == 0);            // TP4056 CHRG low = charging
+    for (uint8_t i = 0; i < 16; ++i) {
+        raw_sum += adc_read();
+    }
 
-    int pct = ((int)batt_mv - BATT_MIN_MV) * 100 / (BATT_MAX_MV - BATT_MIN_MV);
-    if (pct < 0)   pct = 0;
-    if (pct > 100) pct = 100;
+    uint32_t const raw_average = raw_sum / 16;
+    uint32_t const pin_mv = raw_average * 3300 / 4095;
+    return pin_mv * BATT_DIVIDER_RATIO;
+}
+
+static uint8_t battery_pct_for_mv(uint32_t batt_mv)
+{
+    if (batt_mv <= BATT_MIN_MV) return 0;
+    if (batt_mv >= BATT_MAX_MV) return 100;
+    return (uint8_t)((batt_mv - BATT_MIN_MV) * 100 /
+                     (BATT_MAX_MV - BATT_MIN_MV));
+}
+
+static void battery_update_led(uint32_t now)
+{
+    struct rgb_color const color = battery_color_for_pct(battery_pct);
+
+    switch (battery_led_state) {
+    case BATT_LED_BOOT:
+    case BATT_LED_FULL:
+    case BATT_LED_UNPLUG_SHOW:
+        led_apply(color);
+        break;
+    case BATT_LED_CHARGING:
+        /* Exactly two ON/OFF cycles in every two-second animation window. */
+        if (((now - battery_state_started_ms) % BATT_PULSE_WINDOW_MS) %
+             BATT_PULSE_PERIOD_MS < (BATT_PULSE_PERIOD_MS / 2)) {
+            led_apply(color);
+        } else {
+            led_off();
+        }
+        break;
+    case BATT_LED_IDLE:
+    default:
+        led_off();
+        break;
+    }
+}
+
+static void battery_start_display(void)
+{
+    uint32_t const initial_mv = battery_read_mv();
+
+    battery_filtered_mv = initial_mv;
+    battery_trend_reference_mv = initial_mv;
+    battery_charge_peak_mv = initial_mv;
+    battery_pct = battery_pct_for_mv(initial_mv);
+    battery_state_started_ms = board_millis();
+    battery_last_check_ms = battery_state_started_ms;
+    battery_led_state = BATT_LED_BOOT;
+    battery_update_led(battery_state_started_ms);
 
 #if PERIODIC_DEBUG
-    printf("[BATT] raw=%u pin_mv=%lu batt_mv=%lu pct=%d charging=%d\n",
-           raw, (unsigned long)pin_mv, (unsigned long)batt_mv, pct, *charging);
+    printf("[BATT] boot mv=%lu pct=%u\n",
+           (unsigned long)initial_mv, battery_pct);
 #endif
-    return pct;
 }
 
-/* Boot display (Logitech-style): solid battery color for 3s, then settle
- * into the ongoing policy (off / blink-low / breathe-charging). */
-static void battery_boot_display(void)
+static void battery_sample_task(uint32_t now)
 {
-    bool charging;
-    int pct = battery_read(&charging);
+    if (now - battery_last_check_ms < BATT_CHECK_MS) return;
+    battery_last_check_ms = now;
 
-    if (charging) { led_start(LED_BREATHE, 0, 1, 0); return; }
+    uint32_t const sample_mv = battery_read_mv();
+    battery_filtered_mv = (battery_filtered_mv * 3 + sample_mv) / 4;
+    battery_pct = battery_pct_for_mv(battery_filtered_mv);
 
-    uint8_t r, g, b;
-    battery_color_for_pct((uint8_t)pct, &r, &g, &b);
-    led_solid(r, g, b);
-
-    /*
-     * Keep servicing the USB host during the three-second battery display.
-     * A blocking sleep here used to leave an already connected keyboard
-     * unanswered immediately after boot.
-     */
-    absolute_time_t const display_end = make_timeout_time_ms(3000);
-    while (absolute_time_diff_us(get_absolute_time(), display_end) > 0) {
-        tuh_task();
-        tight_loop_contents();
+    if (battery_filtered_mv > battery_charge_peak_mv) {
+        battery_charge_peak_mv = battery_filtered_mv;
     }
 
-    if (pct < BATT_LOW_PCT) led_start(LED_BLINK, 1, 0, 0);
-    else                    led_off();
+    if (battery_led_state == BATT_LED_FULL) {
+        if (battery_pct <= 99 &&
+            battery_filtered_mv + BATT_ONE_PERCENT_MV <= BATT_MAX_MV) {
+            if (++battery_drop_samples >= BATT_TREND_SAMPLES) {
+                battery_led_state = BATT_LED_UNPLUG_SHOW;
+                battery_state_started_ms = now;
+                battery_drop_samples = 0;
+            }
+        } else {
+            battery_drop_samples = 0;
+        }
+        return;
+    }
+
+    if (battery_led_state == BATT_LED_CHARGING) {
+        if (battery_pct >= 100) {
+            battery_led_state = BATT_LED_FULL;
+            battery_state_started_ms = now;
+            battery_drop_samples = 0;
+        } else if (battery_filtered_mv + BATT_UNPLUG_DROP_MV <
+                   battery_charge_peak_mv) {
+            if (++battery_drop_samples >= BATT_TREND_SAMPLES) {
+                battery_led_state = BATT_LED_IDLE;
+                battery_state_started_ms = now;
+                battery_trend_reference_mv = battery_filtered_mv;
+                battery_rise_samples = 0;
+                battery_drop_samples = 0;
+            }
+        } else {
+            battery_drop_samples = 0;
+        }
+        return;
+    }
+
+    if (battery_filtered_mv >=
+        battery_trend_reference_mv + BATT_CHARGE_RISE_MV) {
+        if (++battery_rise_samples >= BATT_TREND_SAMPLES) {
+            if (battery_led_state == BATT_LED_BOOT) {
+                battery_charge_detected_during_boot = true;
+            } else {
+                battery_led_state = battery_pct >= 100 ?
+                    BATT_LED_FULL : BATT_LED_CHARGING;
+                battery_state_started_ms = now;
+            }
+            battery_charge_peak_mv = battery_filtered_mv;
+            battery_rise_samples = 0;
+        }
+    } else {
+        battery_rise_samples = 0;
+        /* Follow slow discharge downward without following noise upward. */
+        if (battery_filtered_mv < battery_trend_reference_mv) {
+            battery_trend_reference_mv = battery_filtered_mv;
+        }
+    }
 }
 
-/* Periodic re-check: only changes the LED when the state actually flips
- * (charging started/stopped, crossed the low-battery threshold). */
 static void battery_task(void)
 {
-    static uint32_t last_check_ms = 0;
-    static bool     first_run = true;
-    static bool     was_charging = false;
-    static bool     was_low = false;
+    uint32_t const now = board_millis();
 
-    uint32_t now = board_millis();
-    if (!first_run && (now - last_check_ms < BATT_CHECK_MS)) return;
-    last_check_ms = now;
-    first_run = false;
+    battery_sample_task(now);
 
-    bool charging;
-    int pct = battery_read(&charging);
-    bool low = (pct < BATT_LOW_PCT);
-
-    if (charging) {
-        if (!was_charging) led_start(LED_BREATHE, 0, 1, 0);
-    } else if (low) {
-        if (!was_low || was_charging) led_start(LED_BLINK, 1, 0, 0);
-    } else if (was_charging || was_low) {
-        led_off();
+    if (battery_led_state == BATT_LED_BOOT &&
+        now - battery_state_started_ms >= BATT_BOOT_SHOW_MS) {
+        battery_led_state = battery_charge_detected_during_boot ?
+            (battery_pct >= 100 ? BATT_LED_FULL : BATT_LED_CHARGING) :
+            BATT_LED_IDLE;
+        battery_state_started_ms = now;
+    } else if (battery_led_state == BATT_LED_UNPLUG_SHOW &&
+               now - battery_state_started_ms >= BATT_BOOT_SHOW_MS) {
+        battery_led_state = BATT_LED_IDLE;
+        battery_state_started_ms = now;
+        battery_trend_reference_mv = battery_filtered_mv;
     }
 
-    was_charging = charging;
-    was_low = low;
+    battery_update_led(now);
 }
 
 /*--------------------------------------------------------------------+
@@ -520,6 +666,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
         kbd_dev_addr = dev_addr;
         kbd_instance = instance;
         kbd_is_mounted = true;
+        keyboard_led_reset();
         if (!tuh_hid_set_protocol(dev_addr, instance, HID_PROTOCOL_BOOT)) {
             printf("[HID] WARNING: failed to force boot protocol\n");
         }
@@ -537,8 +684,29 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
 
         spi_send_report(released);
         null_movement_reset();
+        keyboard_led_transfer_active = false;
+        keyboard_led_update_pending = false;
         kbd_dev_addr = 0;
         kbd_is_mounted = false;
+    }
+}
+
+void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
+                                    uint8_t report_id, uint8_t report_type,
+                                    uint16_t len)
+{
+    if (dev_addr != kbd_dev_addr || instance != kbd_instance ||
+        report_id != 0 || report_type != HID_REPORT_TYPE_OUTPUT) {
+        return;
+    }
+
+    keyboard_led_transfer_active = false;
+    if (len == sizeof(keyboard_led_tx_value) &&
+        keyboard_led_tx_value == keyboard_led_state) {
+        keyboard_led_update_pending = false;
+    } else {
+        keyboard_led_update_pending = true;
+        keyboard_led_retry_after_ms = board_millis() + 100;
     }
 }
 
@@ -607,8 +775,8 @@ int main(void)
     led_pwm_init();
     battery_adc_init();
 
-    printf("[INIT] Sending boot battery display...\n");
-    battery_boot_display();
+    printf("[INIT] Starting 5-second battery display...\n");
+    battery_start_display();
 
     printf("[INIT] Ready. Waiting for keyboard on D+/D-...\n\n");
 
@@ -618,7 +786,7 @@ int main(void)
         spi_link_test_task();
 #endif
         led_blinking_task();
-        led_tick_task();
+        keyboard_led_task();
         battery_task();
         status_task();
     }
