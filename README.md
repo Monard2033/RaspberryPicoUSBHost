@@ -23,11 +23,16 @@ transmitter over SPI.
 | GP7 | P0.20 | SPI MOSI, RP2040 to nRF |
 | GP8 | P0.08 | SPI MISO, reserved; unused by the current write-only protocol |
 | GP9 | P0.22 | SPI CSN, driven low for each 8-byte frame |
-| VSYS | VCC / RAW / VIN | nRF power from the Pico board |
+| VSYS | RAW / VIN only | Use only when the nRF board has an onboard input regulator |
+| 3V3(OUT) | 3V3 / VCC direct supply | Use for a direct 3.3 V nRF52840 supply pin |
 | GND | GND | Common ground |
 
 Keep all data-side grounds common: USB converter GND to RP2040 GND, and
 RP2040 GND to nRF52840 GND.
+
+Never connect a 5 V VSYS/VBUS rail to a direct nRF52840 `3V3` or `VCC` pin.
+Choose exactly one nRF power row above according to the transmitter board's
+schematic; do not connect both power inputs at the same time.
 
 ### Battery monitor and 4-pin RGB LED
 
