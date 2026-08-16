@@ -1030,9 +1030,20 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
     total_hid_reports_received++;
 
 #if CONSUMER_DEBUG
-    printf("[HID RAW] dev=%u inst=%u len=%u:", dev_addr, instance, len);
-    for (uint16_t i = 0; i < len; ++i) printf(" %02x", report[i]);
-    printf("\n");
+    static uint8_t previous_raw[CFG_TUH_HID][64];
+    static uint16_t previous_raw_len[CFG_TUH_HID];
+    bool const raw_changed = instance >= CFG_TUH_HID || len > 64 ||
+        previous_raw_len[instance] != len ||
+        memcmp(previous_raw[instance], report, len) != 0;
+    if (raw_changed) {
+        printf("[HID RAW] dev=%u inst=%u len=%u:", dev_addr, instance, len);
+        for (uint16_t i = 0; i < len; ++i) printf(" %02x", report[i]);
+        printf("\n");
+        if (instance < CFG_TUH_HID && len <= 64) {
+            memcpy(previous_raw[instance], report, len);
+            previous_raw_len[instance] = len;
+        }
+    }
 #endif
 
     struct hid_instance_state const *state =
