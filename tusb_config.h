@@ -69,7 +69,7 @@
 #endif
 
 //------------- CLASS DRIVERS -------------//
-#define CFG_TUH_HID           1
+#define CFG_TUH_HID           4   // multiple HID interfaces on one composite keyboard
 #define CFG_TUH_CDC           0
 #define CFG_TUH_MSC           0
 #define CFG_TUH_MIDI          0

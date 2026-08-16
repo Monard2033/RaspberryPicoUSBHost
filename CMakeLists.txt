@@ -41,7 +41,7 @@ pico_enable_stdio_uart(WirelessKeyboard 1)
 target_compile_definitions(WirelessKeyboard PRIVATE
     CFG_TUH_ENABLED=1
     CFG_TUH_RPI_PIO_USB=1
-    CFG_TUH_HID=1
+    CFG_TUH_HID=4
     CFG_TUH_HID_KEYBOARD=1
     CFG_TUD_ENABLED=0
     PIO_USB_USE_TINYUSB
@@ -108,7 +108,7 @@ pico_enable_stdio_uart(WirelessKeyboardRam 1)
 target_compile_definitions(WirelessKeyboardRam PRIVATE
     CFG_TUH_ENABLED=1
     CFG_TUH_RPI_PIO_USB=1
-    CFG_TUH_HID=1
+    CFG_TUH_HID=4
     CFG_TUH_HID_KEYBOARD=1
     CFG_TUD_ENABLED=0
     PIO_USB_USE_TINYUSB
