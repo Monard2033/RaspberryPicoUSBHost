@@ -1045,12 +1045,9 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
                 }
             }
         }
-        uint8_t const protocol = keyboard_uses_report_protocol ?
-            HID_PROTOCOL_REPORT : HID_PROTOCOL_BOOT;
-        if (!tuh_hid_set_protocol(dev_addr, instance, protocol)) {
-            printf("[HID] WARNING: failed to select %s protocol\n",
-                   protocol == HID_PROTOCOL_REPORT ? "report" : "boot");
-        }
+        /* The default REPORT protocol is selected before tuh_init(). Starting
+         * another control transfer from this mount callback would interrupt
+         * TinyUSB while it is still configuring the remaining HID interfaces. */
     }
     if (!tuh_hid_receive_report(dev_addr, instance)) {
         printf("[HID][ERROR] Failed to arm receive for dev=%u inst=%u\n", dev_addr, instance);
@@ -1191,6 +1188,7 @@ int main(void)
     pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
     pio_cfg.pin_dp = USB_HOST_DP_PIN;
     tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
+    tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT);
     tuh_init(BOARD_TUH_RHPORT);
     printf("[INIT] TinyUSB host stack initialized\n");
 
