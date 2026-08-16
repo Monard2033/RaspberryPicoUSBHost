@@ -87,7 +87,7 @@
 #endif
 
 #ifndef CONSUMER_DEBUG
-#define CONSUMER_DEBUG    0   /* Descriptor/raw multimedia diagnostics. */
+#define CONSUMER_DEBUG    1   /* Descriptor/raw multimedia diagnostics. */
 #endif
 
 #ifndef NULL_MOVEMENT_ENABLED
@@ -933,6 +933,12 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
         printf("[HID] reports=%u consumer_fields=%u\n",
                state->report_count, state->consumer_field_count);
 #if CONSUMER_DEBUG
+        printf("[HID] descriptor len=%u:", desc_len);
+        for (uint16_t i = 0; i < desc_len; ++i) {
+            if ((i % 16u) == 0) printf("\n[HID DESC %03u]", i);
+            printf(" %02x", desc_report[i]);
+        }
+        printf("\n");
         for (uint8_t i = 0; i < state->report_count; ++i) {
             printf("[HID] report[%u] id=%u page=0x%04x usage=0x%02x\n",
                    i, state->reports[i].report_id,
@@ -949,7 +955,9 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
         previous_consumer_usage = 0;
         previous_consumer_valid = false;
         keyboard_input_report_id = 0;
-        keyboard_uses_report_protocol = state != NULL && state->has_consumer;
+        /* Diagnostic and normal operation both require REPORT protocol: boot
+         * protocol intentionally removes non-boot multimedia information. */
+        keyboard_uses_report_protocol = true;
         if (state != NULL) {
             for (uint8_t i = 0; i < state->report_count; ++i) {
                 if (state->reports[i].usage_page == HID_USAGE_PAGE_DESKTOP &&
@@ -1017,9 +1025,15 @@ void tuh_hid_set_protocol_complete_cb(uint8_t dev_addr, uint8_t instance, uint8_
 }
 
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
-                                uint8_t const *report, uint16_t len)
+                                 uint8_t const *report, uint16_t len)
 {
     total_hid_reports_received++;
+
+#if CONSUMER_DEBUG
+    printf("[HID RAW] dev=%u inst=%u len=%u:", dev_addr, instance, len);
+    for (uint16_t i = 0; i < len; ++i) printf(" %02x", report[i]);
+    printf("\n");
+#endif
 
     struct hid_instance_state const *state =
         instance < CFG_TUH_HID && hid_instances[instance].dev_addr == dev_addr ?
@@ -1048,11 +1062,6 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
     }
 
     if (consumer_report && state != NULL) {
-#if CONSUMER_DEBUG
-        printf("[CONSUMER RAW] dev=%u inst=%u len=%u:", dev_addr, instance, len);
-        for (uint16_t i = 0; i < len; ++i) printf(" %02x", report[i]);
-        printf("\n");
-#endif
         forward_consumer_usage(decode_consumer_usage(state, report, len));
     }
 
