@@ -87,7 +87,7 @@
 #endif
 
 #ifndef CONSUMER_DEBUG
-#define CONSUMER_DEBUG    1   /* Descriptor/raw multimedia diagnostics. */
+#define CONSUMER_DEBUG    0   /* Set to 1 only for descriptor/raw diagnostics. */
 #endif
 
 #ifndef NULL_MOVEMENT_ENABLED
