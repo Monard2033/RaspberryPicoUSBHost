@@ -24,6 +24,13 @@
 #define PIN_SPI_CSN       9    // manual GPIO -> nRF P0.22 (SPIS CSN)
 
 #define KBD_REPORT_LEN    8    // boot report: modifier, reserved, key1..key6
+#define LINK_FRAME_LEN    12
+#define LINK_MAGIC        0xA5
+#define LINK_VERSION      0x02
+#define LINK_TYPE_KEYBOARD 0x01
+#define LINK_TYPE_CONSUMER 0x02
+#define MAX_HID_REPORTS   8
+#define MAX_CONSUMER_FIELDS 16
 #define HID_KEY_A         0x04
 #define HID_KEY_D         0x07
 #define HID_KEY_S         0x16
@@ -35,6 +42,15 @@
 #define HID_LED_NUM_LOCK    0x01
 #define HID_LED_CAPS_LOCK   0x02
 #define HID_LED_SCROLL_LOCK 0x04
+
+#define HID_USAGE_PAGE_CONSUMER_CONTROL 0x0C
+#define HID_USAGE_CONSUMER_CONTROL      0x01
+#define HID_USAGE_CONSUMER_SCAN_NEXT    0x00B5
+#define HID_USAGE_CONSUMER_SCAN_PREVIOUS 0x00B6
+#define HID_USAGE_CONSUMER_PLAY_PAUSE   0x00CD
+#define HID_USAGE_CONSUMER_MUTE         0x00E2
+#define HID_USAGE_CONSUMER_VOLUME_UP    0x00E9
+#define HID_USAGE_CONSUMER_VOLUME_DOWN  0x00EA
 
 // --- Battery (read locally, RP2040 is the sole "brain" for this) --------
 #define PIN_BATT_ADC      28   // GP28 = ADC2. Battery divider tap goes here.
@@ -70,6 +86,10 @@
 #define PERIODIC_DEBUG    0   /* Runtime UART summaries also pause USB servicing. */
 #endif
 
+#ifndef CONSUMER_DEBUG
+#define CONSUMER_DEBUG    0   /* Descriptor/raw multimedia diagnostics. */
+#endif
+
 #ifndef NULL_MOVEMENT_ENABLED
 #define NULL_MOVEMENT_ENABLED 1 /* Last-input-wins for A/D and W/S. */
 #endif
@@ -86,9 +106,42 @@ static uint8_t           active_ad_key;
 static uint8_t           active_ws_key;
 static bool              previous_physical_valid;
 static bool              previous_output_valid;
+static uint8_t           keyboard_input_report_id;
+static bool              keyboard_uses_report_protocol;
 
-/* Locally simulated keyboard lock state. The radio protocol remains the
- * original 8-byte, keyboard-to-dongle-only path. */
+struct link_input_frame {
+    uint8_t magic;
+    uint8_t version;
+    uint8_t type;
+    uint8_t sequence;
+    uint8_t data[KBD_REPORT_LEN];
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct link_input_frame) == LINK_FRAME_LEN,
+               "SPI link frame must remain 12 bytes");
+
+struct consumer_field {
+    uint8_t report_id;
+    uint16_t bit_offset;
+    uint8_t bit_size;
+    uint16_t usage;
+    bool is_array;
+};
+
+struct hid_instance_state {
+    uint8_t dev_addr;
+    uint8_t report_count;
+    tuh_hid_report_info_t reports[MAX_HID_REPORTS];
+    uint8_t consumer_field_count;
+    struct consumer_field consumer_fields[MAX_CONSUMER_FIELDS];
+    bool has_consumer;
+};
+
+static struct hid_instance_state hid_instances[CFG_TUH_HID];
+static uint16_t previous_consumer_usage;
+static bool previous_consumer_valid;
+
+/* Locally simulated keyboard lock state. */
 static uint8_t           keyboard_led_state;
 static uint8_t           keyboard_led_tx_value;
 static uint8_t           keyboard_lock_pressed;
@@ -104,9 +157,9 @@ enum { BLINK_NOT_MOUNTED = 250, BLINK_MOUNTED = 1000, BLINK_SUSPENDED = 2500 };
 static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
 
 /*--------------------------------------------------------------------+
- *  SPI master bridge to the nRF52840 (SPI slave) — plain 8-byte frames,
- *  exactly as the nRF transmitter already expects. No LED/battery data
- *  goes over this link anymore; that's local-only now.
+ *  SPI master bridge to the nRF52840 (SPI slave). The fixed 12-byte frame
+ *  carries either an 8-byte boot keyboard state or a normalized 16-bit
+ *  Consumer Control usage. Battery and RGB data remain local-only.
  *--------------------------------------------------------------------*/
 static void spi_master_init(void)
 {
@@ -129,25 +182,35 @@ static void spi_master_init(void)
 #endif
 }
 
-static void spi_send_report(const uint8_t *report8)
+static void spi_send_input(uint8_t type, const uint8_t data[KBD_REPORT_LEN])
 {
+    static uint8_t sequence;
+    struct link_input_frame const frame = {
+        .magic = LINK_MAGIC,
+        .version = LINK_VERSION,
+        .type = type,
+        .sequence = sequence++,
+        .data = { data[0], data[1], data[2], data[3],
+                  data[4], data[5], data[6], data[7] },
+    };
 #if HOT_PATH_DEBUG
     uint32_t const t0 = time_us_32();
 #endif
 
     gpio_put(PIN_SPI_CSN, 0);
     sleep_us(1);
-    spi_write_blocking(SPI_PORT, report8, KBD_REPORT_LEN);
+    spi_write_blocking(SPI_PORT, (uint8_t const *)&frame, sizeof(frame));
     sleep_us(1);
     gpio_put(PIN_SPI_CSN, 1);
 
     total_spi_frames_sent++;
 #if HOT_PATH_DEBUG
     uint32_t const dt_us = time_us_32() - t0;
-    printf("[SPI TX #%lu] took %lu us | bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+    printf("[SPI TX #%lu] took %lu us | type=%u seq=%u data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
            (unsigned long)total_spi_frames_sent, (unsigned long)dt_us,
-           report8[0], report8[1], report8[2], report8[3],
-           report8[4], report8[5], report8[6], report8[7]);
+           frame.type, frame.sequence,
+           frame.data[0], frame.data[1], frame.data[2], frame.data[3],
+           frame.data[4], frame.data[5], frame.data[6], frame.data[7]);
 #endif
 }
 
@@ -158,13 +221,191 @@ static void spi_link_test_task(void)
     static uint8_t counter = 0;
     if (absolute_time_diff_us(get_absolute_time(), next_send) > 0) return;
     next_send = make_timeout_time_ms(1000);
-    uint8_t test_frame[KBD_REPORT_LEN] = {
+    uint8_t test_data[KBD_REPORT_LEN] = {
         0xAA, counter, 0xAA, counter, 0xAA, counter, 0xAA, counter
     };
     counter++;
-    spi_send_report(test_frame);
+    spi_send_input(LINK_TYPE_KEYBOARD, test_data);
 }
 #endif
+
+static bool consumer_usage_supported(uint16_t usage)
+{
+    switch (usage) {
+    case HID_USAGE_CONSUMER_SCAN_NEXT:
+    case HID_USAGE_CONSUMER_SCAN_PREVIOUS:
+    case HID_USAGE_CONSUMER_PLAY_PAUSE:
+    case HID_USAGE_CONSUMER_MUTE:
+    case HID_USAGE_CONSUMER_VOLUME_UP:
+    case HID_USAGE_CONSUMER_VOLUME_DOWN:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static uint32_t hid_item_value(uint8_t const *data, uint8_t size)
+{
+    uint32_t value = 0;
+    for (uint8_t i = 0; i < size; ++i) value |= (uint32_t)data[i] << (8u * i);
+    return value;
+}
+
+/* Extract enough HID descriptor information to normalize common Consumer
+ * array and bitmap reports. Unknown/vendor items are skipped safely. */
+static void parse_consumer_fields(struct hid_instance_state *state,
+                                  uint8_t const *desc, uint16_t len)
+{
+    uint16_t usage_page = 0;
+    uint8_t report_size = 0;
+    uint8_t report_count = 0;
+    uint8_t report_id = 0;
+    uint16_t input_offsets[256] = { 0 };
+    uint16_t usages[MAX_CONSUMER_FIELDS] = { 0 };
+    uint8_t usage_count = 0;
+    uint16_t usage_min = 0;
+    bool usage_min_valid = false;
+
+    for (uint16_t pos = 0; pos < len;) {
+        uint8_t const prefix = desc[pos++];
+        if (prefix == 0xFE) {
+            if (pos + 2 > len) break;
+            uint8_t const long_size = desc[pos++];
+            pos++;
+            pos = (uint16_t)((pos + long_size <= len) ? pos + long_size : len);
+            continue;
+        }
+
+        uint8_t const size_code = prefix & 0x03;
+        uint8_t const size = size_code == 3 ? 4 : size_code;
+        uint8_t const type = (prefix >> 2) & 0x03;
+        uint8_t const tag = (prefix >> 4) & 0x0F;
+        if (pos + size > len) break;
+        uint32_t const value = hid_item_value(desc + pos, size);
+        pos += size;
+
+        if (type == 1) { /* Global */
+            if (tag == 0) usage_page = (uint16_t)value;
+            else if (tag == 7) report_size = (uint8_t)value;
+            else if (tag == 8) report_id = (uint8_t)value;
+            else if (tag == 9) report_count = (uint8_t)value;
+            continue;
+        }
+        if (type == 2) { /* Local */
+            if (tag == 0 && usage_count < MAX_CONSUMER_FIELDS) {
+                usages[usage_count++] = (uint16_t)value;
+            } else if (tag == 1) {
+                usage_min = (uint16_t)value;
+                usage_min_valid = true;
+            }
+            continue;
+        }
+        if (type != 0) continue;
+
+        if (tag == 8) { /* Input */
+            bool const constant = (value & 0x01u) != 0;
+            bool const variable = (value & 0x02u) != 0;
+            uint16_t const base = input_offsets[report_id];
+
+            if (!constant && usage_page == HID_USAGE_PAGE_CONSUMER_CONTROL &&
+                report_size > 0 && report_size <= 16) {
+                if (variable) {
+                    for (uint8_t i = 0; i < report_count &&
+                         state->consumer_field_count < MAX_CONSUMER_FIELDS; ++i) {
+                        uint16_t usage = i < usage_count ? usages[i] :
+                            (usage_min_valid ? (uint16_t)(usage_min + i) : 0);
+                        if (!consumer_usage_supported(usage)) continue;
+                        state->consumer_fields[state->consumer_field_count++] =
+                            (struct consumer_field) {
+                                .report_id = report_id,
+                                .bit_offset = (uint16_t)(base + i * report_size),
+                                .bit_size = report_size,
+                                .usage = usage,
+                                .is_array = false,
+                            };
+                    }
+                } else if (state->consumer_field_count < MAX_CONSUMER_FIELDS) {
+                    state->consumer_fields[state->consumer_field_count++] =
+                        (struct consumer_field) {
+                            .report_id = report_id,
+                            .bit_offset = base,
+                            .bit_size = report_size,
+                            .usage = 0,
+                            .is_array = true,
+                        };
+                }
+            }
+            input_offsets[report_id] =
+                (uint16_t)(base + (uint16_t)report_size * report_count);
+        }
+
+        /* Local items apply only to the next Main item. */
+        usage_count = 0;
+        usage_min_valid = false;
+    }
+
+    state->has_consumer = state->consumer_field_count != 0;
+}
+
+static uint16_t read_report_bits(uint8_t const *data, uint16_t len,
+                                 uint16_t bit_offset, uint8_t bit_size)
+{
+    if (bit_size == 0 || bit_size > 16 ||
+        bit_offset + bit_size > (uint32_t)len * 8u) return 0;
+    uint16_t value = 0;
+    for (uint8_t i = 0; i < bit_size; ++i) {
+        uint16_t const bit = (uint16_t)(bit_offset + i);
+        if (data[bit / 8] & (1u << (bit % 8))) value |= (uint16_t)(1u << i);
+    }
+    return value;
+}
+
+static uint16_t decode_consumer_usage(struct hid_instance_state const *state,
+                                      uint8_t const *report, uint16_t len)
+{
+    uint8_t report_id = 0;
+    bool has_report_ids = false;
+    for (uint8_t i = 0; i < state->report_count; ++i) {
+        if (state->reports[i].report_id != 0) { has_report_ids = true; break; }
+    }
+    if (has_report_ids) {
+        if (len == 0) return 0;
+        report_id = *report++;
+        --len;
+    }
+
+    for (uint8_t i = 0; i < state->consumer_field_count; ++i) {
+        struct consumer_field const *field = &state->consumer_fields[i];
+        if (field->report_id != report_id) continue;
+        uint16_t const value = read_report_bits(report, len,
+                                                field->bit_offset,
+                                                field->bit_size);
+        uint16_t const usage = field->is_array ? value :
+            (value != 0 ? field->usage : 0);
+        if (consumer_usage_supported(usage)) return usage;
+    }
+
+    /* Fallback for the widespread Report-ID + 16-bit usage array layout. */
+    for (uint16_t i = 0; i + 1 < len; i += 2) {
+        uint16_t const usage = (uint16_t)(report[i] | (report[i + 1] << 8));
+        if (consumer_usage_supported(usage)) return usage;
+    }
+    return 0;
+}
+
+static void forward_consumer_usage(uint16_t usage)
+{
+    if (previous_consumer_valid && usage == previous_consumer_usage) return;
+    uint8_t data[KBD_REPORT_LEN] = {
+        (uint8_t)usage, (uint8_t)(usage >> 8), 0, 0, 0, 0, 0, 0
+    };
+    spi_send_input(LINK_TYPE_CONSUMER, data);
+    previous_consumer_usage = usage;
+    previous_consumer_valid = true;
+#if CONSUMER_DEBUG
+    printf("[CONSUMER] usage=0x%04x\n", usage);
+#endif
+}
 
 static bool report_has_key(const uint8_t report[KBD_REPORT_LEN], uint8_t key)
 {
@@ -226,7 +467,7 @@ static void keyboard_led_task(void)
     }
 
     keyboard_led_tx_value = keyboard_led_state;
-    if (tuh_hid_set_report(kbd_dev_addr, kbd_instance, 0,
+    if (tuh_hid_set_report(kbd_dev_addr, kbd_instance, keyboard_input_report_id,
                            HID_REPORT_TYPE_OUTPUT,
                            &keyboard_led_tx_value,
                            sizeof(keyboard_led_tx_value))) {
@@ -344,7 +585,7 @@ static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN])
         return;
     }
 
-    spi_send_report(output);
+    spi_send_input(LINK_TYPE_KEYBOARD, output);
     memcpy(previous_output_report, output, KBD_REPORT_LEN);
     previous_output_valid = true;
     total_output_reports_sent++;
@@ -653,6 +894,25 @@ void tuh_umount_cb(uint8_t dev_addr)
     if (dev_addr == kbd_dev_addr) { kbd_dev_addr = 0; kbd_is_mounted = false; }
 }
 
+static tuh_hid_report_info_t const *hid_report_info_for_input(
+    struct hid_instance_state const *state,
+    uint8_t const **report, uint16_t *len)
+{
+    if (state->report_count == 0) return NULL;
+    if (state->report_count == 1 && state->reports[0].report_id == 0) {
+        return &state->reports[0];
+    }
+    if (*len == 0) return NULL;
+
+    uint8_t const report_id = (*report)[0];
+    ++(*report);
+    --(*len);
+    for (uint8_t i = 0; i < state->report_count; ++i) {
+        if (state->reports[i].report_id == report_id) return &state->reports[i];
+    }
+    return NULL;
+}
+
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
                       uint8_t const *desc_report, uint16_t desc_len)
 {
@@ -660,15 +920,50 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
     printf("\n[HID] MOUNTED dev=%u inst=%u protocol=%s\n", dev_addr, instance,
            itf_protocol == HID_ITF_PROTOCOL_KEYBOARD ? "KEYBOARD" :
            itf_protocol == HID_ITF_PROTOCOL_MOUSE    ? "MOUSE"    : "NONE");
-    (void) desc_report; (void) desc_len;
+    struct hid_instance_state *state = instance < CFG_TUH_HID ?
+        &hid_instances[instance] : NULL;
+    if (state != NULL) {
+        memset(state, 0, sizeof(*state));
+        state->dev_addr = dev_addr;
+        if (desc_report != NULL && desc_len != 0) {
+            state->report_count = tuh_hid_parse_report_descriptor(
+                state->reports, MAX_HID_REPORTS, desc_report, desc_len);
+            parse_consumer_fields(state, desc_report, desc_len);
+        }
+        printf("[HID] reports=%u consumer_fields=%u\n",
+               state->report_count, state->consumer_field_count);
+#if CONSUMER_DEBUG
+        for (uint8_t i = 0; i < state->report_count; ++i) {
+            printf("[HID] report[%u] id=%u page=0x%04x usage=0x%02x\n",
+                   i, state->reports[i].report_id,
+                   state->reports[i].usage_page, state->reports[i].usage);
+        }
+#endif
+    }
 
     if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
         kbd_dev_addr = dev_addr;
         kbd_instance = instance;
         kbd_is_mounted = true;
         keyboard_led_reset();
-        if (!tuh_hid_set_protocol(dev_addr, instance, HID_PROTOCOL_BOOT)) {
-            printf("[HID] WARNING: failed to force boot protocol\n");
+        previous_consumer_usage = 0;
+        previous_consumer_valid = false;
+        keyboard_input_report_id = 0;
+        keyboard_uses_report_protocol = state != NULL && state->has_consumer;
+        if (state != NULL) {
+            for (uint8_t i = 0; i < state->report_count; ++i) {
+                if (state->reports[i].usage_page == HID_USAGE_PAGE_DESKTOP &&
+                    state->reports[i].usage == HID_USAGE_DESKTOP_KEYBOARD) {
+                    keyboard_input_report_id = state->reports[i].report_id;
+                    break;
+                }
+            }
+        }
+        uint8_t const protocol = keyboard_uses_report_protocol ?
+            HID_PROTOCOL_REPORT : HID_PROTOCOL_BOOT;
+        if (!tuh_hid_set_protocol(dev_addr, instance, protocol)) {
+            printf("[HID] WARNING: failed to select %s protocol\n",
+                   protocol == HID_PROTOCOL_REPORT ? "report" : "boot");
         }
     }
     if (!tuh_hid_receive_report(dev_addr, instance)) {
@@ -682,12 +977,16 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
     if (dev_addr == kbd_dev_addr && instance == kbd_instance) {
         uint8_t const released[KBD_REPORT_LEN] = { 0 };
 
-        spi_send_report(released);
+        spi_send_input(LINK_TYPE_KEYBOARD, released);
+        forward_consumer_usage(0);
         null_movement_reset();
         keyboard_led_transfer_active = false;
         keyboard_led_update_pending = false;
         kbd_dev_addr = 0;
         kbd_is_mounted = false;
+    }
+    if (instance < CFG_TUH_HID) {
+        memset(&hid_instances[instance], 0, sizeof(hid_instances[instance]));
     }
 }
 
@@ -696,7 +995,8 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
                                     uint16_t len)
 {
     if (dev_addr != kbd_dev_addr || instance != kbd_instance ||
-        report_id != 0 || report_type != HID_REPORT_TYPE_OUTPUT) {
+        report_id != keyboard_input_report_id ||
+        report_type != HID_REPORT_TYPE_OUTPUT) {
         return;
     }
 
@@ -721,14 +1021,39 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
 {
     total_hid_reports_received++;
 
-    if (dev_addr == kbd_dev_addr && instance == kbd_instance && len >= KBD_REPORT_LEN) {
-        forward_keyboard_report(report);
+    struct hid_instance_state const *state =
+        instance < CFG_TUH_HID && hid_instances[instance].dev_addr == dev_addr ?
+        &hid_instances[instance] : NULL;
+    uint8_t const *payload = report;
+    uint16_t payload_len = len;
+    tuh_hid_report_info_t const *info = state != NULL ?
+        hid_report_info_for_input(state, &payload, &payload_len) : NULL;
+    bool const consumer_report = info != NULL &&
+        info->usage_page == HID_USAGE_PAGE_CONSUMER_CONTROL &&
+        info->usage == HID_USAGE_CONSUMER_CONTROL;
+
+    if (dev_addr == kbd_dev_addr && instance == kbd_instance) {
+        bool const keyboard_report = !keyboard_uses_report_protocol ||
+            (info != NULL && info->usage_page == HID_USAGE_PAGE_DESKTOP &&
+             info->usage == HID_USAGE_DESKTOP_KEYBOARD);
+        if (keyboard_report && payload_len >= KBD_REPORT_LEN) {
+            forward_keyboard_report(payload);
 #if HOT_PATH_DEBUG
-        printf("[HID RX #%lu] mod=%02x res=%02x keys=%02x %02x %02x %02x %02x %02x\n",
-               (unsigned long)total_hid_reports_received,
-               report[0], report[1], report[2], report[3],
-               report[4], report[5], report[6], report[7]);
+            printf("[HID RX #%lu] mod=%02x res=%02x keys=%02x %02x %02x %02x %02x %02x\n",
+                   (unsigned long)total_hid_reports_received,
+                   payload[0], payload[1], payload[2], payload[3],
+                   payload[4], payload[5], payload[6], payload[7]);
 #endif
+        }
+    }
+
+    if (consumer_report && state != NULL) {
+#if CONSUMER_DEBUG
+        printf("[CONSUMER RAW] dev=%u inst=%u len=%u:", dev_addr, instance, len);
+        for (uint16_t i = 0; i < len; ++i) printf(" %02x", report[i]);
+        printf("\n");
+#endif
+        forward_consumer_usage(decode_consumer_usage(state, report, len));
     }
 
     /* Re-arm immediately; no UART output is allowed before this at 1 kHz. */

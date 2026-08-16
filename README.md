@@ -2,8 +2,8 @@
 
 This firmware runs on the RP2040 board inside the wireless keyboard build.
 It reads the keyboard as a USB HID host through PIO-USB, applies local keyboard
-filters, then forwards the 8-byte boot keyboard report to the nRF52840
-transmitter over SPI.
+filters, then forwards keyboard state and supported Consumer Control keys to
+the nRF52840 transmitter over SPI.
 
 ## Active wiring
 
@@ -22,7 +22,7 @@ transmitter over SPI.
 | GP6 | P0.17 | SPI SCK |
 | GP7 | P0.20 | SPI MOSI, RP2040 to nRF |
 | GP8 | P0.08 | SPI MISO, reserved; unused by the current write-only protocol |
-| GP9 | P0.22 | SPI CSN, driven low for each 8-byte frame |
+| GP9 | P0.22 | SPI CSN, driven low for each 12-byte typed frame |
 | VSYS | RAW / VIN only | Use only when the nRF board has an onboard input regulator |
 | 3V3(OUT) | 3V3 / VCC direct supply | Use for a direct 3.3 V nRF52840 supply pin |
 | GND | GND | Common ground |
@@ -60,7 +60,14 @@ Do not connect a Li-ion/LiPo battery directly to GP28. The documented
 
 - USB host D+ is `GP4`; PIO-USB uses `GP5` as D-.
 - SPI is `spi0`, 8 MHz, mode 0, MSB first.
-- The forwarded report is the standard 8-byte boot keyboard report.
+- The SPI/radio frame is 12 bytes: magic, protocol version, input type,
+  sequence number, and an 8-byte payload. Keyboard payloads contain the
+  standard boot-keyboard report; Consumer Control payloads contain a
+  normalized 16-bit usage ID.
+- Next, Previous, Mute, Play/Pause, Volume Down, and Volume Up are detected from
+  HID Consumer Control reports and forwarded to the PC through the nRF52840
+  receiver. Press and release transitions are preserved, while radio
+  keepalives repeat only the latest keyboard state.
 - A/D and W/S use last-input-wins null movement filtering.
 - Per-report UART logging is disabled by default because it breaks 1 kHz input.
 - Long key holds are forwarded as state changes instead of being cut after the
