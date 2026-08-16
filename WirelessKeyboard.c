@@ -988,6 +988,12 @@ static tuh_hid_report_info_t const *hid_report_info_for_input(
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
                       uint8_t const *desc_report, uint16_t desc_len)
 {
+    /* Pico-PIO-USB reaches the HID class callback reliably even on paths
+     * where the optional general tuh_mount_cb() is not observed. */
+    if (pending_descriptor_dev_addr == 0) {
+        pending_descriptor_dev_addr = dev_addr;
+        descriptor_dump_after_ms = board_millis() + 250;
+    }
     uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
     printf("\n[HID] MOUNTED dev=%u inst=%u protocol=%s\n", dev_addr, instance,
            itf_protocol == HID_ITF_PROTOCOL_KEYBOARD ? "KEYBOARD" :
