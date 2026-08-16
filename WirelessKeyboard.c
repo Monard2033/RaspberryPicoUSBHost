@@ -155,6 +155,8 @@ static uint32_t total_output_reports_sent  = 0;
 
 enum { BLINK_NOT_MOUNTED = 250, BLINK_MOUNTED = 1000, BLINK_SUSPENDED = 2500 };
 static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
+static uint8_t pending_descriptor_dev_addr;
+static uint32_t descriptor_dump_after_ms;
 
 /*--------------------------------------------------------------------+
  *  SPI master bridge to the nRF52840 (SPI slave). The fixed 12-byte frame
@@ -874,6 +876,78 @@ static void status_task(void)
 #endif
 }
 
+static void usb_descriptor_dump_task(void)
+{
+#if CONSUMER_DEBUG
+    if (pending_descriptor_dev_addr == 0 ||
+        (int32_t)(board_millis() - descriptor_dump_after_ms) < 0) return;
+
+    uint8_t const dev_addr = pending_descriptor_dev_addr;
+    pending_descriptor_dev_addr = 0;
+    tusb_desc_device_t device_desc;
+    uint8_t const device_result = tuh_descriptor_get_device_sync(
+        dev_addr, &device_desc, sizeof(device_desc));
+    if (device_result != XFER_RESULT_SUCCESS) {
+        printf("[USB DESC] device read failed: result=%u\n", device_result);
+        return;
+    }
+
+    printf("[USB DESC] VID=%04x PID=%04x USB=%04x class=%02x/%02x/%02x configs=%u\n",
+           device_desc.idVendor, device_desc.idProduct, device_desc.bcdUSB,
+           device_desc.bDeviceClass, device_desc.bDeviceSubClass,
+           device_desc.bDeviceProtocol, device_desc.bNumConfigurations);
+
+    static uint8_t config_desc[512] __attribute__((aligned(4)));
+    for (uint8_t config_index = 0;
+         config_index < device_desc.bNumConfigurations; ++config_index) {
+        uint8_t result = tuh_descriptor_get_configuration_sync(
+            dev_addr, config_index, config_desc, sizeof(tusb_desc_configuration_t));
+        if (result != XFER_RESULT_SUCCESS) {
+            printf("[USB DESC] config[%u] header failed: result=%u\n",
+                   config_index, result);
+            continue;
+        }
+
+        tusb_desc_configuration_t const *header =
+            (tusb_desc_configuration_t const *)config_desc;
+        uint16_t const requested_len = header->wTotalLength < sizeof(config_desc) ?
+            header->wTotalLength : sizeof(config_desc);
+        result = tuh_descriptor_get_configuration_sync(
+            dev_addr, config_index, config_desc, requested_len);
+        if (result != XFER_RESULT_SUCCESS) {
+            printf("[USB DESC] config[%u] body failed: result=%u\n",
+                   config_index, result);
+            continue;
+        }
+
+        header = (tusb_desc_configuration_t const *)config_desc;
+        printf("[USB DESC] config[%u] value=%u interfaces=%u total=%u captured=%u\n",
+               config_index, header->bConfigurationValue,
+               header->bNumInterfaces, header->wTotalLength, requested_len);
+        for (uint16_t offset = 0; offset + 2 <= requested_len;) {
+            uint8_t const length = config_desc[offset];
+            uint8_t const type = config_desc[offset + 1];
+            if (length < 2 || offset + length > requested_len) break;
+            printf("[USB CFG %03u]", offset);
+            for (uint8_t i = 0; i < length; ++i) {
+                printf(" %02x", config_desc[offset + i]);
+            }
+            printf("\n");
+            if (type == TUSB_DESC_INTERFACE &&
+                length >= sizeof(tusb_desc_interface_t)) {
+                tusb_desc_interface_t const *itf =
+                    (tusb_desc_interface_t const *)(config_desc + offset);
+                printf("[USB ITF] num=%u alt=%u eps=%u class=%02x/%02x/%02x\n",
+                       itf->bInterfaceNumber, itf->bAlternateSetting,
+                       itf->bNumEndpoints, itf->bInterfaceClass,
+                       itf->bInterfaceSubClass, itf->bInterfaceProtocol);
+            }
+            offset = (uint16_t)(offset + length);
+        }
+    }
+#endif
+}
+
 /*--------------------------------------------------------------------+
  *  USB HID host callbacks
  *--------------------------------------------------------------------*/
@@ -881,10 +955,8 @@ void tuh_mount_cb(uint8_t dev_addr)
 {
     printf("\n*** [USB] DEVICE MOUNTED: addr=%u ***\n", dev_addr);
     blink_interval_ms = BLINK_MOUNTED;
-    tusb_desc_device_t desc;
-    if (tuh_descriptor_get_device_sync(dev_addr, &desc, sizeof(desc)) == PICO_ERROR_NONE) {
-        printf("[USB] VID=0x%04x PID=0x%04x\n", desc.idVendor, desc.idProduct);
-    }
+    pending_descriptor_dev_addr = dev_addr;
+    descriptor_dump_after_ms = board_millis() + 250;
 }
 
 void tuh_umount_cb(uint8_t dev_addr)
@@ -1127,6 +1199,7 @@ int main(void)
 
     while (1) {
         tuh_task();
+        usb_descriptor_dump_task();
 #if SPI_LINK_TEST_MODE
         spi_link_test_task();
 #endif
