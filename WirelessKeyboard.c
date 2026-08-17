@@ -606,8 +606,11 @@ static bool report_has_key(const uint8_t report[KBD_REPORT_LEN], uint8_t key)
 
 static void keyboard_led_reset(void)
 {
-    keyboard_led_state = 0;
-    keyboard_led_tx_value = 0;
+    /* The target Windows installation boots with Num Lock enabled. Mirror
+     * that known state locally as soon as the keyboard mounts so its keypad
+     * and physical Num Lock LED do not start inverted relative to Windows. */
+    keyboard_led_state = HID_LED_NUM_LOCK;
+    keyboard_led_tx_value = HID_LED_NUM_LOCK;
     keyboard_lock_pressed = 0;
     keyboard_led_update_pending = true;
     keyboard_led_transfer_active = false;

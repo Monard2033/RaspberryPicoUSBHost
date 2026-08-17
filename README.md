@@ -161,10 +161,13 @@ Do not connect a Li-ion/LiPo battery directly to GP28. The documented
   each new physical press, RP2040 toggles the matching HID Output bit and sends
   it back to the attached USB keyboard. No lock-state data is added to the
   nRF52840 radio protocol.
-- The local lock state starts with all three LEDs off whenever the keyboard is
-  mounted. Because the state is intentionally local, a lock-state change made
-  by software or by another keyboard on the PC can make the physical LEDs
-  differ from the operating-system state until they are toggled again.
+- Whenever the keyboard is mounted, the local state starts with Num Lock ON,
+  Caps Lock OFF and Scroll Lock OFF. RP2040 schedules the corresponding HID
+  Output report immediately after enumeration, matching the target Windows
+  boot state and preventing the keypad/LED from starting inverted. Because
+  lock state remains intentionally local, a later change made by software or
+  another keyboard can still make the physical LEDs differ from the operating
+  system until the local lock key is toggled again.
 - At startup the RGB LED shows battery level for five seconds: green at
   75–100%, yellow at 50–74%, orange at 25–49%, and red at 0–24%.
 - Battery voltage continues to be sampled once per second in the background.
@@ -185,7 +188,7 @@ firmware/WirelessKeyboard.uf2
 ```
 
 The current sticky-key-hardened RP2040 artifact has SHA-256
-`46BB0D1BCF9B6D288F88289905A6E968596A3956DC1DD623E849CBFE62246980`.
+`1DCE3A0D0619FD13E56D45F1ECE67E822003E58779C6B5BB98FE642524C73B79`.
 
 Flash all three artifacts as one matched protocol `0x02` set. Mixing one of
 these images with an older peer can restore the exact release-loss behavior
