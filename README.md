@@ -77,6 +77,46 @@ the nRF52840 transmitter over SPI.
   Next, Mute and Volume with repeated sub-10-ms actions, while confirming that
   the 1 kHz normal-key path and low-power inactivity behavior are unchanged.
 
+### Bidirectional lock-state synchronization
+
+- Add a reverse data path for Num Lock, Caps Lock and Scroll Lock so Windows,
+  rather than the RP2040 boot assumption, becomes the authoritative state.
+  Receiver must capture the keyboard HID Output report from Windows and return
+  its LED bits through an ESB acknowledgement payload.
+- Transmitter must read the ESB ACK payload and deliver it to RP2040 over the
+  currently reserved SPI MISO connection (`GP8 <-> P0.08`). RP2040 must then
+  send the received state to the SONIX keyboard with HID `SET_REPORT`, without
+  blocking the 1 kHz input callback or waking/sending radio traffic repeatedly
+  when the state has not changed.
+- Define sequencing, acknowledgement, retry and stale-state handling for the
+  reverse direction. Retain Num Lock ON as the local boot fallback until the
+  first authoritative Windows LED state arrives. This protocol change must be
+  versioned and all three firmware images must be flashed as a matched set.
+- Validate changes initiated by the local lock keys, Windows software, another
+  keyboard, Remote Desktop and reconnect/resume, including synchronization
+  after Transmitter System OFF wake-up.
+
+### Wireless battery telemetry
+
+- Add a compact battery-status packet from RP2040 to Receiver containing at
+  minimum percentage, measured millivolts, charging/discharging/idle state and
+  a freshness marker. RP2040 may continue sampling once per second locally,
+  but radio updates should be event-driven (for example on a 1% or material
+  state change) with a low-rate heartbeat such as once every 30-60 seconds.
+- Receiver must cache the latest battery record and expose it without restoring
+  UART or USB CDC. First investigate a standards-based USB HID battery usage
+  and verify whether the target Windows version actually displays it in the
+  native device UI; Bluetooth-style battery display must not be assumed for an
+  arbitrary USB HID device without runtime confirmation.
+- Provide a vendor-defined HID Feature/Input report as the reliable fallback.
+  A small Windows tray application can read that report through HIDAPI at a
+  fixed interval, display battery percentage and charge state, show when data
+  is stale, and optionally start with Windows. This path should require no
+  custom kernel driver and no debug COM port.
+- Keep battery telemetry lower priority than Keyboard and Consumer transitions,
+  deduplicate unchanged values, and confirm that it does not increase input
+  latency, prevent five-minute System OFF, or materially reduce battery life.
+
 ## Active wiring
 
 ### USB keyboard / converter board to RP2040
