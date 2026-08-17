@@ -35,7 +35,7 @@ pico_set_program_name(WirelessKeyboard "WirelessKeyboard")
 pico_set_program_version(WirelessKeyboard "0.2")
 
 pico_enable_stdio_usb(WirelessKeyboard 0)
-pico_enable_stdio_uart(WirelessKeyboard 1)
+pico_enable_stdio_uart(WirelessKeyboard 0)
 
 # === TINYUSB HOST MODE (PIO-USB on RHPORT1) ===
 target_compile_definitions(WirelessKeyboard PRIVATE
@@ -104,7 +104,7 @@ add_executable(WirelessKeyboardRam EXCLUDE_FROM_ALL
 pico_set_program_name(WirelessKeyboardRam "WirelessKeyboardRam")
 pico_set_program_version(WirelessKeyboardRam "0.2")
 pico_enable_stdio_usb(WirelessKeyboardRam 0)
-pico_enable_stdio_uart(WirelessKeyboardRam 1)
+pico_enable_stdio_uart(WirelessKeyboardRam 0)
 target_compile_definitions(WirelessKeyboardRam PRIVATE
     CFG_TUH_ENABLED=1
     CFG_TUH_RPI_PIO_USB=1

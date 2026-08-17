@@ -10,17 +10,17 @@ the nRF52840 transmitter over SPI.
 - Current working trees are authoritative; cloud copies are older fallbacks.
   Work on the existing `codex/*` branches and back up every file before edits.
 - RP2040: `C:\Users\Monard\Raspberry\WirelessKeyboard`, branch
-  `codex/low-power-stage-1`. Key commits: `0e0156d` (Consumer frames),
+  `codex/sticky-key-release-hardening`. Key commits: `0e0156d` (Consumer frames),
   `5410728` (four HID interfaces), `68516f4` (complete enumeration), `94a9d29`
   (release diagnostics off).
 - Transmitter: `C:\ncs\v3.4.0\myproject\Transmitter`, branch
-  `codex/low-power-stage-1`; the Stage 1 artifact is
+  `codex/sticky-key-release-hardening`; the matched artifact is
   `firmware/transmitter.uf2`, SHA-256
-  `E80C6D7D730C566358B7CDF54086B8B0F8393249072E9AA90320318E33FD7931`.
+  `39752BBAB30D0BFE655A21C82A2996D9A4A71A6632ED0E6343589ACD99D89837`.
 - Receiver: `C:\ncs\v3.4.0\myproject\Receiver`, branch
-  `codex/wireless-keyboard-receiver`, commit `5bdbfa1`; artifact
+  `codex/sticky-key-release-hardening`; matched artifact
   `firmware/receiver.hex`, SHA-256
-  `427C9E14587067CB422F2ABF32F872D733A81840BF3E8A3C9D12FF4052B1C3E5`.
+  `40CB154AC61EDFBE82812DEC32CECAFC70E167B54DCE1522C969A9867DFEAC94`.
 - A4Tech `VID 09DA / PID EA04` has three HID interfaces: keyboard (`inst=0`,
   EP `0x81`), mouse (`inst=1`, EP `0x82`), multimedia (`inst=2`, EP `0x83`,
   Report ID 3). `Fn+F2` was verified as Play/Pause `0x00CD`; multimedia works
@@ -45,6 +45,17 @@ the nRF52840 transmitter over SPI.
   OFF after five minutes without changed HID input. CSN/P0.22 wakes it and the
   RP2040 retransmits keyboard and Consumer state after the boot guard time.
   Hardware sleep-current and wake-latency validation remains required.
+- Sticky-key release hardening is implemented across the matched set. RP2040
+  restates its absolute keyboard state over SPI every 250 ms while the radio is
+  awake; the Transmitter deduplicates these frames and retries an unacknowledged
+  all-released radio report until delivery; the Receiver prioritizes the newest
+  keyboard state and locally releases all keys after 250 ms without a valid
+  keyboard packet. A legitimately held key remains active because its 8 ms
+  radio keepalive continuously refreshes this watchdog.
+- Normal RP2040 UART output and all Transmitter/Receiver logging, console,
+  boot-banner, UART and USB-CDC debug output are disabled in release builds.
+  Receiver enumerates as HID only; its former debug COM port is intentionally
+  absent.
 - Battery is `1S2P`: two `3.7 V / 2000 mAh / 7.4 Wh` cells in parallel, total
   `3.7 V / 4000 mAh / 14.8 Wh`, boosted to 5 V. No-sleep estimate: 30–50 hours
   continuously (central 35–40 hours); replace with a measured 5 V current.
@@ -131,6 +142,19 @@ Do not connect a Li-ion/LiPo battery directly to GP28. The documented
 - Per-report UART logging is disabled by default because it breaks 1 kHz input.
 - Long key holds are forwarded as state changes instead of being cut after the
   first few repeats.
+- RP2040 repeats the complete keyboard state to the Transmitter every 250 ms
+  while awake. Identical restatements are discarded before radio transmission,
+  so this repairs a lost write-only SPI transition without adding normal RF
+  traffic.
+- A keyboard release that misses its ESB acknowledgement remains pending in the
+  Transmitter and is retried; released-state keepalive stops only after a
+  successful delivery. Application-level ESB failure handling makes up to two
+  additional attempts before the next pending retry.
+- Receiver HID writes use a 20 ms bounded wait instead of blocking forever. Its
+  queue keeps the newest absolute keyboard state ahead of stale transitions,
+  and a 250 ms link watchdog sends an all-released report if pressed state is
+  no longer refreshed. The normal 8 ms held-key keepalive prevents false
+  releases during legitimate long holds.
 - Num Lock, Caps Lock, and Scroll Lock are tracked locally by the RP2040. On
   each new physical press, RP2040 toggles the matching HID Output bit and sends
   it back to the attached USB keyboard. No lock-state data is added to the
@@ -158,8 +182,12 @@ The build copies the current UF2 to:
 firmware/WirelessKeyboard.uf2
 ```
 
-The current Stage 1 RP2040 artifact has SHA-256
-`8A612FBD92415931CB25C59A806BC94ACC94EEDAA2D116AFF4D2BCAED76AD89B`.
+The current sticky-key-hardened RP2040 artifact has SHA-256
+`C9F881D1EDA500F6B9C164BB8EBE14D8B62FAB8A1D2732DFD820B9D8078F1742`.
+
+Flash all three artifacts as one matched protocol `0x02` set. Mixing one of
+these images with an older peer can restore the exact release-loss behavior
+that this hardening is designed to eliminate.
 
 For a normal board, flash either the build output or the committed UF2 artifact.
 

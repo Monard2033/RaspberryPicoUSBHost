@@ -11,6 +11,14 @@
 #include "host/usbh.h"
 #include "pio_usb.h"
 
+#ifndef RUNTIME_LOGGING
+#define RUNTIME_LOGGING 0
+#endif
+
+#if !RUNTIME_LOGGING
+#define printf(...) do { } while (0)
+#endif
+
 /*--------------------------------------------------------------------+
  *  Pin assignments
  *--------------------------------------------------------------------*/
@@ -37,6 +45,7 @@
 #define RADIO_WAKE_QUEUE_DEPTH 32u
 #define RADIO_SLEEP_BLINK_COUNT 4u
 #define RADIO_SLEEP_BLINK_HALF_PERIOD_MS 100u
+#define SPI_STATE_RECONCILE_MS 250u
 #define MAX_HID_REPORTS   8
 #define MAX_CONSUMER_FIELDS 16
 #define HID_KEY_A         0x04
@@ -172,6 +181,7 @@ static uint8_t radio_wake_queue_head;
 static uint8_t radio_wake_queue_count;
 static bool radio_sleep_indicator_active;
 static uint32_t radio_sleep_indicator_started_ms;
+static uint32_t spi_reconcile_after_ms;
 
 /* Locally simulated keyboard lock state. */
 static uint8_t           keyboard_led_state;
@@ -352,6 +362,7 @@ static void radio_power_task(void)
         spi_send_input(LINK_TYPE_KEYBOARD,
                        previous_output_valid ? previous_output_report : released);
         spi_send_input(LINK_TYPE_CONSUMER, consumer);
+        spi_reconcile_after_ms = board_millis() + SPI_STATE_RECONCILE_MS;
         return;
     }
 
@@ -748,6 +759,7 @@ static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN])
     }
 
     spi_send_input(LINK_TYPE_KEYBOARD, output);
+    spi_reconcile_after_ms = board_millis() + SPI_STATE_RECONCILE_MS;
     memcpy(previous_output_report, output, KBD_REPORT_LEN);
     previous_output_valid = true;
     total_output_reports_sent++;
@@ -758,6 +770,22 @@ static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN])
            output[0], output[1], output[2], output[3],
            output[4], output[5], output[6], output[7]);
 #endif
+}
+
+static void keyboard_spi_reconcile_task(void)
+{
+    uint32_t const now = board_millis();
+
+    if (radio_power_state != RADIO_AWAKE || !previous_output_valid ||
+        (int32_t)(now - spi_reconcile_after_ms) < 0) {
+        return;
+    }
+
+    /* SPI is write-only, so periodically restate the absolute keyboard state.
+     * Transmitter deduplicates it before ESB. A lost release is therefore
+     * repaired locally without adding periodic radio traffic. */
+    spi_send_input(LINK_TYPE_KEYBOARD, previous_output_report);
+    spi_reconcile_after_ms = now + SPI_STATE_RECONCILE_MS;
 }
 
 /*--------------------------------------------------------------------+
@@ -1234,6 +1262,11 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
 
 void tuh_hid_set_protocol_complete_cb(uint8_t dev_addr, uint8_t instance, uint8_t protocol)
 {
+#if !RUNTIME_LOGGING
+    (void)dev_addr;
+    (void)instance;
+    (void)protocol;
+#endif
     printf("[HID] Protocol set complete: dev=%u inst=%u protocol=%s\n",
            dev_addr, instance, protocol == HID_PROTOCOL_BOOT ? "BOOT" : "REPORT");
 }
@@ -1322,8 +1355,10 @@ int main(void)
     set_sys_clock_khz(120000, true);
 
     board_init();
+#if RUNTIME_LOGGING
     stdio_init_all();
     sleep_ms(100);
+#endif
 
     printf("\n\n=== RP2040 USB HID HOST + BATTERY/RGB LED (fully local) -> SPI BRIDGE ===\n");
     printf("[INIT] D+ = GP%d, D- = GP%d\n", USB_HOST_DP_PIN, USB_HOST_DP_PIN + 1);
@@ -1353,6 +1388,7 @@ int main(void)
 #endif
         led_blinking_task();
         keyboard_led_task();
+        keyboard_spi_reconcile_task();
         radio_power_task();
         battery_task();
         status_task();
