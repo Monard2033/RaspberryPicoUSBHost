@@ -98,24 +98,15 @@ the nRF52840 transmitter over SPI.
 
 ### Wireless battery telemetry
 
-- Add a compact battery-status packet from RP2040 to Receiver containing at
-  minimum percentage, measured millivolts, charging/discharging/idle state and
-  a freshness marker. RP2040 may continue sampling once per second locally,
-  but radio updates should be event-driven (for example on a 1% or material
-  state change) with a low-rate heartbeat such as once every 30-60 seconds.
-- Receiver must cache the latest battery record and expose it without restoring
-  UART or USB CDC. First investigate a standards-based USB HID battery usage
-  and verify whether the target Windows version actually displays it in the
-  native device UI; Bluetooth-style battery display must not be assumed for an
-  arbitrary USB HID device without runtime confirmation.
-- Provide a vendor-defined HID Feature/Input report as the reliable fallback.
-  A small Windows tray application can read that report through HIDAPI at a
-  fixed interval, display battery percentage and charge state, show when data
-  is stale, and optionally start with Windows. This path should require no
-  custom kernel driver and no debug COM port.
-- Keep battery telemetry lower priority than Keyboard and Consumer transitions,
-  deduplicate unchanged values, and confirm that it does not increase input
-  latency, prevent five-minute System OFF, or materially reduce battery life.
+- Implement the complete design in
+  [`docs/BATTERY_TELEMETRY_TODO.md`](docs/BATTERY_TELEMETRY_TODO.md). RP2040
+  samples locally once per second but normally sends only one latest-state
+  packet every 30 seconds, after 50 ms without changed HID input and only while
+  the radio is already awake and all urgent Keyboard/Consumer work is idle.
+- Battery traffic must remain lower priority, must not wake the Transmitter or
+  reset/postpone the five-minute inactivity deadline, and must expose a cached
+  Receiver value through tested standard HID support or a vendor HID report for
+  a no-driver Windows tray application.
 
 ## Active wiring
 
