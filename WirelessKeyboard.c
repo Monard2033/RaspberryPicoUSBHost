@@ -45,7 +45,8 @@
 #define RADIO_WAKE_QUEUE_DEPTH 32u
 #define RADIO_SLEEP_BLINK_COUNT 4u
 #define RADIO_SLEEP_BLINK_HALF_PERIOD_MS 100u
-#define SPI_STATE_RECONCILE_MS 250u
+#define SPI_KEYBOARD_RETRY_DELAY_US 1000u
+#define SPI_STATE_RECONCILE_MS 10u
 #define MAX_HID_REPORTS   8
 #define MAX_CONSUMER_FIELDS 16
 #define HID_KEY_A         0x04
@@ -271,6 +272,21 @@ static void spi_send_input(uint8_t type, const uint8_t data[KBD_REPORT_LEN])
            frame.data[0], frame.data[1], frame.data[2], frame.data[3],
            frame.data[4], frame.data[5], frame.data[6], frame.data[7]);
 #endif
+}
+
+static void spi_send_keyboard_transition(
+    const uint8_t data[KBD_REPORT_LEN])
+{
+    spi_send_input(LINK_TYPE_KEYBOARD, data);
+
+    /* SPIS must be re-armed by the nRF application after every transaction.
+     * Repeat changed keyboard state after a short guard interval so the normal
+     * press/release path does not have to wait for periodic reconciliation.
+     * The Transmitter discards the duplicate before ESB transmission. */
+    if (radio_power_state == RADIO_AWAKE) {
+        sleep_us(SPI_KEYBOARD_RETRY_DELAY_US);
+        spi_send_input(LINK_TYPE_KEYBOARD, data);
+    }
 }
 
 static bool keyboard_report_is_released(void)
@@ -758,7 +774,7 @@ static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN])
         return;
     }
 
-    spi_send_input(LINK_TYPE_KEYBOARD, output);
+    spi_send_keyboard_transition(output);
     spi_reconcile_after_ms = board_millis() + SPI_STATE_RECONCILE_MS;
     memcpy(previous_output_report, output, KBD_REPORT_LEN);
     previous_output_valid = true;
@@ -1226,7 +1242,7 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
     if (dev_addr == kbd_dev_addr && instance == kbd_instance) {
         uint8_t const released[KBD_REPORT_LEN] = { 0 };
 
-        spi_send_input(LINK_TYPE_KEYBOARD, released);
+        spi_send_keyboard_transition(released);
         forward_consumer_usage(0);
         null_movement_reset();
         keyboard_led_transfer_active = false;
@@ -1388,8 +1404,8 @@ int main(void)
 #endif
         led_blinking_task();
         keyboard_led_task();
-        keyboard_spi_reconcile_task();
         radio_power_task();
+        keyboard_spi_reconcile_task();
         battery_task();
         status_task();
     }

@@ -46,8 +46,9 @@ the nRF52840 transmitter over SPI.
   RP2040 retransmits keyboard and Consumer state after the boot guard time.
   Hardware sleep-current and wake-latency validation remains required.
 - Sticky-key release hardening is implemented across the matched set. RP2040
-  restates its absolute keyboard state over SPI every 250 ms while the radio is
-  awake; the Transmitter deduplicates these frames and retries an unacknowledged
+  sends each changed keyboard state twice with a 1 ms SPIS re-arm guard, then
+  restates its absolute state over SPI every 10 ms while the radio is awake;
+  the Transmitter deduplicates these frames and retries an unacknowledged
   all-released radio report until delivery; the Receiver prioritizes the newest
   keyboard state and locally releases all keys after 250 ms without a valid
   keyboard packet. A legitimately held key remains active because its 8 ms
@@ -142,10 +143,11 @@ Do not connect a Li-ion/LiPo battery directly to GP28. The documented
 - Per-report UART logging is disabled by default because it breaks 1 kHz input.
 - Long key holds are forwarded as state changes instead of being cut after the
   first few repeats.
-- RP2040 repeats the complete keyboard state to the Transmitter every 250 ms
-  while awake. Identical restatements are discarded before radio transmission,
-  so this repairs a lost write-only SPI transition without adding normal RF
-  traffic.
+- RP2040 sends every changed keyboard state twice, separated by a 1 ms SPIS
+  re-arm guard, and repeats the complete state every 10 ms while awake.
+  Identical restatements are discarded before radio transmission, so this
+  repairs a lost write-only SPI transition without adding normal RF traffic or
+  exposing the previous 250 ms recovery delay to normal typing.
 - A keyboard release that misses its ESB acknowledgement remains pending in the
   Transmitter and is retried; released-state keepalive stops only after a
   successful delivery. Application-level ESB failure handling makes up to two
@@ -183,7 +185,7 @@ firmware/WirelessKeyboard.uf2
 ```
 
 The current sticky-key-hardened RP2040 artifact has SHA-256
-`C9F881D1EDA500F6B9C164BB8EBE14D8B62FAB8A1D2732DFD820B9D8078F1742`.
+`46BB0D1BCF9B6D288F88289905A6E968596A3956DC1DD623E849CBFE62246980`.
 
 Flash all three artifacts as one matched protocol `0x02` set. Mixing one of
 these images with an older peer can restore the exact release-loss behavior
