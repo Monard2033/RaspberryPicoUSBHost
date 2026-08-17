@@ -35,6 +35,8 @@
 #define RADIO_OFF_SETTLE_MS 10u
 #define RADIO_BOOT_WAIT_MS  75u
 #define RADIO_WAKE_QUEUE_DEPTH 32u
+#define RADIO_SLEEP_BLINK_COUNT 4u
+#define RADIO_SLEEP_BLINK_HALF_PERIOD_MS 100u
 #define MAX_HID_REPORTS   8
 #define MAX_CONSUMER_FIELDS 16
 #define HID_KEY_A         0x04
@@ -169,6 +171,8 @@ struct pending_radio_input {
 static struct pending_radio_input radio_wake_queue[RADIO_WAKE_QUEUE_DEPTH];
 static uint8_t radio_wake_queue_head;
 static uint8_t radio_wake_queue_count;
+static bool radio_sleep_indicator_active;
+static uint32_t radio_sleep_indicator_started_ms;
 
 /* Locally simulated keyboard lock state. */
 static uint8_t           keyboard_led_state;
@@ -361,6 +365,8 @@ static void radio_power_task(void)
 
     uint8_t control[KBD_REPORT_LEN] = { LINK_CONTROL_SYSTEM_OFF };
     spi_send_input(LINK_TYPE_CONTROL, control);
+    radio_sleep_indicator_active = true;
+    radio_sleep_indicator_started_ms = now;
     radio_power_state = RADIO_SYSTEM_OFF;
     radio_wake_queue_head = 0;
     radio_wake_queue_count = 0;
@@ -879,6 +885,22 @@ static uint8_t battery_pct_for_mv(uint32_t batt_mv)
 
 static void battery_update_led(uint32_t now)
 {
+    if (radio_sleep_indicator_active) {
+        uint32_t const elapsed = now - radio_sleep_indicator_started_ms;
+        uint32_t const duration = RADIO_SLEEP_BLINK_COUNT * 2u *
+                                  RADIO_SLEEP_BLINK_HALF_PERIOD_MS;
+
+        if (elapsed < duration) {
+            if ((elapsed / RADIO_SLEEP_BLINK_HALF_PERIOD_MS) % 2u == 0u) {
+                led_apply((struct rgb_color) { 0, 0, 255 });
+            } else {
+                led_off();
+            }
+            return;
+        }
+        radio_sleep_indicator_active = false;
+    }
+
     struct rgb_color const color = battery_color_for_pct(battery_pct);
 
     switch (battery_led_state) {

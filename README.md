@@ -117,6 +117,10 @@ Do not connect a Li-ion/LiPo battery directly to GP28. The documented
 - After five inactive minutes, sleep is requested only when the normal keyboard
   report is all released, Consumer Usage is zero, and no local lock-LED control
   transfer is active. The RP2040 sends Control type `0x03`, command `0x01`.
+- At the exact moment this System OFF command is sent, the local RGB LED performs
+  four rapid blue flashes (100 ms ON, 100 ms OFF). This temporary indication has
+  priority over the battery/charging animation and confirms the RP2040 request;
+  only a current measurement proves that nRF52840 physically reached System OFF.
 - The Transmitter consumes the control frame locally, disables ESB, arms
   P0.22/CSN for LOW sense and enters nRF52840 System OFF. On the next HID change,
   RP2040 pulses CSN without clocks, waits for the nRF boot, then retransmits the
@@ -152,7 +156,7 @@ firmware/WirelessKeyboard.uf2
 ```
 
 The current Stage 1 RP2040 artifact has SHA-256
-`BBCBA37B3F4BBFE74A7A9BF7CE568B1EB841E057E13EDE17B6DD3DFDA2B2BD7A`.
+`71C7349D63D5DE4F87DAAC6E4BD255D2250D9AE7866763FB1F4A512E204C1536`.
 
 For a normal board, flash either the build output or the committed UF2 artifact.
 
