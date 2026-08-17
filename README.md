@@ -5,6 +5,51 @@ It reads the keyboard as a USB HID host through PIO-USB, applies local keyboard
 filters, then forwards keyboard state and supported Consumer Control keys to
 the nRF52840 transmitter over SPI.
 
+## Current handoff (2026-08-17)
+
+- Current working trees are authoritative; cloud copies are older fallbacks.
+  Work on the existing `codex/*` branches and back up every file before edits.
+- RP2040: `C:\Users\Monard\Raspberry\WirelessKeyboard`, branch
+  `codex/lock-led-battery-feedback`. Key commits: `0e0156d` (Consumer frames),
+  `5410728` (four HID interfaces), `68516f4` (complete enumeration), `94a9d29`
+  (release diagnostics off).
+- Transmitter: `C:\ncs\v3.4.0\myproject\Transmitter`, branch
+  `codex/wireless-keyboard-transmitter`, commit `4a3abef`; artifact
+  `firmware/transmitter.uf2`, SHA-256
+  `71E5EC1DB9AFE51227810CCC28165E48B323007BFAB7FEF355B4041D254FCBA1`.
+- Receiver: `C:\ncs\v3.4.0\myproject\Receiver`, branch
+  `codex/wireless-keyboard-receiver`, commit `5bdbfa1`; artifact
+  `firmware/receiver.hex`, SHA-256
+  `427C9E14587067CB422F2ABF32F872D733A81840BF3E8A3C9D12FF4052B1C3E5`.
+- A4Tech `VID 09DA / PID EA04` has three HID interfaces: keyboard (`inst=0`,
+  EP `0x81`), mouse (`inst=1`, EP `0x82`), multimedia (`inst=2`, EP `0x83`,
+  Report ID 3). `Fn+F2` was verified as Play/Pause `0x00CD`; multimedia works
+  end-to-end in Windows.
+- Keep `CFG_TUH_HID=4`. Select REPORT before `tuh_init()` with
+  `tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT)`. Do not call
+  `tuh_hid_set_protocol()` from the first mount callback; it interrupts
+  enumeration before `inst=1/2`.
+- `CONSUMER_DEBUG=0` is release mode; temporarily set `1` for changed raw HID
+  reports and descriptor dumps over DAPLink UART (`COM25`).
+- Link protocol is version `0x02` in all three firmware images. The fixed
+  12-byte SPI/ESB frame is magic `A5`, version, type, sequence, payload[8].
+  Types: Keyboard `0x01`, Consumer `0x02`; Consumer contains a little-endian
+  16-bit usage and preserves press/release. Flash compatible v2 images as a set.
+- Num/Caps/Scroll LED feedback and battery/RGB behavior stay local to RP2040;
+  neither lock state nor battery data is sent by radio.
+- Current uncommitted RP2040 adjustment moves RGB to red `GP21`, green `GP20`,
+  blue `GP19`. The rebuilt `firmware/WirelessKeyboard.uf2` currently has
+  SHA-256 `5F571E3230B648FDCAD5DE2C0ADC85BD63E091BC8C35B4CE835514387BACC03E`.
+  Preserve or commit this adjustment separately before other source changes.
+- Sleep is not implemented: RP2040 remains at 120 MHz servicing PIO-USB and
+  nRF52840 repeats a keyboard keepalive every 8 ms. Preferred future design:
+  stop released-state keepalives; after five inactive minutes send Control type
+  `0x03`, put nRF52840 in System OFF, wake through CSN/P0.22, wait for boot and
+  retransmit the complete state. RP2040 stays awake so any key can wake radio.
+- Battery is `1S2P`: two `3.7 V / 2000 mAh / 7.4 Wh` cells in parallel, total
+  `3.7 V / 4000 mAh / 14.8 Wh`, boosted to 5 V. No-sleep estimate: 30–50 hours
+  continuously (central 35–40 hours); replace with a measured 5 V current.
+
 ## Active wiring
 
 ### USB keyboard / converter board to RP2040
@@ -41,9 +86,9 @@ RGB LED. Use one current-limiting resistor for each color channel.
 
 | Component | RP2040 connection | Notes |
 | --- | --- | --- |
-| RGB red pin | GP10 through 220–330 Ω | PWM red channel |
-| RGB green pin | GP11 through 220–330 Ω | PWM green channel |
-| RGB blue pin | GP12 through 220–330 Ω | PWM blue channel |
+| RGB red pin | GP21 through 220–330 Ω | PWM red; current working tree |
+| RGB green pin | GP20 through 220–330 Ω | PWM green; current working tree |
+| RGB blue pin | GP19 through 220–330 Ω | PWM blue; current working tree |
 | RGB common cathode | GND | Default 4-pin LED configuration |
 | Battery positive | 200 kΩ to measurement node | High side of divider |
 | Measurement node | GP28 / ADC2 and 100 kΩ to GND | Battery voltage is divided by three |
