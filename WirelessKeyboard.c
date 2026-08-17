@@ -29,6 +29,12 @@
 #define LINK_VERSION      0x02
 #define LINK_TYPE_KEYBOARD 0x01
 #define LINK_TYPE_CONSUMER 0x02
+#define LINK_TYPE_CONTROL  0x03
+#define LINK_CONTROL_SYSTEM_OFF 0x01
+#define RADIO_INACTIVITY_MS (5u * 60u * 1000u)
+#define RADIO_OFF_SETTLE_MS 10u
+#define RADIO_BOOT_WAIT_MS  75u
+#define RADIO_WAKE_QUEUE_DEPTH 32u
 #define MAX_HID_REPORTS   8
 #define MAX_CONSUMER_FIELDS 16
 #define HID_KEY_A         0x04
@@ -141,6 +147,29 @@ static struct hid_instance_state hid_instances[CFG_TUH_HID];
 static uint16_t previous_consumer_usage;
 static bool previous_consumer_valid;
 
+enum radio_power_state {
+    RADIO_AWAKE,
+    RADIO_SYSTEM_OFF,
+    RADIO_WAKING,
+};
+
+static enum radio_power_state radio_power_state = RADIO_AWAKE;
+static uint32_t radio_last_activity_ms;
+static uint32_t radio_transition_after_ms;
+static bool radio_wake_requested;
+static uint32_t hid_activity_hash[CFG_TUH_HID];
+static uint16_t hid_activity_len[CFG_TUH_HID];
+static bool hid_activity_valid[CFG_TUH_HID];
+
+struct pending_radio_input {
+    uint8_t type;
+    uint8_t data[KBD_REPORT_LEN];
+};
+
+static struct pending_radio_input radio_wake_queue[RADIO_WAKE_QUEUE_DEPTH];
+static uint8_t radio_wake_queue_head;
+static uint8_t radio_wake_queue_count;
+
 /* Locally simulated keyboard lock state. */
 static uint8_t           keyboard_led_state;
 static uint8_t           keyboard_led_tx_value;
@@ -186,6 +215,21 @@ static void spi_master_init(void)
 
 static void spi_send_input(uint8_t type, const uint8_t data[KBD_REPORT_LEN])
 {
+    if (type != LINK_TYPE_CONTROL && radio_power_state != RADIO_AWAKE) {
+        if (radio_wake_queue_count == RADIO_WAKE_QUEUE_DEPTH) {
+            radio_wake_queue_head =
+                (uint8_t)((radio_wake_queue_head + 1u) % RADIO_WAKE_QUEUE_DEPTH);
+            --radio_wake_queue_count;
+        }
+        uint8_t const tail = (uint8_t)(
+            (radio_wake_queue_head + radio_wake_queue_count) %
+            RADIO_WAKE_QUEUE_DEPTH);
+        radio_wake_queue[tail].type = type;
+        memcpy(radio_wake_queue[tail].data, data, KBD_REPORT_LEN);
+        ++radio_wake_queue_count;
+        return;
+    }
+
     static uint8_t sequence;
     struct link_input_frame const frame = {
         .magic = LINK_MAGIC,
@@ -213,6 +257,117 @@ static void spi_send_input(uint8_t type, const uint8_t data[KBD_REPORT_LEN])
            frame.type, frame.sequence,
            frame.data[0], frame.data[1], frame.data[2], frame.data[3],
            frame.data[4], frame.data[5], frame.data[6], frame.data[7]);
+#endif
+}
+
+static bool keyboard_report_is_released(void)
+{
+    static uint8_t const released[KBD_REPORT_LEN] = { 0 };
+
+    return !previous_output_valid ||
+           memcmp(previous_output_report, released, sizeof(released)) == 0;
+}
+
+static uint32_t hid_report_hash(uint8_t const *report, uint16_t len)
+{
+    uint32_t hash = 2166136261u;
+
+    for (uint16_t i = 0; i < len; ++i) {
+        hash ^= report[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static bool hid_report_changed(uint8_t instance,
+                               uint8_t const *report, uint16_t len)
+{
+    if (instance >= CFG_TUH_HID) return true;
+
+    uint32_t const hash = hid_report_hash(report, len);
+    bool const changed = !hid_activity_valid[instance] ||
+        hid_activity_len[instance] != len ||
+        hid_activity_hash[instance] != hash;
+
+    hid_activity_hash[instance] = hash;
+    hid_activity_len[instance] = len;
+    hid_activity_valid[instance] = true;
+    return changed;
+}
+
+static void radio_note_activity(void)
+{
+    radio_last_activity_ms = board_millis();
+    if (radio_power_state == RADIO_SYSTEM_OFF) {
+        radio_wake_requested = true;
+    }
+}
+
+static void radio_start_wake(void)
+{
+    /* P0.22 is armed for active-low sense in System OFF. This first CSN pulse
+     * only wakes/reset the nRF; no SPI clocks are generated until it boots. */
+    gpio_put(PIN_SPI_CSN, 0);
+    sleep_us(100);
+    gpio_put(PIN_SPI_CSN, 1);
+    radio_power_state = RADIO_WAKING;
+    radio_wake_requested = false;
+    radio_transition_after_ms = board_millis() + RADIO_BOOT_WAIT_MS;
+}
+
+static void radio_power_task(void)
+{
+    uint32_t const now = board_millis();
+
+    if (radio_power_state == RADIO_SYSTEM_OFF) {
+        if (radio_wake_requested &&
+            (int32_t)(now - radio_transition_after_ms) >= 0) {
+            radio_start_wake();
+        }
+        return;
+    }
+
+    if (radio_power_state == RADIO_WAKING) {
+        if ((int32_t)(now - radio_transition_after_ms) < 0) return;
+
+        uint8_t const released[KBD_REPORT_LEN] = { 0 };
+        uint8_t consumer[KBD_REPORT_LEN] = {
+            (uint8_t)previous_consumer_usage,
+            (uint8_t)(previous_consumer_usage >> 8),
+            0, 0, 0, 0, 0, 0
+        };
+
+        radio_power_state = RADIO_AWAKE;
+        while (radio_wake_queue_count != 0) {
+            struct pending_radio_input const pending =
+                radio_wake_queue[radio_wake_queue_head];
+            radio_wake_queue_head = (uint8_t)(
+                (radio_wake_queue_head + 1u) % RADIO_WAKE_QUEUE_DEPTH);
+            --radio_wake_queue_count;
+            spi_send_input(pending.type, pending.data);
+        }
+        spi_send_input(LINK_TYPE_KEYBOARD,
+                       previous_output_valid ? previous_output_report : released);
+        spi_send_input(LINK_TYPE_CONSUMER, consumer);
+        return;
+    }
+
+    if ((uint32_t)(now - radio_last_activity_ms) < RADIO_INACTIVITY_MS ||
+        !keyboard_report_is_released() ||
+        (previous_consumer_valid && previous_consumer_usage != 0) ||
+        keyboard_led_transfer_active) {
+        return;
+    }
+
+    uint8_t control[KBD_REPORT_LEN] = { LINK_CONTROL_SYSTEM_OFF };
+    spi_send_input(LINK_TYPE_CONTROL, control);
+    radio_power_state = RADIO_SYSTEM_OFF;
+    radio_wake_queue_head = 0;
+    radio_wake_queue_count = 0;
+    radio_wake_requested = false;
+    radio_transition_after_ms = now + RADIO_OFF_SETTLE_MS;
+#if PERIODIC_DEBUG
+    printf("[POWER] nRF52840 System OFF requested after 5 minutes idle\n");
 #endif
 }
 
@@ -601,7 +756,7 @@ static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN])
 }
 
 /*--------------------------------------------------------------------+
- *  RGB battery LED — fully local to RP2040, PWM on GP10/11/12.
+ *  RGB battery LED — fully local to RP2040, PWM on GP21/20/19.
  *--------------------------------------------------------------------*/
 struct rgb_color {
     uint8_t r;
@@ -953,6 +1108,7 @@ static void usb_descriptor_dump_task(void)
  *--------------------------------------------------------------------*/
 void tuh_mount_cb(uint8_t dev_addr)
 {
+    radio_note_activity();
     printf("\n*** [USB] DEVICE MOUNTED: addr=%u ***\n", dev_addr);
     blink_interval_ms = BLINK_MOUNTED;
     pending_descriptor_dev_addr = dev_addr;
@@ -961,6 +1117,7 @@ void tuh_mount_cb(uint8_t dev_addr)
 
 void tuh_umount_cb(uint8_t dev_addr)
 {
+    radio_note_activity();
     printf("\n*** [USB] DEVICE UNMOUNTED: addr=%u ***\n", dev_addr);
     blink_interval_ms = BLINK_NOT_MOUNTED;
     if (dev_addr == kbd_dev_addr) { kbd_dev_addr = 0; kbd_is_mounted = false; }
@@ -1002,6 +1159,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
         &hid_instances[instance] : NULL;
     if (state != NULL) {
         memset(state, 0, sizeof(*state));
+        hid_activity_valid[instance] = false;
         state->dev_addr = dev_addr;
         if (desc_report != NULL && desc_len != 0) {
             state->report_count = tuh_hid_parse_report_descriptor(
@@ -1056,6 +1214,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
 
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
 {
+    radio_note_activity();
     printf("[HID] UNMOUNTED dev=%u inst=%u\n", dev_addr, instance);
     if (dev_addr == kbd_dev_addr && instance == kbd_instance) {
         uint8_t const released[KBD_REPORT_LEN] = { 0 };
@@ -1070,6 +1229,7 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
     }
     if (instance < CFG_TUH_HID) {
         memset(&hid_instances[instance], 0, sizeof(hid_instances[instance]));
+        hid_activity_valid[instance] = false;
     }
 }
 
@@ -1103,6 +1263,10 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
                                  uint8_t const *report, uint16_t len)
 {
     total_hid_reports_received++;
+
+    if (hid_report_changed(instance, report, len)) {
+        radio_note_activity();
+    }
 
 #if CONSUMER_DEBUG
     static uint8_t previous_raw[CFG_TUH_HID][64];
@@ -1200,6 +1364,7 @@ int main(void)
     battery_start_display();
 
     printf("[INIT] Ready. Waiting for keyboard on D+/D-...\n\n");
+    radio_last_activity_ms = board_millis();
 
     while (1) {
         tuh_task();
@@ -1209,6 +1374,7 @@ int main(void)
 #endif
         led_blinking_task();
         keyboard_led_task();
+        radio_power_task();
         battery_task();
         status_task();
     }

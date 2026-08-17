@@ -10,13 +10,13 @@ the nRF52840 transmitter over SPI.
 - Current working trees are authoritative; cloud copies are older fallbacks.
   Work on the existing `codex/*` branches and back up every file before edits.
 - RP2040: `C:\Users\Monard\Raspberry\WirelessKeyboard`, branch
-  `codex/lock-led-battery-feedback`. Key commits: `0e0156d` (Consumer frames),
+  `codex/low-power-stage-1`. Key commits: `0e0156d` (Consumer frames),
   `5410728` (four HID interfaces), `68516f4` (complete enumeration), `94a9d29`
   (release diagnostics off).
 - Transmitter: `C:\ncs\v3.4.0\myproject\Transmitter`, branch
-  `codex/wireless-keyboard-transmitter`, commit `4a3abef`; artifact
+  `codex/low-power-stage-1`; the Stage 1 artifact is
   `firmware/transmitter.uf2`, SHA-256
-  `71E5EC1DB9AFE51227810CCC28165E48B323007BFAB7FEF355B4041D254FCBA1`.
+  `E80C6D7D730C566358B7CDF54086B8B0F8393249072E9AA90320318E33FD7931`.
 - Receiver: `C:\ncs\v3.4.0\myproject\Receiver`, branch
   `codex/wireless-keyboard-receiver`, commit `5bdbfa1`; artifact
   `firmware/receiver.hex`, SHA-256
@@ -33,19 +33,18 @@ the nRF52840 transmitter over SPI.
   reports and descriptor dumps over DAPLink UART (`COM25`).
 - Link protocol is version `0x02` in all three firmware images. The fixed
   12-byte SPI/ESB frame is magic `A5`, version, type, sequence, payload[8].
-  Types: Keyboard `0x01`, Consumer `0x02`; Consumer contains a little-endian
-  16-bit usage and preserves press/release. Flash compatible v2 images as a set.
+  Types: Keyboard `0x01`, Consumer `0x02`, local Control `0x03`; Consumer
+  contains a little-endian 16-bit usage and preserves press/release. Control
+  command `0x01` requests Transmitter System OFF and is never relayed by ESB.
 - Num/Caps/Scroll LED feedback and battery/RGB behavior stay local to RP2040;
   neither lock state nor battery data is sent by radio.
-- Current uncommitted RP2040 adjustment moves RGB to red `GP21`, green `GP20`,
-  blue `GP19`. The rebuilt `firmware/WirelessKeyboard.uf2` currently has
-  SHA-256 `5F571E3230B648FDCAD5DE2C0ADC85BD63E091BC8C35B4CE835514387BACC03E`.
-  Preserve or commit this adjustment separately before other source changes.
-- Sleep is not implemented: RP2040 remains at 120 MHz servicing PIO-USB and
-  nRF52840 repeats a keyboard keepalive every 8 ms. Preferred future design:
-  stop released-state keepalives; after five inactive minutes send Control type
-  `0x03`, put nRF52840 in System OFF, wake through CSN/P0.22, wait for boot and
-  retransmit the complete state. RP2040 stays awake so any key can wake radio.
+- RGB uses red `GP21`, green `GP20`, blue `GP19`; this pin-only adjustment was
+  isolated in commit `ea4827d` before the low-power implementation.
+- Low-power Stage 1 is implemented. RP2040 remains at 120 MHz to service the
+  PIO-USB host, while nRF52840 stops released-state keepalives and enters System
+  OFF after five minutes without changed HID input. CSN/P0.22 wakes it and the
+  RP2040 retransmits keyboard and Consumer state after the boot guard time.
+  Hardware sleep-current and wake-latency validation remains required.
 - Battery is `1S2P`: two `3.7 V / 2000 mAh / 7.4 Wh` cells in parallel, total
   `3.7 V / 4000 mAh / 14.8 Wh`, boosted to 5 V. No-sleep estimate: 30–50 hours
   continuously (central 35–40 hours); replace with a measured 5 V current.
@@ -112,7 +111,18 @@ Do not connect a Li-ion/LiPo battery directly to GP28. The documented
 - Next, Previous, Mute, Play/Pause, Volume Down, and Volume Up are detected from
   HID Consumer Control reports and forwarded to the PC through the nRF52840
   receiver. Press and release transitions are preserved, while radio
-  keepalives repeat only the latest keyboard state.
+  keepalives repeat only the latest non-released keyboard state.
+- Every HID interface contributes to the inactivity timer when its report
+  content changes; identical USB polling reports do not keep the radio awake.
+- After five inactive minutes, sleep is requested only when the normal keyboard
+  report is all released, Consumer Usage is zero, and no local lock-LED control
+  transfer is active. The RP2040 sends Control type `0x03`, command `0x01`.
+- The Transmitter consumes the control frame locally, disables ESB, arms
+  P0.22/CSN for LOW sense and enters nRF52840 System OFF. On the next HID change,
+  RP2040 pulses CSN without clocks, waits for the nRF boot, then retransmits the
+  queued press/release transitions followed by the complete keyboard and
+  Consumer state. No additional wake wire is required, and a short tap during
+  the boot guard interval is not reduced to its final released state.
 - A/D and W/S use last-input-wins null movement filtering.
 - Per-report UART logging is disabled by default because it breaks 1 kHz input.
 - Long key holds are forwarded as state changes instead of being cut after the
@@ -140,6 +150,9 @@ The build copies the current UF2 to:
 ```text
 firmware/WirelessKeyboard.uf2
 ```
+
+The current Stage 1 RP2040 artifact has SHA-256
+`BBCBA37B3F4BBFE74A7A9BF7CE568B1EB841E057E13EDE17B6DD3DFDA2B2BD7A`.
 
 For a normal board, flash either the build output or the committed UF2 artifact.
 
