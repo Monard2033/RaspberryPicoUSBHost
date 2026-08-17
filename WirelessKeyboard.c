@@ -68,12 +68,11 @@
 #define BATT_MAX_MV        4200
 #define BATT_CHECK_MS      1000
 #define BATT_BOOT_SHOW_MS  5000
+#define BATT_EVENT_SHOW_MS 5000
 #define BATT_PULSE_WINDOW_MS 2000
 #define BATT_PULSE_PERIOD_MS 1000
-#define BATT_CHARGE_RISE_MV  12
-#define BATT_UNPLUG_DROP_MV  20
-#define BATT_ONE_PERCENT_MV   8
-#define BATT_TREND_SAMPLES    3
+#define BATT_PIN_EVENT_DELTA_MV 50
+#define BATT_EVENT_DELTA_MV (BATT_PIN_EVENT_DELTA_MV * BATT_DIVIDER_RATIO)
 
 // --- RGB LED, driven locally by RP2040 PWM, 3 consecutive free pins -----
 #define PIN_LED_R         21
@@ -844,11 +843,8 @@ static enum battery_led_state battery_led_state = BATT_LED_BOOT;
 static uint32_t battery_state_started_ms;
 static uint32_t battery_last_check_ms;
 static uint32_t battery_filtered_mv;
-static uint32_t battery_trend_reference_mv;
-static uint32_t battery_charge_peak_mv;
+static uint32_t battery_previous_sample_mv;
 static uint8_t battery_pct;
-static uint8_t battery_rise_samples;
-static uint8_t battery_drop_samples;
 static bool battery_charge_detected_during_boot;
 
 static void battery_adc_init(void)
@@ -930,8 +926,7 @@ static void battery_start_display(void)
     uint32_t const initial_mv = battery_read_mv();
 
     battery_filtered_mv = initial_mv;
-    battery_trend_reference_mv = initial_mv;
-    battery_charge_peak_mv = initial_mv;
+    battery_previous_sample_mv = initial_mv;
     battery_pct = battery_pct_for_mv(initial_mv);
     battery_state_started_ms = board_millis();
     battery_last_check_ms = battery_state_started_ms;
@@ -950,65 +945,28 @@ static void battery_sample_task(uint32_t now)
     battery_last_check_ms = now;
 
     uint32_t const sample_mv = battery_read_mv();
+    int32_t const delta_mv = (int32_t)sample_mv -
+                             (int32_t)battery_previous_sample_mv;
+    battery_previous_sample_mv = sample_mv;
     battery_filtered_mv = (battery_filtered_mv * 3 + sample_mv) / 4;
     battery_pct = battery_pct_for_mv(battery_filtered_mv);
 
-    if (battery_filtered_mv > battery_charge_peak_mv) {
-        battery_charge_peak_mv = battery_filtered_mv;
-    }
-
-    if (battery_led_state == BATT_LED_FULL) {
-        if (battery_pct <= 99 &&
-            battery_filtered_mv + BATT_ONE_PERCENT_MV <= BATT_MAX_MV) {
-            if (++battery_drop_samples >= BATT_TREND_SAMPLES) {
-                battery_led_state = BATT_LED_UNPLUG_SHOW;
-                battery_state_started_ms = now;
-                battery_drop_samples = 0;
-            }
+    /* Detect only a large step between consecutive one-second ADC samples.
+     * 50 mV at GP28 corresponds to 150 mV at the battery through the x3
+     * divider. Stable voltage is monitored silently and never latches an LED. */
+    if (delta_mv >= (int32_t)BATT_EVENT_DELTA_MV) {
+        if (battery_led_state == BATT_LED_BOOT) {
+            battery_charge_detected_during_boot = true;
         } else {
-            battery_drop_samples = 0;
-        }
-        return;
-    }
-
-    if (battery_led_state == BATT_LED_CHARGING) {
-        if (battery_pct >= 100) {
-            battery_led_state = BATT_LED_FULL;
+            battery_led_state = battery_pct >= 100 ?
+                BATT_LED_FULL : BATT_LED_CHARGING;
             battery_state_started_ms = now;
-            battery_drop_samples = 0;
-        } else if (battery_filtered_mv + BATT_UNPLUG_DROP_MV <
-                   battery_charge_peak_mv) {
-            if (++battery_drop_samples >= BATT_TREND_SAMPLES) {
-                battery_led_state = BATT_LED_IDLE;
-                battery_state_started_ms = now;
-                battery_trend_reference_mv = battery_filtered_mv;
-                battery_rise_samples = 0;
-                battery_drop_samples = 0;
-            }
-        } else {
-            battery_drop_samples = 0;
         }
-        return;
-    }
-
-    if (battery_filtered_mv >=
-        battery_trend_reference_mv + BATT_CHARGE_RISE_MV) {
-        if (++battery_rise_samples >= BATT_TREND_SAMPLES) {
-            if (battery_led_state == BATT_LED_BOOT) {
-                battery_charge_detected_during_boot = true;
-            } else {
-                battery_led_state = battery_pct >= 100 ?
-                    BATT_LED_FULL : BATT_LED_CHARGING;
-                battery_state_started_ms = now;
-            }
-            battery_charge_peak_mv = battery_filtered_mv;
-            battery_rise_samples = 0;
-        }
-    } else {
-        battery_rise_samples = 0;
-        /* Follow slow discharge downward without following noise upward. */
-        if (battery_filtered_mv < battery_trend_reference_mv) {
-            battery_trend_reference_mv = battery_filtered_mv;
+    } else if (delta_mv <= -(int32_t)BATT_EVENT_DELTA_MV) {
+        battery_charge_detected_during_boot = false;
+        if (battery_led_state != BATT_LED_BOOT) {
+            battery_led_state = BATT_LED_UNPLUG_SHOW;
+            battery_state_started_ms = now;
         }
     }
 }
@@ -1025,11 +983,10 @@ static void battery_task(void)
             (battery_pct >= 100 ? BATT_LED_FULL : BATT_LED_CHARGING) :
             BATT_LED_IDLE;
         battery_state_started_ms = now;
-    } else if (battery_led_state == BATT_LED_UNPLUG_SHOW &&
-               now - battery_state_started_ms >= BATT_BOOT_SHOW_MS) {
+    } else if (battery_led_state != BATT_LED_IDLE &&
+               now - battery_state_started_ms >= BATT_EVENT_SHOW_MS) {
         battery_led_state = BATT_LED_IDLE;
         battery_state_started_ms = now;
-        battery_trend_reference_mv = battery_filtered_mv;
     }
 
     battery_update_led(now);

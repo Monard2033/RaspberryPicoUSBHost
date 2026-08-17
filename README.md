@@ -141,11 +141,14 @@ Do not connect a Li-ion/LiPo battery directly to GP28. The documented
   differ from the operating-system state until they are toggled again.
 - At startup the RGB LED shows battery level for five seconds: green at
   75–100%, yellow at 50–74%, orange at 25–49%, and red at 0–24%.
-- Charging is inferred locally from a sustained filtered rise in battery
-  voltage. While charging below 100%, the current battery color performs two
-  ON/OFF cycles in each two-second window. At 100% it remains solid green.
-  After a confirmed drop of at least 1% from full, it shows the current color
-  for five more seconds and then turns off.
+- Battery voltage continues to be sampled once per second in the background.
+  Charging/discharging indications are event-based: the raw averaged sample
+  must change by at least 50 mV at GP28 versus the immediately previous sample
+  (equivalent to 150 mV at the battery through the x3 divider). A large rise
+  shows the charging animation for five seconds; a large drop shows the current
+  battery color for five seconds. Stable or slowly changing voltage keeps the
+  LED off after the five-second boot display, so an old event cannot latch a
+  continuous animation.
 
 ## Firmware
 
@@ -156,7 +159,7 @@ firmware/WirelessKeyboard.uf2
 ```
 
 The current Stage 1 RP2040 artifact has SHA-256
-`71C7349D63D5DE4F87DAAC6E4BD255D2250D9AE7866763FB1F4A512E204C1536`.
+`8A612FBD92415931CB25C59A806BC94ACC94EEDAA2D116AFF4D2BCAED76AD89B`.
 
 For a normal board, flash either the build output or the committed UF2 artifact.
 
