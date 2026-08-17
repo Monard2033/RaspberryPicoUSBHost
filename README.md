@@ -46,8 +46,9 @@ the nRF52840 transmitter over SPI.
   RP2040 retransmits keyboard and Consumer state after the boot guard time.
   Hardware sleep-current and wake-latency validation remains required.
 - Sticky-key release hardening is implemented across the matched set. RP2040
-  sends each changed keyboard state twice with a 1 ms SPIS re-arm guard, then
-  restates its absolute state over SPI every 10 ms while the radio is awake;
+  sends each changed keyboard state immediately and schedules a non-blocking
+  duplicate after a 250 us SPIS re-arm guard, then restates its absolute state
+  over SPI every 10 ms while the radio is awake;
   the Transmitter deduplicates these frames and retries an unacknowledged
   all-released radio report until delivery; the Receiver prioritizes the newest
   keyboard state and locally releases all keys after 250 ms without a valid
@@ -143,11 +144,13 @@ Do not connect a Li-ion/LiPo battery directly to GP28. The documented
 - Per-report UART logging is disabled by default because it breaks 1 kHz input.
 - Long key holds are forwarded as state changes instead of being cut after the
   first few repeats.
-- RP2040 sends every changed keyboard state twice, separated by a 1 ms SPIS
-  re-arm guard, and repeats the complete state every 10 ms while awake.
-  Identical restatements are discarded before radio transmission, so this
-  repairs a lost write-only SPI transition without adding normal RF traffic or
-  exposing the previous 250 ms recovery delay to normal typing.
+- RP2040 sends every changed keyboard state immediately, schedules its duplicate
+  non-blocking after a 250 us SPIS re-arm guard, and repeats the complete state
+  every 10 ms while awake. The TinyUSB callback contains no retry sleep and
+  rearms the keyboard endpoint immediately, preserving one new input report per
+  1 ms USB frame for a 1000 Hz source. Identical restatements are discarded
+  before radio transmission, so this repairs a lost write-only SPI transition
+  without adding normal RF traffic or exposing recovery delay to normal input.
 - A keyboard release that misses its ESB acknowledgement remains pending in the
   Transmitter and is retried; released-state keepalive stops only after a
   successful delivery. Application-level ESB failure handling makes up to two
@@ -188,7 +191,7 @@ firmware/WirelessKeyboard.uf2
 ```
 
 The current sticky-key-hardened RP2040 artifact has SHA-256
-`1DCE3A0D0619FD13E56D45F1ECE67E822003E58779C6B5BB98FE642524C73B79`.
+`05F575DF656CDCBFDC20944FE0C18B537DB89DFAEB252BAC149537D302FEE5D9`.
 
 Flash all three artifacts as one matched protocol `0x02` set. Mixing one of
 these images with an older peer can restore the exact release-loss behavior

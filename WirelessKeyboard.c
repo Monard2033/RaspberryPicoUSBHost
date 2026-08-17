@@ -45,7 +45,7 @@
 #define RADIO_WAKE_QUEUE_DEPTH 32u
 #define RADIO_SLEEP_BLINK_COUNT 4u
 #define RADIO_SLEEP_BLINK_HALF_PERIOD_MS 100u
-#define SPI_KEYBOARD_RETRY_DELAY_US 1000u
+#define SPI_KEYBOARD_RETRY_DELAY_US 250u
 #define SPI_STATE_RECONCILE_MS 10u
 #define MAX_HID_REPORTS   8
 #define MAX_CONSUMER_FIELDS 16
@@ -183,6 +183,9 @@ static uint8_t radio_wake_queue_count;
 static bool radio_sleep_indicator_active;
 static uint32_t radio_sleep_indicator_started_ms;
 static uint32_t spi_reconcile_after_ms;
+static uint8_t spi_keyboard_retry_data[KBD_REPORT_LEN];
+static bool spi_keyboard_retry_pending;
+static uint32_t spi_keyboard_retry_after_us;
 
 /* Locally simulated keyboard lock state. */
 static uint8_t           keyboard_led_state;
@@ -280,13 +283,29 @@ static void spi_send_keyboard_transition(
     spi_send_input(LINK_TYPE_KEYBOARD, data);
 
     /* SPIS must be re-armed by the nRF application after every transaction.
-     * Repeat changed keyboard state after a short guard interval so the normal
-     * press/release path does not have to wait for periodic reconciliation.
-     * The Transmitter discards the duplicate before ESB transmission. */
+     * Schedule a non-blocking duplicate after a short guard interval. Keeping
+     * the wait outside the TinyUSB callback lets it re-arm the 1 kHz endpoint
+     * immediately. The Transmitter discards the duplicate before ESB. */
     if (radio_power_state == RADIO_AWAKE) {
-        sleep_us(SPI_KEYBOARD_RETRY_DELAY_US);
-        spi_send_input(LINK_TYPE_KEYBOARD, data);
+        memcpy(spi_keyboard_retry_data, data, KBD_REPORT_LEN);
+        spi_keyboard_retry_after_us =
+            time_us_32() + SPI_KEYBOARD_RETRY_DELAY_US;
+        spi_keyboard_retry_pending = true;
     }
+}
+
+static void keyboard_spi_retry_task(void)
+{
+    if (!spi_keyboard_retry_pending) return;
+
+    if (radio_power_state != RADIO_AWAKE) {
+        spi_keyboard_retry_pending = false;
+        return;
+    }
+    if ((int32_t)(time_us_32() - spi_keyboard_retry_after_us) < 0) return;
+
+    spi_keyboard_retry_pending = false;
+    spi_send_input(LINK_TYPE_KEYBOARD, spi_keyboard_retry_data);
 }
 
 static bool keyboard_report_is_released(void)
@@ -1401,6 +1420,7 @@ int main(void)
 
     while (1) {
         tuh_task();
+        keyboard_spi_retry_task();
         usb_descriptor_dump_task();
 #if SPI_LINK_TEST_MODE
         spi_link_test_task();
