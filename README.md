@@ -62,6 +62,21 @@ the nRF52840 transmitter over SPI.
   `3.7 V / 4000 mAh / 14.8 Wh`, boosted to 5 V. No-sleep estimate: 30–50 hours
   continuously (central 35–40 hours); replace with a measured 5 V current.
 
+## TODO
+
+- Rapid consecutive multimedia actions currently have a visible delay compared
+  with normal keyboard keys. Apply the same non-blocking reliability principle
+  used by `LINK_TYPE_KEYBOARD` to `LINK_TYPE_CONSUMER`, without placing a sleep
+  in the TinyUSB callback.
+- Preserve every ordered Consumer Control edge (`press -> release -> press`):
+  use a small transition queue rather than only a single latest-state slot,
+  schedule the RP2040 SPI retry outside the callback, and keep each Consumer
+  frame pending in the Transmitter until ESB acknowledges it.
+- Receiver must discard only true retransmission duplicates while preserving
+  distinct rapid press/release transitions. Validate Play/Pause, Previous,
+  Next, Mute and Volume with repeated sub-10-ms actions, while confirming that
+  the 1 kHz normal-key path and low-power inactivity behavior are unchanged.
+
 ## Active wiring
 
 ### USB keyboard / converter board to RP2040
