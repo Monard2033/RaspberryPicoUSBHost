@@ -10,8 +10,9 @@ the nRF52840 transmitter over SPI.
 - Current working trees are authoritative; cloud copies are older fallbacks.
   Work on the existing `codex/*` branches and back up every file before edits.
 - RP2040: `C:\Users\Monard\Raspberry\WirelessKeyboard`, branch
-  `codex/ultra-fast-input-reliability`. The current change removes blocking SPI
-  work from the TinyUSB report callback and adds an ordered input FIFO.
+  `codex/fix-hid-rearm-liveness`. The current image keeps the ordered,
+  nonblocking 1 kHz input path and also recovers a transient TinyUSB HID
+  endpoint re-arm failure instead of leaving the keyboard permanently frozen.
 - Transmitter: `C:\ncs\v3.4.0\myproject\Transmitter`, branch
   `codex/ultra-fast-input-reliability`; the matched artifact is
   `firmware/transmitter.uf2`, SHA-256
@@ -84,9 +85,16 @@ the nRF52840 transmitter over SPI.
 - [x] Ordered Consumer transitions: press -> release -> press remains queued;
   Receiver discards only a same-sequence retransmission after its first queue
   insertion succeeds. Queue-overrun counters remain visible in diagnostic logs.
+- [x] Five-key/burst HID liveness: RP2040 still attempts to re-arm the USB HID
+  interrupt-IN endpoint immediately after every report. If TinyUSB temporarily
+  cannot claim or start that transfer, a per-interface pending bit retries from
+  the main loop until it succeeds. The normal callback remains nonblocking and
+  no permanent polling or retry delay was added.
 - [ ] Hardware acceptance: validate Play/Pause, Previous, Next, Mute and
   Volume with repeated sub-10-ms actions, then verify `Ctrl+C`, `Ctrl+V`, Shift
-  and Alt combinations at the 1 kHz source rate. Every multimedia release must
+  and Alt combinations at the 1 kHz source rate. Also hold and release 5 and 6
+  ordinary keys repeatedly, then press Num Lock without reconnecting; input and
+  the physical LED must continue responding. Every multimedia release must
   return to Consumer usage zero without a second press.
 
 ### Bidirectional lock-state synchronization
@@ -209,11 +217,13 @@ Do not connect a Li-ion/LiPo battery directly to GP28. The documented
   first few repeats.
 - RP2040 sends every changed keyboard/Consumer state into an ordered FIFO,
   schedules one exact-sequence duplicate nonblocking after a 250 us SPIS
-  re-arm guard, and rearms the TinyUSB endpoint immediately. There is no 10 ms
-  reconciliation loop on the urgent path: the duplicate and the Transmitter's
-  ESB-pending retry repair a lost write without delaying the next 1 ms USB
-  report. Keyboard restatements are deduplicated by absolute state; distinct
-  Consumer sequences are retained.
+  re-arm guard, and rearms the TinyUSB endpoint immediately. A transient
+  endpoint busy/start failure sets only a pending bit; the main loop retries it
+  without sleeping until TinyUSB accepts the next interrupt-IN transfer. There
+  is no 10 ms reconciliation loop on the urgent path: the duplicate and the
+  Transmitter's ESB-pending retry repair a lost write without delaying the next
+  1 ms USB report. Keyboard restatements are deduplicated by absolute state;
+  distinct Consumer sequences are retained.
 - A keyboard release that misses its ESB acknowledgement remains pending in the
   Transmitter and is retried; released-state keepalive stops only after a
   successful delivery. Application-level ESB failure handling makes up to two
@@ -259,7 +269,7 @@ firmware/WirelessKeyboard.uf2
 The current matched protocol `0x03` artifacts have these SHA-256 values:
 
 - RP2040 `firmware/WirelessKeyboard.uf2`:
-  `96DD1F9AB4A7FD45D5ED73B33319BDBFEA2490D14B44085BAA37B22AD401BAEE`
+  `107AE556C0BD5CFA7D6200BF2DACA7A53803B0012049F32602E4CAE670283D4D`
 - Transmitter `firmware/transmitter.uf2`:
   `551751E5353223CFDB7CF2456723514039473C2D11304410888080C6B2FAF89D`
 - Receiver `firmware/receiver.hex`:
