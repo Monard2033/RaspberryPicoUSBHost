@@ -10,9 +10,9 @@ the nRF52840 transmitter over SPI.
 - Current working trees are authoritative; cloud copies are older fallbacks.
   Work on the existing `codex/*` branches and back up every file before edits.
 - RP2040: `C:\Users\Monard\Raspberry\WirelessKeyboard`, branch
-  `codex/fix-keyboard-halt-recovery`. The current artifact is the silent
+  `codex/fix-sonix-keyboard-toggle-resync`. The current artifact is the silent
   release image for the keyboard host-stall investigation; its Keyboard HID
-  endpoint has explicit asynchronous halt recovery.
+  endpoint has explicit halt recovery and DATA-toggle resynchronization.
 - Transmitter: `C:\ncs\v3.4.0\myproject\Transmitter`, branch
   `codex/ultra-fast-input-reliability`; the matched artifact is
   `firmware/transmitter.uf2`, SHA-256
@@ -114,6 +114,12 @@ the nRF52840 transmitter over SPI.
   matching PIO-USB DATA toggle to DATA0 after success, then re-arms Keyboard.
   Normal 1 kHz input sends no control requests; Multimedia endpoint `0x83` is
   never reset or delayed by this recovery.
+- [x] SONiX Keyboard PID resynchronization: EP `0x81` uses complete absolute
+  keyboard states. When PIO-USB receives a CRC-valid DATA0/DATA1 mismatch on
+  that endpoint, it accepts that one state and resynchronizes the local toggle
+  instead of ACKing then discarding it. The RP2040 state comparison prevents a
+  duplicate packet from becoming a duplicate key action. This is limited to
+  Keyboard EP `0x81`; mouse and Multimedia endpoint semantics are unchanged.
 - [ ] Hardware acceptance: validate Play/Pause, Previous, Next, Mute and
   Volume with repeated sub-10-ms actions, then verify `Ctrl+C`, `Ctrl+V`, Shift
   and Alt combinations at the 1 kHz source rate. Also hold and release 5 and 6
@@ -312,10 +318,12 @@ the 1 kHz release.
 ### Release matched protocol `0x03` artifacts
 
 The current RP2040 release artifact is
-`3675D044D83B3DD30300793B76389778E161EBBED4AE214EE4D223E7C7987C3C`.
+`E90C76C9062093E84AC79F3C8D225FE5A01EDBF0214A171AED28CF134771301E`.
 It removes the post-mount BOOT protocol switch, makes Keyboard endpoint
 recovery nonblocking, and clears a detected Keyboard endpoint halt without
-resetting Multimedia. The Transmitter and Receiver artifacts remain:
+resetting Multimedia. It also resynchronizes a CRC-valid Keyboard PID mismatch
+instead of ACKing and discarding that complete input state. The Transmitter and
+Receiver artifacts remain:
 
 - Transmitter `firmware/transmitter.uf2`:
   `551751E5353223CFDB7CF2456723514039473C2D11304410888080C6B2FAF89D`

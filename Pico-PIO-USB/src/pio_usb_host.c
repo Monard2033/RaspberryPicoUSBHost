@@ -566,6 +566,21 @@ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
     if (receive_pid == expect_pid) {
       memcpy(ep->app_buf, &pp->usb_rx_buffer[2], receive_len);
       pio_usb_ll_transfer_continue(ep, receive_len);
+    } else if (ep->ep_num == 0x81 &&
+               (receive_pid == USB_PID_DATA0 || receive_pid == USB_PID_DATA1)) {
+      /* The SONiX keyboard sends complete, absolute HID states on EP 0x81.
+       * This PIO host already ACKed the CRC-valid packet above. Discarding a
+       * DATA-toggle mismatch after that ACK can leave host and keyboard out of
+       * phase until a later state change, which looks like a dead Keyboard
+       * interface while the independent Consumer endpoint still works.
+       *
+       * Accept this one state and set the local toggle from its received PID;
+       * pio_usb_ll_transfer_continue() flips it for the next expected packet.
+       * Higher-level keyboard-state deduplication prevents any duplicate key
+       * edge from being forwarded beyond the RP2040. */
+      ep->data_id = receive_pid == USB_PID_DATA1 ? 1 : 0;
+      memcpy(ep->app_buf, &pp->usb_rx_buffer[2], receive_len);
+      pio_usb_ll_transfer_continue(ep, receive_len);
     } else {
       // DATA0/1 mismatched, 0 for re-try next frame
     }
