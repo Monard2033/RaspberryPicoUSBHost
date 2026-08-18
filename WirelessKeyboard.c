@@ -199,6 +199,7 @@ static bool radio_wake_requested;
 static uint32_t hid_activity_hash[CFG_TUH_HID];
 static uint16_t hid_activity_len[CFG_TUH_HID];
 static bool hid_activity_valid[CFG_TUH_HID];
+static bool hid_receive_rearm_pending[CFG_TUH_HID];
 
 struct pending_radio_input {
     uint8_t type;
@@ -1479,6 +1480,34 @@ static void usb_descriptor_dump_task(void)
 /*--------------------------------------------------------------------+
  *  USB HID host callbacks
  *--------------------------------------------------------------------*/
+static void hid_receive_arm_or_defer(uint8_t dev_addr, uint8_t instance)
+{
+    if (instance >= CFG_TUH_HID) return;
+
+    /* A completed interrupt-IN transfer can briefly remain busy inside the
+     * host stack. Losing this one re-arm permanently stops all keyboard input,
+     * so remember the failure and retry from the main loop without blocking. */
+    hid_receive_rearm_pending[instance] =
+        !tuh_hid_receive_report(dev_addr, instance);
+}
+
+static void hid_receive_rearm_task(void)
+{
+    for (uint8_t instance = 0; instance < CFG_TUH_HID; ++instance) {
+        if (!hid_receive_rearm_pending[instance]) continue;
+
+        struct hid_instance_state const *state = &hid_instances[instance];
+        if (state->dev_addr == 0) {
+            hid_receive_rearm_pending[instance] = false;
+            continue;
+        }
+
+        if (tuh_hid_receive_report(state->dev_addr, instance)) {
+            hid_receive_rearm_pending[instance] = false;
+        }
+    }
+}
+
 void tuh_mount_cb(uint8_t dev_addr)
 {
     radio_note_activity();
@@ -1599,9 +1628,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
          * another control transfer from this mount callback would interrupt
          * TinyUSB while it is still configuring the remaining HID interfaces. */
     }
-    if (!tuh_hid_receive_report(dev_addr, instance)) {
-        printf("[HID][ERROR] Failed to arm receive for dev=%u inst=%u\n", dev_addr, instance);
-    }
+    hid_receive_arm_or_defer(dev_addr, instance);
 }
 
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
@@ -1621,6 +1648,7 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
         kbd_is_mounted = false;
     }
     if (instance < CFG_TUH_HID) {
+        hid_receive_rearm_pending[instance] = false;
         memset(&hid_instances[instance], 0, sizeof(hid_instances[instance]));
         hid_activity_valid[instance] = false;
     }
@@ -1713,10 +1741,9 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
         forward_consumer_usage(decode_consumer_usage(state, report, len));
     }
 
-    /* Re-arm immediately; no UART output is allowed before this at 1 kHz. */
-    if (!tuh_hid_receive_report(dev_addr, instance)) {
-        printf("[HID][ERROR] Failed to re-arm receive for dev=%u inst=%u\n", dev_addr, instance);
-    }
+    /* Re-arm immediately. A transient busy result is recovered by the
+     * nonblocking main-loop task instead of freezing this HID endpoint. */
+    hid_receive_arm_or_defer(dev_addr, instance);
 }
 
 /*--------------------------------------------------------------------+
@@ -1768,6 +1795,7 @@ int main(void)
 
     while (1) {
         tuh_task();
+        hid_receive_rearm_task();
         radio_power_task();
         battery_task();
         spi_ack_poll_task();
