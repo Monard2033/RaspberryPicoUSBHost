@@ -991,21 +991,100 @@ static bool keyboard_boot_report_has_error(
     return false;
 }
 
-/* The SPI/RF keyboard frame is the standard eight-byte 6KRO array.  Do not
- * forward HID ErrorRollOver/POSTFail/ErrorUndefined usages as ordinary keys.
- * This helper is valid only after the descriptor-selected payload has been
- * verified as exactly that eight-byte array; it must never be applied to an
- * NKRO bitmap. */
-static void keyboard_array_report_normalize(uint8_t const report[KBD_REPORT_LEN],
-                                            uint8_t normalized[KBD_REPORT_LEN])
+/*
+ * Decodes any incoming keyboard report:
+ * 1. Standard 6KRO 8-byte report: [modifier, reserved, k1..k6]
+ * 2. 6KRO with 1-byte Report ID (9 bytes): [id, modifier, reserved, k1..k6]
+ * 3. NKRO Bitmap report (10 to 64 bytes): [modifier, bitmap...] or [id, modifier, bitmap...]
+ * Outputs standard 8-byte normalized report [modifier, 0, key1..key6].
+ * Returns true if valid keyboard report decoded.
+ */
+static bool keyboard_decode_report(uint8_t const *report, uint16_t len,
+                                   uint8_t output[KBD_REPORT_LEN])
 {
-    memcpy(normalized, report, KBD_REPORT_LEN);
-    if (keyboard_boot_report_has_error(normalized)) {
-        /* Do not forward rollover/error usages through the RF link. Releasing
-         * regular keys is safe; retain modifiers so a transient rollover does
-         * not manufacture an unexpected modifier-up edge. */
-        memset(normalized + 2, 0, KBD_REPORT_LEN - 2);
+    if (report == NULL || len == 0) return false;
+
+    memset(output, 0, KBD_REPORT_LEN);
+
+    /* Case 1: Standard 8-byte boot keyboard report */
+    if (len == KBD_REPORT_LEN) {
+        memcpy(output, report, KBD_REPORT_LEN);
+        output[1] = 0; /* Clear reserved byte */
+        if (keyboard_boot_report_has_error(output)) {
+            /* Rollover/error: clear keys, retain modifiers */
+            memset(output + 2, 0, KBD_REPORT_LEN - 2);
+        }
+        return true;
     }
+
+    /* Case 2: 9-byte report (1 byte Report ID + standard 8-byte 6KRO) */
+    if (len == 9) {
+        output[0] = report[1]; /* Modifier */
+        output[1] = 0;
+        memcpy(output + 2, report + 3, 6);
+        if (keyboard_boot_report_has_error(output)) {
+            memset(output + 2, 0, KBD_REPORT_LEN - 2);
+        }
+        return true;
+    }
+
+    /* Case 3: NKRO Bitmap report (> 9 bytes, e.g. 15, 16, 29, 32, 64 bytes) */
+    if (len >= 10) {
+        uint8_t modifier = 0;
+        uint8_t const *bitmap = NULL;
+        uint16_t bitmap_len = 0;
+
+        /* Check if report has a Report ID prefix in byte 0 */
+        if (keyboard_input_report_id != 0 && report[0] == keyboard_input_report_id) {
+            modifier = report[1];
+            bitmap = report + 2;
+            bitmap_len = len - 2;
+        } else if (report[0] != 0 && report[0] <= 0x0F && len >= 12) {
+            /* Likely Report ID in byte 0, modifier in byte 1 */
+            modifier = report[1];
+            bitmap = report + 2;
+            bitmap_len = len - 2;
+        } else {
+            /* Modifier in byte 0, bitmap starts at byte 1 */
+            modifier = report[0];
+            bitmap = report + 1;
+            bitmap_len = len - 1;
+        }
+
+        output[0] = modifier;
+        output[1] = 0;
+
+        uint8_t key_idx = 2;
+
+        /* Standard USB HID NKRO key bitmap layout (0-indexed usages 0..255) */
+        for (uint16_t b = 0; b < bitmap_len && key_idx < KBD_REPORT_LEN; ++b) {
+            uint8_t const byte_val = bitmap[b];
+            if (byte_val == 0) continue;
+
+            for (uint8_t bit = 0; bit < 8 && key_idx < KBD_REPORT_LEN; ++bit) {
+                if ((byte_val & (1u << bit)) != 0) {
+                    uint16_t const usage = (uint16_t)(b * 8u + bit);
+                    if (usage >= 0x04 && usage <= 0xE7) {
+                        output[key_idx++] = (uint8_t)usage;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    /* Short or non-standard report (< 8 bytes) */
+    if (len > 0) {
+        output[0] = report[0];
+        output[1] = 0;
+        uint16_t const copy_len = len > 2 ? (len - 2 > 6 ? 6 : len - 2) : 0;
+        if (copy_len > 0) {
+            memcpy(output + 2, report + 2, copy_len);
+        }
+        return true;
+    }
+
+    return false;
 }
 
 static void keyboard_led_reset(void)
@@ -1911,16 +1990,21 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
             keyboard_recovery_after_ms = board_millis();
         } else {
             keyboard_last_report_ms = board_millis();
+            uint8_t normalized[KBD_REPORT_LEN];
+            if (keyboard_decode_report(report, len, normalized)) {
+                (void)usb_host_event_push(USB_HOST_EVENT_KEYBOARD_REPORT,
+                                          dev_addr, instance, normalized);
+            }
+#if HOT_PATH_DEBUG
+            if (len >= KBD_REPORT_LEN) {
+                printf("[HID RX #%lu] len=%u mod=%02x keys=%02x %02x %02x %02x %02x %02x\n",
+                        (unsigned long)total_hid_reports_received, len,
+                        normalized[0], normalized[2], normalized[3],
+                        normalized[4], normalized[5], normalized[6], normalized[7]);
+            }
+#endif
         }
-        bool const keyboard_report = !keyboard_uses_report_protocol ||
-            (info != NULL && info->usage_page == HID_USAGE_PAGE_DESKTOP &&
-             info->usage == HID_USAGE_DESKTOP_KEYBOARD);
-        uint8_t const *keyboard_payload = keyboard_uses_report_protocol ?
-            payload : report;
-        uint16_t const keyboard_payload_len = keyboard_uses_report_protocol ?
-            payload_len : len;
 #if HID_DIAGNOSTIC_LOG
-        bool diagnostic_emitted = false;
         if (hid_changed &&
             (uint32_t)(keyboard_last_report_ms - keyboard_last_diagnostic_ms) >= 5u) {
             uint8_t const b0 = len > 0 ? report[0] : 0;
@@ -1931,43 +2015,10 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
             uint8_t const b5 = len > 5 ? report[5] : 0;
             uint8_t const b6 = len > 6 ? report[6] : 0;
             uint8_t const b7 = len > 7 ? report[7] : 0;
-            printf("[KBD RX] len=%u mode=%s raw=%02x %02x %02x %02x %02x %02x %02x %02x q=%u retry=%u\n",
-                   len, keyboard_uses_report_protocol ? "REPORT" : "BOOT",
-                   b0, b1, b2, b3, b4, b5, b6, b7,
+            printf("[KBD RX] len=%u raw=%02x %02x %02x %02x %02x %02x %02x %02x q=%u retry=%u\n",
+                   len, b0, b1, b2, b3, b4, b5, b6, b7,
                    spi_input_queue_count, spi_retry_pending ? 1u : 0u);
             keyboard_last_diagnostic_ms = keyboard_last_report_ms;
-            diagnostic_emitted = true;
-        }
-#endif
-        if (!keyboard_xfer_failed && keyboard_report && keyboard_uses_report_protocol &&
-            keyboard_payload_len == KBD_REPORT_LEN) {
-            uint8_t normalized[KBD_REPORT_LEN];
-            keyboard_array_report_normalize(keyboard_payload, normalized);
-            (void)usb_host_event_push(USB_HOST_EVENT_KEYBOARD_REPORT,
-                                      dev_addr, instance, normalized);
-        } else if (!keyboard_xfer_failed && keyboard_report && !keyboard_uses_report_protocol) {
-            if (keyboard_payload_len == KBD_REPORT_LEN) {
-                uint8_t normalized[KBD_REPORT_LEN];
-                keyboard_array_report_normalize(keyboard_payload, normalized);
-                (void)usb_host_event_push(USB_HOST_EVENT_KEYBOARD_REPORT,
-                                          dev_addr, instance, normalized);
-            }
-#if HOT_PATH_DEBUG
-            if (keyboard_payload_len >= KBD_REPORT_LEN) {
-                printf("[HID RX #%lu] mod=%02x res=%02x keys=%02x %02x %02x %02x %02x %02x\n",
-                        (unsigned long)total_hid_reports_received,
-                        keyboard_payload[0], keyboard_payload[1],
-                        keyboard_payload[2], keyboard_payload[3],
-                        keyboard_payload[4], keyboard_payload[5],
-                        keyboard_payload[6], keyboard_payload[7]);
-            }
-#endif
-        }
-#if HID_DIAGNOSTIC_LOG
-        if (diagnostic_emitted) {
-            printf("[KBD DONE] q=%u retry=%u pressed=%u\n",
-                   spi_input_queue_count, spi_retry_pending ? 1u : 0u,
-                   keyboard_report_is_released() ? 0u : 1u);
         }
 #endif
     }
@@ -2053,7 +2104,7 @@ static void usb_host_core1_main(void)
     pio_cfg.pin_dp = USB_HOST_DP_PIN;
     tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION,
                   &pio_cfg);
-    tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT);
+    tuh_hid_set_default_protocol(HID_PROTOCOL_BOOT);
     tuh_init(BOARD_TUH_RHPORT);
 
     while (true) {

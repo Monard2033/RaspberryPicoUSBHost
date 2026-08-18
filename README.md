@@ -318,12 +318,12 @@ the 1 kHz release.
 ### Release matched protocol `0x03` artifacts
 
 The current RP2040 release artifact is
-`E90C76C9062093E84AC79F3C8D225FE5A01EDBF0214A171AED28CF134771301E`.
-It removes the post-mount BOOT protocol switch, makes Keyboard endpoint
-recovery nonblocking, and clears a detected Keyboard endpoint halt without
-resetting Multimedia. It also resynchronizes a CRC-valid Keyboard PID mismatch
-instead of ACKing and discarding that complete input state. The Transmitter and
-Receiver artifacts remain:
+`A40E67B5A94028FF32370D34684ABD222DB144915CCB762EC770B269E6F5FFB3`.
+It adds universal keyboard report decoding (supporting standard 6KRO 8-byte,
+9-byte Report-ID, and NKRO bitmaps from 10 to 64 bytes), eliminates rigid
+8-byte length filtering, configures default BOOT protocol for boot keyboards
+while keeping Consumer Control in Report protocol, and provides nonblocking
+endpoint recovery. The Transmitter and Receiver artifacts remain:
 
 - Transmitter `firmware/transmitter.uf2`:
   `551751E5353223CFDB7CF2456723514039473C2D11304410888080C6B2FAF89D`
