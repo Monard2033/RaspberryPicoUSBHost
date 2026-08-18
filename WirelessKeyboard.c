@@ -53,8 +53,6 @@
 #define RADIO_SLEEP_BLINK_HALF_PERIOD_MS 100u
 #define SPI_REARM_GUARD_US 250u
 #define SPI_ACK_POLL_MS 100u
-#define KEYBOARD_BOOT_PROTOCOL_DELAY_MS 250u
-#define KEYBOARD_BOOT_PROTOCOL_RETRY_MS 50u
 #define KEYBOARD_HID_STALL_RECOVERY_MS 250u
 #define RP2040_WATCHDOG_TIMEOUT_MS 1000u
 #define BATTERY_TELEMETRY_PERIOD_MS 30000u
@@ -147,9 +145,6 @@ static uint8_t           keyboard_led_output_report_id;
 static uint8_t           keyboard_led_output_report_len = 1;
 static uint16_t          keyboard_led_output_bit_offsets[3] = { 0, 1, 2 };
 static bool              keyboard_uses_report_protocol;
-static bool              keyboard_boot_protocol_pending;
-static bool              keyboard_boot_protocol_transfer_active;
-static uint32_t          keyboard_boot_protocol_after_ms;
 static uint32_t          keyboard_last_report_ms;
 #if HID_DIAGNOSTIC_LOG
 static uint32_t          keyboard_last_diagnostic_ms;
@@ -1580,25 +1575,6 @@ static void keyboard_hid_stall_recovery_task(void)
     hid_receive_arm_or_defer(kbd_dev_addr, kbd_instance);
 }
 
-static void keyboard_boot_protocol_task(void)
-{
-    if (!kbd_is_mounted || !keyboard_boot_protocol_pending ||
-        keyboard_boot_protocol_transfer_active ||
-        (int32_t)(board_millis() - keyboard_boot_protocol_after_ms) < 0) {
-        return;
-    }
-
-    /* Keep REPORT as the default while the composite device enumerates so the
-     * Consumer interface remains intact. The boot keyboard alone is switched
-     * after enumeration to receive its defined fixed eight-byte format. */
-    if (tuh_hid_set_protocol(kbd_dev_addr, kbd_instance, HID_PROTOCOL_BOOT)) {
-        keyboard_boot_protocol_transfer_active = true;
-    } else {
-        keyboard_boot_protocol_after_ms = board_millis() +
-            KEYBOARD_BOOT_PROTOCOL_RETRY_MS;
-    }
-}
-
 void tuh_mount_cb(uint8_t dev_addr)
 {
     radio_note_activity();
@@ -1692,13 +1668,12 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
         keyboard_led_output_bit_offsets[0] = 0;
         keyboard_led_output_bit_offsets[1] = 1;
         keyboard_led_output_bit_offsets[2] = 2;
-        /* Diagnostic and normal operation both require REPORT protocol: boot
-         * protocol intentionally removes non-boot multimedia information. */
+        /* Keep the interface in the default REPORT protocol. Do not issue a
+         * runtime SET_PROTOCOL(BOOT): this composite keyboard has separate
+         * keyboard/mouse/consumer collections and a concurrent control
+         * transfer can leave the PIO-USB HID IN path stale during rapid
+         * multi-key transitions. */
         keyboard_uses_report_protocol = true;
-        keyboard_boot_protocol_pending = true;
-        keyboard_boot_protocol_transfer_active = false;
-        keyboard_boot_protocol_after_ms = board_millis() +
-            KEYBOARD_BOOT_PROTOCOL_DELAY_MS;
         keyboard_last_report_ms = board_millis();
         if (state != NULL) {
             for (uint8_t i = 0; i < state->report_count; ++i) {
@@ -1742,8 +1717,6 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
         remote_keyboard_led_valid = false;
         kbd_dev_addr = 0;
         kbd_is_mounted = false;
-        keyboard_boot_protocol_pending = false;
-        keyboard_boot_protocol_transfer_active = false;
         keyboard_last_report_ms = 0;
     }
     if (instance < CFG_TUH_HID) {
@@ -1771,25 +1744,6 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
         keyboard_led_update_pending = true;
         keyboard_led_retry_after_ms = board_millis() + 100;
     }
-}
-
-void tuh_hid_set_protocol_complete_cb(uint8_t dev_addr, uint8_t instance, uint8_t protocol)
-{
-    if (dev_addr == kbd_dev_addr && instance == kbd_instance &&
-        keyboard_boot_protocol_transfer_active) {
-        keyboard_boot_protocol_transfer_active = false;
-        keyboard_uses_report_protocol = protocol != HID_PROTOCOL_BOOT;
-        keyboard_boot_protocol_pending = keyboard_uses_report_protocol;
-        keyboard_boot_protocol_after_ms = board_millis() +
-            KEYBOARD_BOOT_PROTOCOL_RETRY_MS;
-    }
-#if !RUNTIME_LOGGING
-    (void)dev_addr;
-    (void)instance;
-    (void)protocol;
-#endif
-    printf("[HID] Protocol set complete: dev=%u inst=%u protocol=%s\n",
-           dev_addr, instance, protocol == HID_PROTOCOL_BOOT ? "BOOT" : "REPORT");
 }
 
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
@@ -1948,7 +1902,6 @@ int main(void)
     while (1) {
         watchdog_update();
         tuh_task();
-        keyboard_boot_protocol_task();
         hid_receive_rearm_task();
         keyboard_hid_stall_recovery_task();
         radio_power_task();
