@@ -422,9 +422,15 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
 
     if (keyboard_led_state != remote_keyboard_led_state) {
         keyboard_led_state = remote_keyboard_led_state;
-        keyboard_led_update_pending = true;
-        keyboard_led_retry_after_ms = 0;
+        keyboard_led_update_pending = false;
     }
+#if HID_DIAGNOSTIC_LOG
+    static uint8_t last_logged_led = 0xFF;
+    if (ack.data[0] != last_logged_led) {
+        printf("[SPI ACK] seq=%u led=0x%02x\n", ack.sequence, ack.data[0]);
+        last_logged_led = ack.data[0];
+    }
+#endif
 }
 
 static void spi_write_frame(struct link_input_frame const *frame)
@@ -443,7 +449,13 @@ static void spi_write_frame(struct link_input_frame const *frame)
 
     total_spi_frames_sent++;
     spi_process_ack(rx);
-#if HOT_PATH_DEBUG
+#if HID_DIAGNOSTIC_LOG
+    printf("[SPI TX #%lu] type=%u seq=%u data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+           (unsigned long)total_spi_frames_sent,
+           frame->type, frame->sequence,
+           frame->data[0], frame->data[1], frame->data[2], frame->data[3],
+           frame->data[4], frame->data[5], frame->data[6], frame->data[7]);
+#elif HOT_PATH_DEBUG
     uint32_t const dt_us = time_us_32() - t0;
     printf("[SPI TX #%lu] took %lu us | type=%u seq=%u data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
            (unsigned long)total_spi_frames_sent, (unsigned long)dt_us,
@@ -1098,7 +1110,7 @@ static void keyboard_led_reset(void)
     keyboard_led_retry_after_ms = 0;
 }
 
-static void keyboard_led_build_output_report(uint8_t led_state)
+static void __unused keyboard_led_build_output_report(uint8_t led_state)
 {
     memset(keyboard_led_tx_report, 0, sizeof(keyboard_led_tx_report));
     for (uint8_t i = 0; i < 3; ++i) {
@@ -1143,26 +1155,11 @@ static void keyboard_led_toggle_on_press(
     keyboard_lock_pressed = pressed_now;
 }
 
-/* SET_REPORT is a control transfer, so keep its one-byte buffer alive and
- * submit it from the main loop rather than from the input-report callback. */
+/* LED output is managed locally on keyboard hardware; disable runtime SET_REPORT
+ * control transfers to prevent collisions with 1 kHz Interrupt-IN transfers. */
 static void keyboard_led_task(void)
 {
-    if (!kbd_is_mounted || !keyboard_led_update_pending ||
-        keyboard_led_transfer_active ||
-        (int32_t)(board_millis() - keyboard_led_retry_after_ms) < 0) {
-        return;
-    }
-
-    keyboard_led_build_output_report(keyboard_led_state);
-    if (tuh_hid_set_report(kbd_dev_addr, kbd_instance,
-                           keyboard_led_output_report_id,
-                           HID_REPORT_TYPE_OUTPUT,
-                           keyboard_led_tx_report,
-                           keyboard_led_output_report_len)) {
-        keyboard_led_transfer_active = true;
-    } else {
-        keyboard_led_retry_after_ms = board_millis() + 100;
-    }
+    keyboard_led_update_pending = false;
 }
 
 static void null_movement_reset(void)

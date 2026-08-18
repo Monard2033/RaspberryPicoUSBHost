@@ -318,7 +318,7 @@ the 1 kHz release.
 ### Release matched protocol `0x03` artifacts
 
 The current RP2040 release artifact is
-`A79F1B80F6B1521C4FEB62971935D729441574558019310AC9156014598A295B`.
+`AF77E97C1DE9BAF18121CD4994ED5D06F0324235F600FB1FE8FD0A2DE373A6B2`.
 It adds universal keyboard report decoding (supporting standard 6KRO 8-byte,
 9-byte Report-ID, and NKRO bitmaps from 10 to 64 bytes), eliminates rigid
 8-byte length filtering, configures default BOOT protocol for boot keyboards
