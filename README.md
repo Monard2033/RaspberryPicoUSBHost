@@ -10,9 +10,9 @@ the nRF52840 transmitter over SPI.
 - Current working trees are authoritative; cloud copies are older fallbacks.
   Work on the existing `codex/*` branches and back up every file before edits.
 - RP2040: `C:\Users\Monard\Raspberry\WirelessKeyboard`, branch
-  `codex/fix-report-protocol-host-stall`. The current artifact is the silent
+  `codex/fix-keyboard-endpoint-recovery`. The current artifact is the silent
   release image for the `V+A+W+D` host-stall investigation; its keyboard HID
-  interface remains in REPORT protocol throughout operation.
+  interface remains in REPORT protocol and has nonblocking endpoint recovery.
 - Transmitter: `C:\ncs\v3.4.0\myproject\Transmitter`, branch
   `codex/ultra-fast-input-reliability`; the matched artifact is
   `firmware/transmitter.uf2`, SHA-256
@@ -98,12 +98,15 @@ the nRF52840 transmitter over SPI.
   report, preserves simultaneous keys beyond the Boot-protocol limit, and
   treats HID `ErrorRollOver`/`POSTFail`/`ErrorUndefined` usages as a safe
   non-key state rather than forwarding them to the radio link.
-- [x] Held-key host-stall recovery: while the local keyboard state is pressed,
-  RP2040 detects 250 ms without a keyboard report, aborts only the stale HID
-  interrupt-IN transfer and re-arms it without waiting. The local A/D and W/S
-  last-input-wins filter is disabled by default: raw simultaneous keys are
-  forwarded unchanged, prioritizing reliability over that game-specific filter.
-  A one-second RP2040 hardware watchdog resets a genuine main-loop hard hang.
+- [x] Held-key host-stall recovery: Keyboard and Consumer use independent HID
+  interrupt-IN endpoints. If Keyboard (`inst=0`) becomes ready after an error,
+  RP2040 re-arms it even after a released state. If a pressed Keyboard transfer
+  is stale, it is aborted and re-armed only when the PIO USB frame is no longer
+  active; the abort path never waits or blocks Consumer (`inst=2`). The local
+  A/D and W/S last-input-wins filter is disabled by default: raw simultaneous
+  keys are forwarded unchanged, prioritizing reliability over that game-specific
+  filter. A one-second RP2040 hardware watchdog resets a genuine main-loop hard
+  hang.
 - [ ] Hardware acceptance: validate Play/Pause, Previous, Next, Mute and
   Volume with repeated sub-10-ms actions, then verify `Ctrl+C`, `Ctrl+V`, Shift
   and Alt combinations at the 1 kHz source rate. Also hold and release 5 and 6
@@ -302,9 +305,10 @@ the 1 kHz release.
 ### Release matched protocol `0x03` artifacts
 
 The current RP2040 release artifact is
-`382F6144F8195C95F8379029C3B35B6F464BE5F3EA735AABDF8080018772FF63`.
-It removes the post-mount BOOT protocol switch. The Transmitter and Receiver
-artifacts remain:
+`4A3B723B5FAEB16DC0D4B6D912A1562D936480ACF748F168E94D7FF6C4F7DBFD`.
+It removes the post-mount BOOT protocol switch and makes Keyboard endpoint
+recovery nonblocking while Multimedia continues independently. The Transmitter
+and Receiver artifacts remain:
 
 - Transmitter `firmware/transmitter.uf2`:
   `551751E5353223CFDB7CF2456723514039473C2D11304410888080C6B2FAF89D`

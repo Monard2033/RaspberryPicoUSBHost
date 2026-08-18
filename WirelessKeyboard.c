@@ -146,6 +146,7 @@ static uint8_t           keyboard_led_output_report_len = 1;
 static uint16_t          keyboard_led_output_bit_offsets[3] = { 0, 1, 2 };
 static bool              keyboard_uses_report_protocol;
 static uint32_t          keyboard_last_report_ms;
+static uint32_t          keyboard_recovery_after_ms;
 #if HID_DIAGNOSTIC_LOG
 static uint32_t          keyboard_last_diagnostic_ms;
 #endif
@@ -1554,24 +1555,38 @@ static void hid_receive_rearm_task(void)
 
 static void keyboard_hid_stall_recovery_task(void)
 {
-    if (!kbd_is_mounted || keyboard_report_is_released()) return;
+    if (!kbd_is_mounted) return;
 
     uint32_t const now = board_millis();
-    if ((uint32_t)(now - keyboard_last_report_ms) <
-        KEYBOARD_HID_STALL_RECOVERY_MS) {
+    if ((int32_t)(now - keyboard_recovery_after_ms) < 0 ||
+        (uint32_t)(now - keyboard_last_report_ms) <
+            KEYBOARD_HID_STALL_RECOVERY_MS) {
         return;
     }
 
-    /* A PIO-USB interrupt transfer can stall without delivering a callback.
-     * While keys are held, cancel only that stale IN transfer and request a
-     * fresh one. This never runs while released and never blocks the callback. */
+    /* An endpoint made ready by an error completion has no callback to re-arm
+     * it. Repair that case even if the last keyboard state was released. */
+    if (tuh_hid_receive_ready(kbd_dev_addr, kbd_instance)) {
+        hid_receive_arm_or_defer(kbd_dev_addr, kbd_instance);
+        keyboard_last_report_ms = now;
+        return;
+    }
+
+    if (keyboard_report_is_released()) return;
+
+    /* A pressed keyboard with no callback has a stale queued IN transfer.
+     * Pico-PIO-USB abort is nonblocking: an in-progress USB frame simply
+     * returns false and this task retries next frame. It must never spin or
+     * suspend the independently working Consumer endpoint. */
+    keyboard_recovery_after_ms = now + 1u;
+    if (!tuh_hid_receive_abort(kbd_dev_addr, kbd_instance)) return;
+
     keyboard_last_report_ms = now;
 #if HID_DIAGNOSTIC_LOG
-    printf("[HID RECOVER] no keyboard report for %lu ms; abort/re-arm dev=%u inst=%u\n",
+    printf("[HID RECOVER] stale keyboard IN after %lu ms; re-arm dev=%u inst=%u\n",
            (unsigned long)KEYBOARD_HID_STALL_RECOVERY_MS,
            kbd_dev_addr, kbd_instance);
 #endif
-    (void)tuh_hid_receive_abort(kbd_dev_addr, kbd_instance);
     hid_receive_arm_or_defer(kbd_dev_addr, kbd_instance);
 }
 
@@ -1675,6 +1690,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
          * multi-key transitions. */
         keyboard_uses_report_protocol = true;
         keyboard_last_report_ms = board_millis();
+        keyboard_recovery_after_ms = keyboard_last_report_ms;
         if (state != NULL) {
             for (uint8_t i = 0; i < state->report_count; ++i) {
                 if (state->reports[i].usage_page == HID_USAGE_PAGE_DESKTOP &&
@@ -1718,6 +1734,7 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
         kbd_dev_addr = 0;
         kbd_is_mounted = false;
         keyboard_last_report_ms = 0;
+        keyboard_recovery_after_ms = 0;
     }
     if (instance < CFG_TUH_HID) {
         hid_receive_rearm_pending[instance] = false;

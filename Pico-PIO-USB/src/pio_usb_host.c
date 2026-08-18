@@ -513,11 +513,14 @@ bool pio_usb_host_endpoint_abort_transfer(uint8_t root_idx, uint8_t device_addre
   // mark transfer as aborted
   ep->transfer_aborted = true;
 
-  // Race potential: SOF timer can be called before transfer_aborted is actually set
-  // and started the transfer. Wait 1 usb frame for transaction to complete.
-  // On the next SOF timer, transfer_aborted will be checked and skipped
-  while (ep->has_transfer && ep->transfer_started) {
-    busy_wait_ms(1);
+  // Do not wait here. This function is called from the application path and
+  // the SOF handler may currently be executing the transaction. Waiting for
+  // transfer_started to clear can otherwise hold the whole RP2040 foreground
+  // indefinitely. Leave this endpoint untouched and let the caller retry on
+  // the next USB frame; all unrelated HID interfaces keep running.
+  if (ep->transfer_started) {
+    ep->transfer_aborted = false;
+    return false;
   }
 
   // check if transfer is still active (could be completed)
