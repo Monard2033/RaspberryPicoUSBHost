@@ -422,7 +422,7 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
 
     if (keyboard_led_state != remote_keyboard_led_state) {
         keyboard_led_state = remote_keyboard_led_state;
-        keyboard_led_update_pending = true;
+        keyboard_led_update_pending = false;
     }
 #if HID_DIAGNOSTIC_LOG
     static uint8_t last_logged_led = 0xFF;
@@ -1109,11 +1109,11 @@ static void keyboard_led_reset(void)
      * and physical Num Lock LED do not start inverted relative to Windows. */
     keyboard_led_state = HID_LED_NUM_LOCK;
     keyboard_lock_pressed = 0;
-    keyboard_led_update_pending = true;
+    keyboard_led_update_pending = false;
     keyboard_led_retry_after_ms = 0;
 }
 
-static void keyboard_led_build_output_report(uint8_t led_state)
+static void __unused keyboard_led_build_output_report(uint8_t led_state)
 {
     memset(keyboard_led_tx_report, 0, sizeof(keyboard_led_tx_report));
     for (uint8_t i = 0; i < 3; ++i) {
@@ -1148,7 +1148,7 @@ static void keyboard_led_toggle_on_press(
         if ((pressed_now & lock_keys[i].led) != 0 &&
             (keyboard_lock_pressed & lock_keys[i].led) == 0) {
             keyboard_led_state ^= lock_keys[i].led;
-            keyboard_led_update_pending = true;
+            keyboard_led_update_pending = false;
 #if PERIODIC_DEBUG
             printf("[KBD LED] local state=0x%02x\n", keyboard_led_state);
 #endif
@@ -1158,24 +1158,11 @@ static void keyboard_led_toggle_on_press(
     keyboard_lock_pressed = pressed_now;
 }
 
-/* Single-shot LED SET_REPORT to sync physical keyboard Num/Caps/Scroll LEDs */
+/* Disabled: sending SET_REPORT control transfers over USB to physical keyboard
+ * crashes the keyboard's onboard controller during rapid multi-key transitions. */
 static void keyboard_led_task(void)
 {
-    if (!kbd_is_mounted || !keyboard_led_update_pending ||
-        keyboard_led_transfer_active) {
-        return;
-    }
-
-    keyboard_led_build_output_report(keyboard_led_state);
     keyboard_led_update_pending = false;
-
-    if (tuh_hid_set_report(kbd_dev_addr, kbd_instance,
-                           keyboard_led_output_report_id,
-                           HID_REPORT_TYPE_OUTPUT,
-                           keyboard_led_tx_report,
-                           keyboard_led_output_report_len)) {
-        keyboard_led_transfer_active = true;
-    }
 }
 
 static void null_movement_reset(void)
