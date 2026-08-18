@@ -670,14 +670,7 @@ static void spi_service_task(void)
                   pending.data[6], pending.data[7] },
     };
     spi_write_frame(&spi_retry_frame);
-    if (pending.type == LINK_TYPE_BATTERY) {
-        /* Battery is latest-state telemetry, not an urgent transition. It
-         * must not consume the 250 us Keyboard/Consumer duplicate slot. */
-        spi_retry_pending = false;
-    } else {
-        spi_retry_after_us = time_us_32() + SPI_REARM_GUARD_US;
-        spi_retry_pending = true;
-    }
+    spi_retry_pending = false;
 }
 
 static void __unused spi_send_control_command(uint8_t command)
