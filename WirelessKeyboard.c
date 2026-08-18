@@ -56,6 +56,8 @@
 #define BATTERY_HID_QUIET_GUARD_MS 50u
 #define MAX_HID_REPORTS   8
 #define MAX_CONSUMER_FIELDS 16
+#define MAX_LED_LOCAL_USAGES 16
+#define MAX_LED_OUTPUT_REPORT_LEN 16
 #define HID_KEY_A         0x04
 #define HID_KEY_D         0x07
 #define HID_KEY_S         0x16
@@ -68,6 +70,7 @@
 #define HID_LED_CAPS_LOCK   0x02
 #define HID_LED_SCROLL_LOCK 0x04
 
+#define HID_USAGE_PAGE_LEDS             0x08
 #define HID_USAGE_PAGE_CONSUMER_CONTROL 0x0C
 #define HID_USAGE_CONSUMER_CONTROL      0x01
 #define HID_USAGE_CONSUMER_SCAN_NEXT    0x00B5
@@ -131,6 +134,9 @@ static uint8_t           active_ws_key;
 static bool              previous_physical_valid;
 static bool              previous_output_valid;
 static uint8_t           keyboard_input_report_id;
+static uint8_t           keyboard_led_output_report_id;
+static uint8_t           keyboard_led_output_report_len = 1;
+static uint16_t          keyboard_led_output_bit_offsets[3] = { 0, 1, 2 };
 static bool              keyboard_uses_report_protocol;
 
 struct link_input_frame {
@@ -170,6 +176,10 @@ struct hid_instance_state {
     uint8_t consumer_field_count;
     struct consumer_field consumer_fields[MAX_CONSUMER_FIELDS];
     bool has_consumer;
+    uint8_t led_output_report_id;
+    uint8_t led_output_report_len;
+    uint16_t led_output_bit_offsets[3];
+    bool has_led_output;
 };
 
 static struct hid_instance_state hid_instances[CFG_TUH_HID];
@@ -218,7 +228,8 @@ static bool remote_keyboard_led_valid;
 
 /* Locally simulated keyboard lock state. */
 static uint8_t           keyboard_led_state;
-static uint8_t           keyboard_led_tx_value;
+static uint8_t           keyboard_led_tx_report[MAX_LED_OUTPUT_REPORT_LEN];
+static uint8_t           keyboard_led_tx_state;
 static uint8_t           keyboard_lock_pressed;
 static bool              keyboard_led_update_pending;
 static bool              keyboard_led_transfer_active;
@@ -708,6 +719,111 @@ static void parse_consumer_fields(struct hid_instance_state *state,
     state->has_consumer = state->consumer_field_count != 0;
 }
 
+/* Locate the Num/Caps/Scroll LED bits in the keyboard's real Output report.
+ * Report IDs and bit positions are independent from the Input report, so the
+ * common one-byte/same-ID layout is only a fallback. */
+static void parse_keyboard_led_output(struct hid_instance_state *state,
+                                      uint8_t const *desc, uint16_t len)
+{
+    uint16_t usage_page = 0;
+    uint8_t report_size = 0;
+    uint8_t report_count = 0;
+    uint8_t report_id = 0;
+    uint16_t output_offsets[256] = { 0 };
+    uint16_t usages[MAX_LED_LOCAL_USAGES] = { 0 };
+    uint8_t usage_count = 0;
+    uint16_t usage_min = 0;
+    bool usage_min_valid = false;
+    bool selected = false;
+    uint8_t selected_report_id = 0;
+    uint16_t selected_offsets[3] = { 0xFFFFu, 0xFFFFu, 0xFFFFu };
+
+    for (uint16_t pos = 0; pos < len;) {
+        uint8_t const prefix = desc[pos++];
+        if (prefix == 0xFE) {
+            if (pos + 2 > len) break;
+            uint8_t const long_size = desc[pos++];
+            pos++;
+            pos = (uint16_t)((pos + long_size <= len) ? pos + long_size : len);
+            continue;
+        }
+
+        uint8_t const size_code = prefix & 0x03;
+        uint8_t const size = size_code == 3 ? 4 : size_code;
+        uint8_t const type = (prefix >> 2) & 0x03;
+        uint8_t const tag = (prefix >> 4) & 0x0F;
+        if (pos + size > len) break;
+        uint32_t const value = hid_item_value(desc + pos, size);
+        pos += size;
+
+        if (type == 1) { /* Global */
+            if (tag == 0) usage_page = (uint16_t)value;
+            else if (tag == 7) report_size = (uint8_t)value;
+            else if (tag == 8) report_id = (uint8_t)value;
+            else if (tag == 9) report_count = (uint8_t)value;
+            continue;
+        }
+        if (type == 2) { /* Local */
+            if (tag == 0 && usage_count < MAX_LED_LOCAL_USAGES) {
+                usages[usage_count++] = (uint16_t)value;
+            } else if (tag == 1) {
+                usage_min = (uint16_t)value;
+                usage_min_valid = true;
+            }
+            continue;
+        }
+        if (type != 0) continue;
+
+        if (tag == 9) { /* Output */
+            bool const constant = (value & 0x01u) != 0;
+            bool const variable = (value & 0x02u) != 0;
+            uint16_t const base = output_offsets[report_id];
+
+            if (!constant && variable && usage_page == HID_USAGE_PAGE_LEDS &&
+                report_size == 1) {
+                for (uint8_t i = 0; i < report_count; ++i) {
+                    uint16_t const usage = i < usage_count ? usages[i] :
+                        (usage_min_valid ? (uint16_t)(usage_min + i) : 0);
+                    if (usage < 1 || usage > 3) continue;
+
+                    if (!selected) {
+                        selected = true;
+                        selected_report_id = report_id;
+                    }
+                    if (selected_report_id == report_id) {
+                        selected_offsets[usage - 1] =
+                            (uint16_t)(base + i);
+                    }
+                }
+            }
+            output_offsets[report_id] =
+                (uint16_t)(base + (uint16_t)report_size * report_count);
+        }
+
+        /* HID local items apply only to the next Main item. */
+        usage_count = 0;
+        usage_min_valid = false;
+    }
+
+    if (!selected || selected_offsets[0] == 0xFFFFu ||
+        selected_offsets[1] == 0xFFFFu ||
+        selected_offsets[2] == 0xFFFFu) {
+        return;
+    }
+
+    uint16_t const output_bytes =
+        (uint16_t)((output_offsets[selected_report_id] + 7u) / 8u);
+    if (output_bytes == 0 || output_bytes > MAX_LED_OUTPUT_REPORT_LEN) {
+        return;
+    }
+
+    state->led_output_report_id = selected_report_id;
+    state->led_output_report_len = (uint8_t)output_bytes;
+    memcpy(state->led_output_bit_offsets, selected_offsets,
+           sizeof(selected_offsets));
+    state->has_led_output = true;
+}
+
 static uint16_t read_report_bits(uint8_t const *data, uint16_t len,
                                  uint16_t bit_offset, uint8_t bit_size)
 {
@@ -782,11 +898,26 @@ static void keyboard_led_reset(void)
      * that known state locally as soon as the keyboard mounts so its keypad
      * and physical Num Lock LED do not start inverted relative to Windows. */
     keyboard_led_state = HID_LED_NUM_LOCK;
-    keyboard_led_tx_value = HID_LED_NUM_LOCK;
+    keyboard_led_tx_state = 0;
+    memset(keyboard_led_tx_report, 0, sizeof(keyboard_led_tx_report));
     keyboard_lock_pressed = 0;
     keyboard_led_update_pending = true;
     keyboard_led_transfer_active = false;
     keyboard_led_retry_after_ms = 0;
+}
+
+static void keyboard_led_build_output_report(uint8_t led_state)
+{
+    memset(keyboard_led_tx_report, 0, sizeof(keyboard_led_tx_report));
+    for (uint8_t i = 0; i < 3; ++i) {
+        if ((led_state & (1u << i)) == 0) continue;
+
+        uint16_t const bit = keyboard_led_output_bit_offsets[i];
+        if (bit < (uint16_t)keyboard_led_output_report_len * 8u) {
+            keyboard_led_tx_report[bit / 8u] |= (uint8_t)(1u << (bit % 8u));
+        }
+    }
+    keyboard_led_tx_state = led_state;
 }
 
 static void keyboard_led_toggle_on_press(
@@ -830,11 +961,12 @@ static void keyboard_led_task(void)
         return;
     }
 
-    keyboard_led_tx_value = keyboard_led_state;
-    if (tuh_hid_set_report(kbd_dev_addr, kbd_instance, keyboard_input_report_id,
+    keyboard_led_build_output_report(keyboard_led_state);
+    if (tuh_hid_set_report(kbd_dev_addr, kbd_instance,
+                           keyboard_led_output_report_id,
                            HID_REPORT_TYPE_OUTPUT,
-                           &keyboard_led_tx_value,
-                           sizeof(keyboard_led_tx_value))) {
+                           keyboard_led_tx_report,
+                           keyboard_led_output_report_len)) {
         keyboard_led_transfer_active = true;
     } else {
         keyboard_led_retry_after_ms = board_millis() + 100;
@@ -1406,9 +1538,11 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
             state->report_count = tuh_hid_parse_report_descriptor(
                 state->reports, MAX_HID_REPORTS, desc_report, desc_len);
             parse_consumer_fields(state, desc_report, desc_len);
+            parse_keyboard_led_output(state, desc_report, desc_len);
         }
-        printf("[HID] reports=%u consumer_fields=%u\n",
-               state->report_count, state->consumer_field_count);
+        printf("[HID] reports=%u consumer_fields=%u led_output=%u\n",
+               state->report_count, state->consumer_field_count,
+               state->has_led_output ? 1u : 0u);
 #if CONSUMER_DEBUG
         printf("[HID] descriptor len=%u:", desc_len);
         for (uint16_t i = 0; i < desc_len; ++i) {
@@ -1433,6 +1567,11 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
         previous_consumer_usage = 0;
         previous_consumer_valid = false;
         keyboard_input_report_id = 0;
+        keyboard_led_output_report_id = 0;
+        keyboard_led_output_report_len = 1;
+        keyboard_led_output_bit_offsets[0] = 0;
+        keyboard_led_output_bit_offsets[1] = 1;
+        keyboard_led_output_bit_offsets[2] = 2;
         /* Diagnostic and normal operation both require REPORT protocol: boot
          * protocol intentionally removes non-boot multimedia information. */
         keyboard_uses_report_protocol = true;
@@ -1443,6 +1582,17 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
                     keyboard_input_report_id = state->reports[i].report_id;
                     break;
                 }
+            }
+            if (state->has_led_output) {
+                keyboard_led_output_report_id = state->led_output_report_id;
+                keyboard_led_output_report_len = state->led_output_report_len;
+                memcpy(keyboard_led_output_bit_offsets,
+                       state->led_output_bit_offsets,
+                       sizeof(keyboard_led_output_bit_offsets));
+            } else {
+                /* Standard keyboards commonly share the Input Report ID for
+                 * one-byte LED Output; retain that safe legacy fallback. */
+                keyboard_led_output_report_id = keyboard_input_report_id;
             }
         }
         /* The default REPORT protocol is selected before tuh_init(). Starting
@@ -1481,14 +1631,14 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
                                     uint16_t len)
 {
     if (dev_addr != kbd_dev_addr || instance != kbd_instance ||
-        report_id != keyboard_input_report_id ||
+        report_id != keyboard_led_output_report_id ||
         report_type != HID_REPORT_TYPE_OUTPUT) {
         return;
     }
 
     keyboard_led_transfer_active = false;
-    if (len == sizeof(keyboard_led_tx_value) &&
-        keyboard_led_tx_value == keyboard_led_state) {
+    if (len == keyboard_led_output_report_len &&
+        keyboard_led_tx_state == keyboard_led_state) {
         keyboard_led_update_pending = false;
     } else {
         keyboard_led_update_pending = true;
