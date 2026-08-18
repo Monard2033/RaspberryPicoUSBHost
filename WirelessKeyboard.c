@@ -54,8 +54,8 @@
 #define LINK_ACK_TYPE_LOCK_STATE 0x01
 #define LINK_ACK_TYPE_DFU       0x02
 
-#define FLASH_STAGING_OFFSET (1024u * 1024u)
-#define FLASH_STAGING_MAX_SIZE (896u * 1024u)
+#define FLASH_STAGING_OFFSET (2048u * 1024u)   /* 2MB offset for WeAct RP2040 4MB Flash */
+#define FLASH_STAGING_MAX_SIZE (1900u * 1024u) /* Up to 1.9MB firmware image size */
 
 #define DFU_STATUS_IDLE         0x00u
 #define DFU_STATUS_BUSY         0x01u
