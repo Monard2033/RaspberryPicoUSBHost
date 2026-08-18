@@ -305,7 +305,7 @@ static bool spi_retry_pending;
 static uint32_t spi_retry_after_us;
 static struct pending_radio_input battery_spi_pending_frame;
 static bool battery_spi_pending;
-static uint32_t spi_last_ack_poll_ms;
+static uint32_t __unused spi_last_ack_poll_ms;
 
 static uint8_t remote_keyboard_led_state;
 static uint8_t remote_keyboard_led_sequence;
@@ -538,7 +538,7 @@ static void spi_service_task(void)
     }
 }
 
-static void spi_send_control_command(uint8_t command)
+static void __unused spi_send_control_command(uint8_t command)
 {
     struct link_input_frame const frame = {
         .magic = LINK_MAGIC,
@@ -553,6 +553,8 @@ static void spi_send_control_command(uint8_t command)
 
 static void spi_ack_poll_task(void)
 {
+    /* Temporarily commented out for experiment: test typing without type=3 polling packets */
+    /*
     uint32_t const now = board_millis();
 
     if (radio_power_state != RADIO_AWAKE || spi_retry_pending ||
@@ -563,6 +565,7 @@ static void spi_ack_poll_task(void)
 
     spi_last_ack_poll_ms = now;
     spi_send_control_command(LINK_CONTROL_POLL_ACK);
+    */
 }
 
 static bool keyboard_report_is_released(void)
