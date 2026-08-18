@@ -256,7 +256,11 @@ The current matched protocol `0x03` artifacts have these SHA-256 values:
 - Transmitter `firmware/transmitter.uf2`:
   `551751E5353223CFDB7CF2456723514039473C2D11304410888080C6B2FAF89D`
 - Receiver `firmware/receiver.hex`:
-  `F1A41F0FCC0A02D81575DD4D940830A9331F07B568ADE7B4048910DEDF9AD192`
+  `FEC717F3DB77CE06AE598CF627150629B25E06D0291F94C2D8644A0DCF2F51CE`
+
+The Receiver artifact above includes the Windows HID descriptor validation
+fix: the eight-byte vendor Battery Input and Feature fields each declare their
+complete Usage range, preventing Windows Code 10 during HID device startup.
 
 Flash all three artifacts as one matched protocol `0x03` set. Mixing one of
 these images with an older peer can restore the exact release-loss behavior
