@@ -18,6 +18,7 @@
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"WirelessKeyboardTrayHiddenWindow";
+constexpr wchar_t kPopupWindowClass[] = L"WirelessKeyboardTrayStatusPopup";
 constexpr wchar_t kAppName[] = L"Wireless Keyboard Battery";
 constexpr wchar_t kRunValueName[] = L"WirelessKeyboardTray";
 constexpr wchar_t kSingleInstanceName[] =
@@ -43,6 +44,8 @@ constexpr UINT kMenuRefresh = 1001;
 constexpr UINT kMenuAutostart = 1002;
 constexpr UINT kMenuExit = 1003;
 constexpr LONG kTrayMenuLiftPx = 23;
+constexpr int kPopupWidth = 270;
+constexpr int kPopupHeight = 250;
 
 enum class Availability {
     Offline,
@@ -65,6 +68,10 @@ struct BatterySnapshot {
 
 HINSTANCE gInstance = nullptr;
 HWND gWindow = nullptr;
+HWND gPopupWindow = nullptr;
+HWND gPopupStatus = nullptr;
+HWND gPopupRefresh = nullptr;
+HWND gPopupAutostart = nullptr;
 HANDLE gSingleInstance = nullptr;
 HANDLE gStopEvent = nullptr;
 HANDLE gRefreshEvent = nullptr;
@@ -76,6 +83,8 @@ HICON gCurrentIcon = nullptr;
 UINT gTaskbarCreatedMessage = 0;
 volatile LONG gDeviceEpoch = 0;
 BatterySnapshot gLastSnapshot{};
+
+void UpdateStatusPopup(BatterySnapshot const &snapshot);
 
 std::wstring GetExecutablePath()
 {
@@ -317,6 +326,7 @@ void UpdateTray(BatterySnapshot const &snapshot)
     CopyTooltip(BuildTooltip(snapshot));
     gNotifyIcon.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     Shell_NotifyIconW(NIM_MODIFY, &gNotifyIcon);
+    UpdateStatusPopup(snapshot);
 
     if (previousIcon != nullptr && previousIcon != gCurrentIcon &&
         previousIcon != LoadIconW(nullptr, IDI_APPLICATION)) {
@@ -561,83 +571,174 @@ void RequestRefresh()
     }
 }
 
-void AppendBatteryDetails(HMENU menu, BatterySnapshot const &snapshot)
+std::wstring BuildPopupStatus(BatterySnapshot const &snapshot)
 {
-    constexpr UINT kDetailFlags = MF_STRING | MF_DISABLED;
-    wchar_t text[128]{};
-
-    AppendMenuW(menu, kDetailFlags, 0, L"Wireless Keyboard Battery");
+    wchar_t text[256]{};
 
     switch (snapshot.availability) {
     case Availability::Offline:
-        AppendMenuW(menu, kDetailFlags, 0, L"Receiver: offline");
-        break;
+        return L"Receiver: offline";
     case Availability::WaitingForTelemetry:
-        AppendMenuW(menu, kDetailFlags, 0,
-                    L"Waiting for battery telemetry...");
-        break;
+        return L"Waiting for battery telemetry...";
     case Availability::ReadError:
         std::swprintf(text, std::size(text), L"HID read error: %lu",
                       static_cast<unsigned long>(snapshot.error));
-        AppendMenuW(menu, kDetailFlags, 0, text);
-        break;
+        return text;
     case Availability::Live:
     case Availability::Stale:
-        std::swprintf(text, std::size(text), L"Battery: %u%%",
-                      static_cast<unsigned>(snapshot.percentage));
-        AppendMenuW(menu, kDetailFlags, 0, text);
-        std::swprintf(text, std::size(text), L"Voltage: %.3f V",
-                      static_cast<double>(snapshot.millivolts) / 1000.0);
-        AppendMenuW(menu, kDetailFlags, 0, text);
-        std::swprintf(text, std::size(text), L"State: %ls",
-                      BatteryStateName(snapshot.batteryState));
-        AppendMenuW(menu, kDetailFlags, 0, text);
-        std::swprintf(text, std::size(text), L"Telemetry: %ls, age %u s",
-                      snapshot.availability == Availability::Live ?
-                          L"LIVE" : L"STALE",
-                      static_cast<unsigned>(snapshot.ageSeconds));
-        AppendMenuW(menu, kDetailFlags, 0, text);
-        std::swprintf(text, std::size(text), L"Sequence: %u",
-                      static_cast<unsigned>(snapshot.sequence));
-        AppendMenuW(menu, kDetailFlags, 0, text);
-        break;
+        std::swprintf(
+            text, std::size(text),
+            L"Battery: %u%%\r\nVoltage: %.3f V\r\nState: %ls\r\n"
+            L"Telemetry: %ls, age %u s\r\nSequence: %u",
+            static_cast<unsigned>(snapshot.percentage),
+            static_cast<double>(snapshot.millivolts) / 1000.0,
+            BatteryStateName(snapshot.batteryState),
+            snapshot.availability == Availability::Live ? L"LIVE" : L"STALE",
+            static_cast<unsigned>(snapshot.ageSeconds),
+            static_cast<unsigned>(snapshot.sequence));
+        return text;
     }
-
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    return L"Unknown battery status";
 }
 
-void ShowTrayMenu()
+void SetControlFont(HWND control)
 {
-    HMENU const menu = CreatePopupMenu();
-    if (menu == nullptr) {
-        return;
+    SendMessageW(control, WM_SETFONT,
+                 reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),
+                 TRUE);
+}
+
+void UpdateAutostartButton()
+{
+    if (gPopupAutostart != nullptr) {
+        SetWindowTextW(gPopupAutostart,
+                       IsAutostartEnabled() ? L"Start with Windows: On" :
+                                              L"Start with Windows: Off");
+    }
+}
+
+void UpdateStatusPopup(BatterySnapshot const &snapshot)
+{
+    if (gPopupStatus == nullptr) return;
+
+    std::wstring const status = BuildPopupStatus(snapshot);
+    SetWindowTextW(gPopupStatus, status.c_str());
+    if (gPopupRefresh != nullptr) {
+        SetWindowTextW(gPopupRefresh, L"Refresh now");
+        EnableWindow(gPopupRefresh, TRUE);
+    }
+}
+
+LRESULT CALLBACK PopupWindowProcedure(HWND window, UINT message, WPARAM wParam,
+                                      LPARAM lParam)
+{
+    switch (message) {
+    case WM_CREATE: {
+        HWND const title = CreateWindowExW(
+            0, L"STATIC", L"Wireless Keyboard Battery", WS_CHILD | WS_VISIBLE,
+            12, 10, 244, 20, window, nullptr, gInstance, nullptr);
+        gPopupStatus = CreateWindowExW(
+            0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+            12, 34, 244, 96, window, nullptr, gInstance, nullptr);
+        gPopupRefresh = CreateWindowExW(
+            0, L"BUTTON", L"Refresh now", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            12, 138, 244, 28, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMenuRefresh)),
+            gInstance, nullptr);
+        gPopupAutostart = CreateWindowExW(
+            0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            12, 172, 244, 28, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMenuAutostart)),
+            gInstance, nullptr);
+        HWND const exitButton = CreateWindowExW(
+            0, L"BUTTON", L"Exit", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            12, 206, 244, 28, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kMenuExit)),
+            gInstance, nullptr);
+        SetControlFont(title);
+        SetControlFont(gPopupStatus);
+        SetControlFont(gPopupRefresh);
+        SetControlFont(gPopupAutostart);
+        SetControlFont(exitButton);
+        UpdateAutostartButton();
+        UpdateStatusPopup(gLastSnapshot);
+        return 0;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case kMenuRefresh:
+            SetWindowTextW(gPopupRefresh, L"Refreshing...");
+            EnableWindow(gPopupRefresh, FALSE);
+            RequestRefresh();
+            return 0;
+        case kMenuAutostart: {
+            bool const enable = !IsAutostartEnabled();
+            if (!SetAutostartEnabled(enable)) {
+                MessageBoxW(window,
+                            L"Windows could not update the current user's "
+                            L"startup entry.",
+                            kAppName, MB_OK | MB_ICONERROR);
+            }
+            UpdateAutostartButton();
+            return 0;
+        }
+        case kMenuExit:
+            DestroyWindow(gWindow);
+            return 0;
+        default:
+            break;
+        }
+        break;
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) == WA_INACTIVE) {
+            ShowWindow(window, SW_HIDE);
+        }
+        return 0;
+    case WM_CLOSE:
+        ShowWindow(window, SW_HIDE);
+        return 0;
+    case WM_DESTROY:
+        gPopupWindow = nullptr;
+        gPopupStatus = nullptr;
+        gPopupRefresh = nullptr;
+        gPopupAutostart = nullptr;
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void ShowStatusPopup()
+{
+    if (gPopupWindow == nullptr) {
+        gPopupWindow = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kPopupWindowClass, kAppName,
+            WS_POPUP | WS_BORDER | WS_CLIPCHILDREN,
+            0, 0, kPopupWidth, kPopupHeight, gWindow, nullptr, gInstance,
+            nullptr);
+        if (gPopupWindow == nullptr) return;
     }
 
-    AppendBatteryDetails(menu, gLastSnapshot);
-    AppendMenuW(menu, MF_STRING, kMenuRefresh, L"Refresh now");
-    AppendMenuW(menu, MF_STRING |
-                          (IsAutostartEnabled() ? MF_CHECKED : MF_UNCHECKED),
-                kMenuAutostart, L"Start with Windows");
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kMenuExit, L"Exit");
+    UpdateStatusPopup(gLastSnapshot);
+    UpdateAutostartButton();
 
     POINT cursor{};
     GetCursorPos(&cursor);
-    /* The notification overflow panel is topmost and can cover the lower
-     * menu rows. Lift the anchor above the click so Exit is neither
-     * hidden by the tray nor directly under the released mouse button. */
-    cursor.y -= kTrayMenuLiftPx;
-    SetForegroundWindow(gWindow);
-    UINT const command = TrackPopupMenuEx(
-        menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN |
-                  TPM_RETURNCMD | TPM_NONOTIFY,
-        cursor.x, cursor.y, gWindow, nullptr);
-    PostMessageW(gWindow, WM_NULL, 0, 0);
-    Shell_NotifyIconW(NIM_SETFOCUS, &gNotifyIcon);
-    DestroyMenu(menu);
-    if (command != 0) {
-        SendMessageW(gWindow, WM_COMMAND, MAKEWPARAM(command, 0), 0);
-    }
+    HMONITOR const monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    GetMonitorInfoW(monitor, &monitorInfo);
+    RECT const work = monitorInfo.rcWork;
+    LONG x = std::clamp(cursor.x - kPopupWidth / 2, work.left,
+                        work.right - kPopupWidth);
+    LONG y = cursor.y - kTrayMenuLiftPx - kPopupHeight;
+    y = std::clamp(y, work.top, work.bottom - kPopupHeight);
+
+    SetWindowPos(gPopupWindow, HWND_TOPMOST, x, y, kPopupWidth, kPopupHeight,
+                 SWP_SHOWWINDOW);
+    SetForegroundWindow(gPopupWindow);
+    SetFocus(gPopupWindow);
 }
 
 void RegisterForHidNotifications()
@@ -689,11 +790,11 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam,
     case kTrayCallbackMessage: {
         UINT const event = LOWORD(lParam);
         if (event == WM_CONTEXTMENU || event == WM_RBUTTONUP) {
-            ShowTrayMenu();
+            ShowStatusPopup();
         } else if (event == NIN_SELECT || event == NIN_KEYSELECT ||
                    event == WM_LBUTTONUP) {
             RequestRefresh();
-            ShowTrayMenu();
+            ShowStatusPopup();
         }
         return 0;
     }
@@ -804,6 +905,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     windowClass.lpszClassName = kWindowClass;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     if (!RegisterClassExW(&windowClass)) {
+        CloseHandle(gSingleInstance);
+        return 2;
+    }
+
+    WNDCLASSEXW popupClass{};
+    popupClass.cbSize = sizeof(popupClass);
+    popupClass.hInstance = instance;
+    popupClass.lpfnWndProc = PopupWindowProcedure;
+    popupClass.lpszClassName = kPopupWindowClass;
+    popupClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    popupClass.hbrBackground = GetSysColorBrush(COLOR_MENU);
+    if (!RegisterClassExW(&popupClass)) {
         CloseHandle(gSingleInstance);
         return 2;
     }
