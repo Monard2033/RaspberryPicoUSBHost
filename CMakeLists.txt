@@ -13,6 +13,8 @@ if (EXISTS ${picoVscode})
 endif()
 # ====================================================================================
 set(PICO_BOARD pico CACHE STRING "Board type")
+option(WIRELESS_KEYBOARD_UART_DIAGNOSTIC
+       "Enable bounded DAPLink UART diagnostics in WirelessKeyboard" OFF)
 
 cmake_minimum_required(VERSION 3.13)
 
@@ -35,7 +37,7 @@ pico_set_program_name(WirelessKeyboard "WirelessKeyboard")
 pico_set_program_version(WirelessKeyboard "0.2")
 
 pico_enable_stdio_usb(WirelessKeyboard 0)
-pico_enable_stdio_uart(WirelessKeyboard 0)
+pico_enable_stdio_uart(WirelessKeyboard ${WIRELESS_KEYBOARD_UART_DIAGNOSTIC})
 
 # === TINYUSB HOST MODE (PIO-USB on RHPORT1) ===
 target_compile_definitions(WirelessKeyboard PRIVATE
@@ -46,6 +48,16 @@ target_compile_definitions(WirelessKeyboard PRIVATE
     CFG_TUD_ENABLED=0
     PIO_USB_USE_TINYUSB
 )
+
+if(WIRELESS_KEYBOARD_UART_DIAGNOSTIC)
+    target_compile_definitions(WirelessKeyboard PRIVATE
+        RUNTIME_LOGGING=1
+        HID_DIAGNOSTIC_LOG=1
+        HOT_PATH_DEBUG=0
+        PERIODIC_DEBUG=0
+        CONSUMER_DEBUG=0
+    )
+endif()
 
 target_link_libraries(WirelessKeyboard
     pico_stdlib

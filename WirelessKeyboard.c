@@ -122,6 +122,10 @@
 #define CONSUMER_DEBUG    0   /* Set to 1 only for descriptor/raw diagnostics. */
 #endif
 
+#ifndef HID_DIAGNOSTIC_LOG
+#define HID_DIAGNOSTIC_LOG 0 /* Bounded changed-report UART trace for DAPLink. */
+#endif
+
 #ifndef NULL_MOVEMENT_ENABLED
 #define NULL_MOVEMENT_ENABLED 0 /* Raw keyboard state has priority over game filtering. */
 #endif
@@ -147,6 +151,9 @@ static bool              keyboard_boot_protocol_pending;
 static bool              keyboard_boot_protocol_transfer_active;
 static uint32_t          keyboard_boot_protocol_after_ms;
 static uint32_t          keyboard_last_report_ms;
+#if HID_DIAGNOSTIC_LOG
+static uint32_t          keyboard_last_diagnostic_ms;
+#endif
 
 struct link_input_frame {
     uint8_t magic;
@@ -1564,6 +1571,11 @@ static void keyboard_hid_stall_recovery_task(void)
      * While keys are held, cancel only that stale IN transfer and request a
      * fresh one. This never runs while released and never blocks the callback. */
     keyboard_last_report_ms = now;
+#if HID_DIAGNOSTIC_LOG
+    printf("[HID RECOVER] no keyboard report for %lu ms; abort/re-arm dev=%u inst=%u\n",
+           (unsigned long)KEYBOARD_HID_STALL_RECOVERY_MS,
+           kbd_dev_addr, kbd_instance);
+#endif
     (void)tuh_hid_receive_abort(kbd_dev_addr, kbd_instance);
     hid_receive_arm_or_defer(kbd_dev_addr, kbd_instance);
 }
@@ -1785,7 +1797,8 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
 {
     total_hid_reports_received++;
 
-    if (hid_report_changed(instance, report, len)) {
+    bool const hid_changed = hid_report_changed(instance, report, len);
+    if (hid_changed) {
         radio_note_activity();
     }
 
@@ -1826,6 +1839,26 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
             payload : report;
         uint16_t const keyboard_payload_len = keyboard_uses_report_protocol ?
             payload_len : len;
+#if HID_DIAGNOSTIC_LOG
+        bool diagnostic_emitted = false;
+        if (hid_changed &&
+            (uint32_t)(keyboard_last_report_ms - keyboard_last_diagnostic_ms) >= 5u) {
+            uint8_t const b0 = len > 0 ? report[0] : 0;
+            uint8_t const b1 = len > 1 ? report[1] : 0;
+            uint8_t const b2 = len > 2 ? report[2] : 0;
+            uint8_t const b3 = len > 3 ? report[3] : 0;
+            uint8_t const b4 = len > 4 ? report[4] : 0;
+            uint8_t const b5 = len > 5 ? report[5] : 0;
+            uint8_t const b6 = len > 6 ? report[6] : 0;
+            uint8_t const b7 = len > 7 ? report[7] : 0;
+            printf("[KBD RX] len=%u mode=%s raw=%02x %02x %02x %02x %02x %02x %02x %02x q=%u retry=%u\n",
+                   len, keyboard_uses_report_protocol ? "REPORT" : "BOOT",
+                   b0, b1, b2, b3, b4, b5, b6, b7,
+                   spi_input_queue_count, spi_retry_pending ? 1u : 0u);
+            keyboard_last_diagnostic_ms = keyboard_last_report_ms;
+            diagnostic_emitted = true;
+        }
+#endif
         if (keyboard_report && keyboard_uses_report_protocol &&
             keyboard_payload_len >= KBD_REPORT_LEN) {
             forward_keyboard_report(keyboard_payload);
@@ -1843,6 +1876,13 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
             }
 #endif
         }
+#if HID_DIAGNOSTIC_LOG
+        if (diagnostic_emitted) {
+            printf("[KBD DONE] q=%u retry=%u pressed=%u\n",
+                   spi_input_queue_count, spi_retry_pending ? 1u : 0u,
+                   keyboard_report_is_released() ? 0u : 1u);
+        }
+#endif
     }
 
     if (consumer_report && state != NULL) {
@@ -1879,6 +1919,9 @@ int main(void)
 #if RUNTIME_LOGGING
     stdio_init_all();
     sleep_ms(100);
+    if (watchdog_caused_reboot()) {
+        printf("[WATCHDOG] Previous execution reset by watchdog\n");
+    }
 #endif
 
     printf("\n\n=== RP2040 USB HID HOST + BATTERY/RGB LED (fully local) -> SPI BRIDGE ===\n");
