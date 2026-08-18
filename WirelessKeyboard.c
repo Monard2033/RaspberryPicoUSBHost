@@ -147,7 +147,7 @@
 #endif
 
 #ifndef NULL_MOVEMENT_ENABLED
-#define NULL_MOVEMENT_ENABLED 0 /* Raw keyboard state has priority over game filtering. */
+#define NULL_MOVEMENT_ENABLED 1 /* Null Movement (Snap Tap / SOCD Last Win) enabled for A/D and W/S */
 #endif
 
 /*--------------------------------------------------------------------+
