@@ -52,6 +52,8 @@
 #define RADIO_SLEEP_BLINK_HALF_PERIOD_MS 100u
 #define SPI_REARM_GUARD_US 250u
 #define SPI_ACK_POLL_MS 100u
+#define KEYBOARD_BOOT_PROTOCOL_DELAY_MS 250u
+#define KEYBOARD_BOOT_PROTOCOL_RETRY_MS 50u
 #define BATTERY_TELEMETRY_PERIOD_MS 30000u
 #define BATTERY_HID_QUIET_GUARD_MS 50u
 #define MAX_HID_REPORTS   8
@@ -138,6 +140,9 @@ static uint8_t           keyboard_led_output_report_id;
 static uint8_t           keyboard_led_output_report_len = 1;
 static uint16_t          keyboard_led_output_bit_offsets[3] = { 0, 1, 2 };
 static bool              keyboard_uses_report_protocol;
+static bool              keyboard_boot_protocol_pending;
+static bool              keyboard_boot_protocol_transfer_active;
+static uint32_t          keyboard_boot_protocol_after_ms;
 
 struct link_input_frame {
     uint8_t magic;
@@ -885,12 +890,43 @@ static void forward_consumer_usage(uint16_t usage)
 #endif
 }
 
+static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN]);
+
 static bool report_has_key(const uint8_t report[KBD_REPORT_LEN], uint8_t key)
 {
     for (uint8_t i = 2; i < KBD_REPORT_LEN; ++i) {
         if (report[i] == key) return true;
     }
     return false;
+}
+
+static bool keyboard_boot_report_has_error(
+    const uint8_t report[KBD_REPORT_LEN])
+{
+    for (uint8_t i = 2; i < KBD_REPORT_LEN; ++i) {
+        /* HID Keyboard page reserves 0x01..0x03 for ErrorRollOver,
+         * POSTFail and ErrorUndefined. They are not actual pressed keys. */
+        if (report[i] >= 0x01u && report[i] <= 0x03u) return true;
+    }
+    return false;
+}
+
+static void forward_boot_keyboard_report(uint8_t const *report, uint16_t len)
+{
+    uint8_t normalized[KBD_REPORT_LEN];
+
+    /* Boot protocol is exactly modifier, reserved and six usages. Reject a
+     * malformed packet instead of indexing an alternate NKRO/report-ID layout. */
+    if (len != KBD_REPORT_LEN) return;
+
+    memcpy(normalized, report, sizeof(normalized));
+    if (keyboard_boot_report_has_error(normalized)) {
+        /* Do not forward rollover/error usages through the RF link. Releasing
+         * regular keys is safe; retain modifiers so a transient rollover does
+         * not manufacture an unexpected modifier-up edge. */
+        memset(normalized + 2, 0, KBD_REPORT_LEN - 2);
+    }
+    forward_keyboard_report(normalized);
 }
 
 static void keyboard_led_reset(void)
@@ -1508,6 +1544,25 @@ static void hid_receive_rearm_task(void)
     }
 }
 
+static void keyboard_boot_protocol_task(void)
+{
+    if (!kbd_is_mounted || !keyboard_boot_protocol_pending ||
+        keyboard_boot_protocol_transfer_active ||
+        (int32_t)(board_millis() - keyboard_boot_protocol_after_ms) < 0) {
+        return;
+    }
+
+    /* Keep REPORT as the default while the composite device enumerates so the
+     * Consumer interface remains intact. The boot keyboard alone is switched
+     * after enumeration to receive its defined fixed eight-byte format. */
+    if (tuh_hid_set_protocol(kbd_dev_addr, kbd_instance, HID_PROTOCOL_BOOT)) {
+        keyboard_boot_protocol_transfer_active = true;
+    } else {
+        keyboard_boot_protocol_after_ms = board_millis() +
+            KEYBOARD_BOOT_PROTOCOL_RETRY_MS;
+    }
+}
+
 void tuh_mount_cb(uint8_t dev_addr)
 {
     radio_note_activity();
@@ -1604,6 +1659,10 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
         /* Diagnostic and normal operation both require REPORT protocol: boot
          * protocol intentionally removes non-boot multimedia information. */
         keyboard_uses_report_protocol = true;
+        keyboard_boot_protocol_pending = true;
+        keyboard_boot_protocol_transfer_active = false;
+        keyboard_boot_protocol_after_ms = board_millis() +
+            KEYBOARD_BOOT_PROTOCOL_DELAY_MS;
         if (state != NULL) {
             for (uint8_t i = 0; i < state->report_count; ++i) {
                 if (state->reports[i].usage_page == HID_USAGE_PAGE_DESKTOP &&
@@ -1646,6 +1705,8 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
         remote_keyboard_led_valid = false;
         kbd_dev_addr = 0;
         kbd_is_mounted = false;
+        keyboard_boot_protocol_pending = false;
+        keyboard_boot_protocol_transfer_active = false;
     }
     if (instance < CFG_TUH_HID) {
         hid_receive_rearm_pending[instance] = false;
@@ -1676,6 +1737,14 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
 
 void tuh_hid_set_protocol_complete_cb(uint8_t dev_addr, uint8_t instance, uint8_t protocol)
 {
+    if (dev_addr == kbd_dev_addr && instance == kbd_instance &&
+        keyboard_boot_protocol_transfer_active) {
+        keyboard_boot_protocol_transfer_active = false;
+        keyboard_uses_report_protocol = protocol != HID_PROTOCOL_BOOT;
+        keyboard_boot_protocol_pending = keyboard_uses_report_protocol;
+        keyboard_boot_protocol_after_ms = board_millis() +
+            KEYBOARD_BOOT_PROTOCOL_RETRY_MS;
+    }
 #if !RUNTIME_LOGGING
     (void)dev_addr;
     (void)instance;
@@ -1726,13 +1795,25 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
         bool const keyboard_report = !keyboard_uses_report_protocol ||
             (info != NULL && info->usage_page == HID_USAGE_PAGE_DESKTOP &&
              info->usage == HID_USAGE_DESKTOP_KEYBOARD);
-        if (keyboard_report && payload_len >= KBD_REPORT_LEN) {
-            forward_keyboard_report(payload);
+        uint8_t const *keyboard_payload = keyboard_uses_report_protocol ?
+            payload : report;
+        uint16_t const keyboard_payload_len = keyboard_uses_report_protocol ?
+            payload_len : len;
+        if (keyboard_report && keyboard_uses_report_protocol &&
+            keyboard_payload_len >= KBD_REPORT_LEN) {
+            forward_keyboard_report(keyboard_payload);
+        } else if (keyboard_report && !keyboard_uses_report_protocol) {
+            forward_boot_keyboard_report(keyboard_payload,
+                                         keyboard_payload_len);
 #if HOT_PATH_DEBUG
-            printf("[HID RX #%lu] mod=%02x res=%02x keys=%02x %02x %02x %02x %02x %02x\n",
-                   (unsigned long)total_hid_reports_received,
-                   payload[0], payload[1], payload[2], payload[3],
-                   payload[4], payload[5], payload[6], payload[7]);
+            if (keyboard_payload_len >= KBD_REPORT_LEN) {
+                printf("[HID RX #%lu] mod=%02x res=%02x keys=%02x %02x %02x %02x %02x %02x\n",
+                        (unsigned long)total_hid_reports_received,
+                        keyboard_payload[0], keyboard_payload[1],
+                        keyboard_payload[2], keyboard_payload[3],
+                        keyboard_payload[4], keyboard_payload[5],
+                        keyboard_payload[6], keyboard_payload[7]);
+            }
 #endif
         }
     }
@@ -1795,6 +1876,7 @@ int main(void)
 
     while (1) {
         tuh_task();
+        keyboard_boot_protocol_task();
         hid_receive_rearm_task();
         radio_power_task();
         battery_task();
