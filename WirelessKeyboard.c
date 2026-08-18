@@ -1902,10 +1902,14 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
     if (dev_addr == kbd_dev_addr && instance == kbd_instance) {
         bool const keyboard_xfer_failed = len == 0;
         if (keyboard_xfer_failed) {
-            /* TinyUSB delivers FAILED/STALLED interrupt-IN completions through
-             * this callback with zero bytes. Do not interpret that as a normal
-             * key report or immediately re-arm a halted SONiX endpoint. */
-            keyboard_halt_recovery_pending = true;
+            /* TinyUSB's HID callback exposes both a real STALL and a transient
+             * PIO transport/CRC failure as a zero-length completion. Most
+             * failures are not a STALL, so issuing CLEAR_FEATURE first leaves
+             * EP 0x81 unpolled during a key burst. The completed transfer is
+             * already released by TinyUSB: arm it again immediately below.
+             * A genuine STALL will surface again and remains visible to the
+             * periodic host recovery, without blocking normal input. */
+            keyboard_halt_recovery_pending = false;
             keyboard_recovery_after_ms = board_millis();
         } else {
             keyboard_last_report_ms = board_millis();
@@ -1975,11 +1979,10 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
                                   dev_addr, instance, consumer);
     }
 
-    /* Re-arm immediately. A transient busy result is recovered by the
-     * nonblocking main-loop task instead of freezing this HID endpoint. */
-    if (!(dev_addr == kbd_dev_addr && instance == kbd_instance && len == 0)) {
-        hid_receive_arm_or_defer(dev_addr, instance);
-    }
+    /* Re-arm every completed transfer, including zero-length failures. A
+     * transient busy result is retried by the host-core task; no control
+     * transfer or delay is allowed to interrupt the 1 kHz input path. */
+    hid_receive_arm_or_defer(dev_addr, instance);
 }
 
 /* Core 0 consumes complete reports in arrival order.  The only work in the
