@@ -16,26 +16,32 @@ background service.
 - Uses a low-priority worker and a coalescable 30-second waitable timer with a
   5-second tolerance. There is no busy loop and no high-resolution timer.
 - Refreshes immediately on Receiver arrival/removal and when the user chooses
-  `Refresh now` or clicks the tray icon.
+  `Refresh now` or left-clicks the tray icon.
 - Reads only Receiver RAM cache. A refresh emits no ESB packet, does not wake
   the keyboard, and does not postpone System OFF.
 - Shows no automatic balloons, overlays, global hooks, Raw Input listeners, or
-  focus-stealing windows. The context menu appears only after user interaction.
-- Anchors the context menu 50 px above the pointer and dispatches only the
+  focus-stealing windows. The detail/action popup appears only after user
+  interaction.
+- Anchors the context menu with its configured lift above the pointer and
+  dispatches only the
   command explicitly returned by Windows, preventing an accidental Exit on the
   right-button release inside the notification overflow panel.
 - Runs below normal process priority; the HID worker runs at the lowest thread
   priority.
 
-The tooltip shows percentage, voltage, charge state, LIVE/STALE state, and the
-age of the last wireless Battery packet. The icon is green/yellow/red according
-to level, blue while charging, and gray while offline or waiting for telemetry.
+The tooltip explicitly requests the Windows standard hover UI and shows
+percentage, voltage, charge state, LIVE/STALE state, and the age of the last
+wireless Battery packet. Left-click and right-click both open a native popup
+that shows Battery percentage, voltage, charge state, telemetry state/age and
+sequence above the action commands. The icon is green/yellow/red according to
+level, blue while charging, and gray while offline or waiting for telemetry.
 
 ## Portable usage
 
 1. Copy `dist\WirelessKeyboardTray.exe` to any writable folder.
 2. Run it. No installation or elevation is required.
-3. Right-click the tray icon for `Refresh now`, `Start with Windows`, or `Exit`.
+3. Hover for the compact status. Left-click or right-click for the complete
+   Battery details and `Refresh now`, `Start with Windows`, or `Exit`.
 
 `Start with Windows` adds one per-user value named `WirelessKeyboardTray` under
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Turning the option off
@@ -86,8 +92,8 @@ The committed `dist\WirelessKeyboardTray.exe` is the portable release artifact.
 Current release:
 
 ```text
-size      243200 bytes
-SHA-256   8C1F47FECC0D5389F559E42695E91A67B11A946DA7A5BAA334B97C7E1C64A0F1
+size      244224 bytes
+SHA-256   03FFDA3D498A36DE80DBB9B95F7481700F9DB4BFC89AE598EA0A481EABAD66E1
 ```
 
 Offline idle smoke test on Windows 11: zero additional CPU milliseconds during
