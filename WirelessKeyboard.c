@@ -28,25 +28,32 @@
 #define SPI_BAUD_HZ       8000000
 #define PIN_SPI_SCK       6    // SPI0 SCK  -> nRF P0.17
 #define PIN_SPI_MOSI      7    // SPI0 TX   -> nRF P0.20
-#define PIN_SPI_MISO      8    // unused (link is write-only); wire only -> nRF P0.08
+#define PIN_SPI_MISO      8    // SPI0 RX   <- nRF P0.08 (reverse ACK/status path)
 #define PIN_SPI_CSN       9    // manual GPIO -> nRF P0.22 (SPIS CSN)
 
 #define KBD_REPORT_LEN    8    // boot report: modifier, reserved, key1..key6
 #define LINK_FRAME_LEN    12
 #define LINK_MAGIC        0xA5
-#define LINK_VERSION      0x02
+#define LINK_VERSION      0x03
 #define LINK_TYPE_KEYBOARD 0x01
 #define LINK_TYPE_CONSUMER 0x02
 #define LINK_TYPE_CONTROL  0x03
+#define LINK_TYPE_BATTERY  0x04
 #define LINK_CONTROL_SYSTEM_OFF 0x01
+#define LINK_CONTROL_POLL_ACK   0x02
+#define LINK_ACK_MAGIC           0x5A
+#define LINK_ACK_TYPE_LOCK_STATE 0x01
 #define RADIO_INACTIVITY_MS (5u * 60u * 1000u)
 #define RADIO_OFF_SETTLE_MS 10u
 #define RADIO_BOOT_WAIT_MS  75u
-#define RADIO_WAKE_QUEUE_DEPTH 32u
+#define RADIO_WAKE_QUEUE_DEPTH 128u
+#define SPI_INPUT_QUEUE_DEPTH 128u
 #define RADIO_SLEEP_BLINK_COUNT 4u
 #define RADIO_SLEEP_BLINK_HALF_PERIOD_MS 100u
-#define SPI_KEYBOARD_RETRY_DELAY_US 250u
-#define SPI_STATE_RECONCILE_MS 10u
+#define SPI_REARM_GUARD_US 250u
+#define SPI_ACK_POLL_MS 100u
+#define BATTERY_TELEMETRY_PERIOD_MS 30000u
+#define BATTERY_HID_QUIET_GUARD_MS 50u
 #define MAX_HID_REPORTS   8
 #define MAX_CONSUMER_FIELDS 16
 #define HID_KEY_A         0x04
@@ -137,6 +144,17 @@ struct link_input_frame {
 _Static_assert(sizeof(struct link_input_frame) == LINK_FRAME_LEN,
                "SPI link frame must remain 12 bytes");
 
+struct link_ack_frame {
+    uint8_t magic;
+    uint8_t version;
+    uint8_t type;
+    uint8_t sequence;
+    uint8_t data[KBD_REPORT_LEN];
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct link_ack_frame) == LINK_FRAME_LEN,
+               "SPI ACK frame must remain 12 bytes");
+
 struct consumer_field {
     uint8_t report_id;
     uint16_t bit_offset;
@@ -180,12 +198,23 @@ struct pending_radio_input {
 static struct pending_radio_input radio_wake_queue[RADIO_WAKE_QUEUE_DEPTH];
 static uint8_t radio_wake_queue_head;
 static uint8_t radio_wake_queue_count;
+static struct pending_radio_input spi_input_queue[SPI_INPUT_QUEUE_DEPTH];
+static uint8_t spi_input_queue_head;
+static uint8_t spi_input_queue_count;
 static bool radio_sleep_indicator_active;
 static uint32_t radio_sleep_indicator_started_ms;
-static uint32_t spi_reconcile_after_ms;
-static uint8_t spi_keyboard_retry_data[KBD_REPORT_LEN];
-static bool spi_keyboard_retry_pending;
-static uint32_t spi_keyboard_retry_after_us;
+static uint8_t spi_sequence;
+static struct link_input_frame spi_retry_frame;
+static bool spi_retry_pending;
+static uint32_t spi_retry_after_us;
+static struct pending_radio_input battery_spi_pending_frame;
+static bool battery_spi_pending;
+static uint32_t spi_last_ack_poll_ms;
+
+static uint8_t remote_keyboard_led_state;
+static uint8_t remote_keyboard_led_sequence;
+static uint8_t remote_keyboard_led_epoch;
+static bool remote_keyboard_led_valid;
 
 /* Locally simulated keyboard lock state. */
 static uint8_t           keyboard_led_state;
@@ -194,6 +223,11 @@ static uint8_t           keyboard_lock_pressed;
 static bool              keyboard_led_update_pending;
 static bool              keyboard_led_transfer_active;
 static uint32_t          keyboard_led_retry_after_ms;
+
+static bool              battery_tx_pending;
+static bool              battery_material_step;
+static uint32_t          battery_last_tx_ms;
+static uint8_t           battery_sequence;
 
 static uint32_t total_hid_reports_received = 0;
 static uint32_t total_spi_frames_sent      = 0;
@@ -206,8 +240,9 @@ static uint32_t descriptor_dump_after_ms;
 
 /*--------------------------------------------------------------------+
  *  SPI master bridge to the nRF52840 (SPI slave). The fixed 12-byte frame
- *  carries either an 8-byte boot keyboard state or a normalized 16-bit
- *  Consumer Control usage. Battery and RGB data remain local-only.
+ *  carries either an 8-byte boot keyboard state, a normalized 16-bit Consumer
+ *  Control usage, or a low-priority latest-state Battery record. RGB control
+ *  remains local; the RP2040 remains the battery measurement authority.
  *--------------------------------------------------------------------*/
 static void spi_master_init(void)
 {
@@ -216,96 +251,209 @@ static void spi_master_init(void)
 
     gpio_set_function(PIN_SPI_SCK,  GPIO_FUNC_SPI);
     gpio_set_function(PIN_SPI_MOSI, GPIO_FUNC_SPI);
-    gpio_init(PIN_SPI_MISO);
-    gpio_set_dir(PIN_SPI_MISO, GPIO_IN);
+    gpio_set_function(PIN_SPI_MISO, GPIO_FUNC_SPI);
 
     gpio_init(PIN_SPI_CSN);
     gpio_set_dir(PIN_SPI_CSN, GPIO_OUT);
     gpio_put(PIN_SPI_CSN, 1);
 
-    printf("[SPI] Master init OK: %d Hz, SCK=GP%d MOSI=GP%d MISO=GP%d(unused) CSN=GP%d\n",
+    printf("[SPI] Master init OK: %d Hz, SCK=GP%d MOSI=GP%d MISO=GP%d ACK CSN=GP%d\n",
            SPI_BAUD_HZ, PIN_SPI_SCK, PIN_SPI_MOSI, PIN_SPI_MISO, PIN_SPI_CSN);
 #if SPI_LINK_TEST_MODE
     printf("[SPI] *** LINK TEST MODE ENABLED ***\n");
 #endif
 }
 
-static void spi_send_input(uint8_t type, const uint8_t data[KBD_REPORT_LEN])
+static bool spi_sequence_is_newer(uint8_t sequence, uint8_t previous)
 {
-    if (type != LINK_TYPE_CONTROL && radio_power_state != RADIO_AWAKE) {
-        if (radio_wake_queue_count == RADIO_WAKE_QUEUE_DEPTH) {
-            radio_wake_queue_head =
-                (uint8_t)((radio_wake_queue_head + 1u) % RADIO_WAKE_QUEUE_DEPTH);
-            --radio_wake_queue_count;
-        }
-        uint8_t const tail = (uint8_t)(
-            (radio_wake_queue_head + radio_wake_queue_count) %
-            RADIO_WAKE_QUEUE_DEPTH);
-        radio_wake_queue[tail].type = type;
-        memcpy(radio_wake_queue[tail].data, data, KBD_REPORT_LEN);
-        ++radio_wake_queue_count;
+    return (int8_t)(sequence - previous) > 0;
+}
+
+static bool pending_radio_queue_push(struct pending_radio_input *queue,
+                                     uint8_t *head, uint8_t *count,
+                                     uint8_t depth, uint8_t type,
+                                     const uint8_t data[KBD_REPORT_LEN])
+{
+    if (*count >= depth) return false;
+
+    uint8_t const tail = (uint8_t)((*head + *count) % depth);
+    queue[tail].type = type;
+    memcpy(queue[tail].data, data, KBD_REPORT_LEN);
+    ++(*count);
+    return true;
+}
+
+static bool pending_radio_queue_pop(struct pending_radio_input *queue,
+                                    uint8_t *head, uint8_t *count,
+                                    uint8_t depth,
+                                    struct pending_radio_input *output)
+{
+    if (*count == 0) return false;
+
+    *output = queue[*head];
+    *head = (uint8_t)((*head + 1u) % depth);
+    --(*count);
+    return true;
+}
+
+static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
+{
+    struct link_ack_frame ack;
+
+    memcpy(&ack, rx, sizeof(ack));
+    if (ack.magic != LINK_ACK_MAGIC || ack.version != LINK_VERSION ||
+        ack.type != LINK_ACK_TYPE_LOCK_STATE ||
+        (ack.data[1] & 0x01u) == 0) {
         return;
     }
 
-    static uint8_t sequence;
-    struct link_input_frame const frame = {
-        .magic = LINK_MAGIC,
-        .version = LINK_VERSION,
-        .type = type,
-        .sequence = sequence++,
-        .data = { data[0], data[1], data[2], data[3],
-                  data[4], data[5], data[6], data[7] },
-    };
+    if (remote_keyboard_led_valid &&
+        ack.data[2] == remote_keyboard_led_epoch &&
+        !spi_sequence_is_newer(ack.sequence, remote_keyboard_led_sequence)) {
+        return;
+    }
+
+    if (!remote_keyboard_led_valid ||
+        ack.data[2] != remote_keyboard_led_epoch) {
+        remote_keyboard_led_epoch = ack.data[2];
+        remote_keyboard_led_valid = false;
+    }
+    remote_keyboard_led_sequence = ack.sequence;
+    remote_keyboard_led_valid = true;
+    remote_keyboard_led_state = ack.data[0] &
+        (HID_LED_NUM_LOCK | HID_LED_CAPS_LOCK | HID_LED_SCROLL_LOCK);
+
+    if (keyboard_led_state != remote_keyboard_led_state) {
+        keyboard_led_state = remote_keyboard_led_state;
+        keyboard_led_update_pending = true;
+        keyboard_led_retry_after_ms = 0;
+    }
+}
+
+static void spi_write_frame(struct link_input_frame const *frame)
+{
+    uint8_t rx[LINK_FRAME_LEN] = { 0 };
 #if HOT_PATH_DEBUG
     uint32_t const t0 = time_us_32();
 #endif
 
     gpio_put(PIN_SPI_CSN, 0);
     sleep_us(1);
-    spi_write_blocking(SPI_PORT, (uint8_t const *)&frame, sizeof(frame));
+    spi_write_read_blocking(SPI_PORT, (uint8_t const *)frame, rx,
+                            sizeof(*frame));
     sleep_us(1);
     gpio_put(PIN_SPI_CSN, 1);
 
     total_spi_frames_sent++;
+    spi_process_ack(rx);
 #if HOT_PATH_DEBUG
     uint32_t const dt_us = time_us_32() - t0;
     printf("[SPI TX #%lu] took %lu us | type=%u seq=%u data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
            (unsigned long)total_spi_frames_sent, (unsigned long)dt_us,
-           frame.type, frame.sequence,
-           frame.data[0], frame.data[1], frame.data[2], frame.data[3],
-           frame.data[4], frame.data[5], frame.data[6], frame.data[7]);
+           frame->type, frame->sequence,
+           frame->data[0], frame->data[1], frame->data[2], frame->data[3],
+           frame->data[4], frame->data[5], frame->data[6], frame->data[7]);
 #endif
 }
 
-static void spi_send_keyboard_transition(
+static bool spi_queue_input(uint8_t type, const uint8_t data[KBD_REPORT_LEN])
+{
+    if (type == LINK_TYPE_BATTERY) {
+        battery_spi_pending_frame.type = type;
+        memcpy(battery_spi_pending_frame.data, data, KBD_REPORT_LEN);
+        battery_spi_pending = true;
+        return true;
+    }
+
+    if (type != LINK_TYPE_CONTROL && radio_power_state != RADIO_AWAKE) {
+        return pending_radio_queue_push(radio_wake_queue,
+                                        &radio_wake_queue_head,
+                                        &radio_wake_queue_count,
+                                        RADIO_WAKE_QUEUE_DEPTH, type, data);
+    }
+
+    return pending_radio_queue_push(spi_input_queue,
+                                    &spi_input_queue_head,
+                                    &spi_input_queue_count,
+                                    SPI_INPUT_QUEUE_DEPTH, type, data);
+}
+
+static bool spi_send_keyboard_transition(
     const uint8_t data[KBD_REPORT_LEN])
 {
-    spi_send_input(LINK_TYPE_KEYBOARD, data);
+    return spi_queue_input(LINK_TYPE_KEYBOARD, data);
+}
 
-    /* SPIS must be re-armed by the nRF application after every transaction.
-     * Schedule a non-blocking duplicate after a short guard interval. Keeping
-     * the wait outside the TinyUSB callback lets it re-arm the 1 kHz endpoint
-     * immediately. The Transmitter discards the duplicate before ESB. */
-    if (radio_power_state == RADIO_AWAKE) {
-        memcpy(spi_keyboard_retry_data, data, KBD_REPORT_LEN);
-        spi_keyboard_retry_after_us =
-            time_us_32() + SPI_KEYBOARD_RETRY_DELAY_US;
-        spi_keyboard_retry_pending = true;
+static void spi_service_task(void)
+{
+    struct pending_radio_input pending;
+
+    if (spi_retry_pending) {
+        if (radio_power_state != RADIO_AWAKE ||
+            (int32_t)(time_us_32() - spi_retry_after_us) < 0) {
+            return;
+        }
+
+        spi_retry_pending = false;
+        spi_write_frame(&spi_retry_frame);
+        return;
+    }
+
+    if (radio_power_state != RADIO_AWAKE) return;
+
+    if (!pending_radio_queue_pop(spi_input_queue, &spi_input_queue_head,
+                                 &spi_input_queue_count,
+                                 SPI_INPUT_QUEUE_DEPTH, &pending)) {
+        if (!battery_spi_pending) return;
+        pending = battery_spi_pending_frame;
+        battery_spi_pending = false;
+    }
+
+    spi_retry_frame = (struct link_input_frame) {
+        .magic = LINK_MAGIC,
+        .version = LINK_VERSION,
+        .type = pending.type,
+        .sequence = spi_sequence++,
+        .data = { pending.data[0], pending.data[1], pending.data[2],
+                  pending.data[3], pending.data[4], pending.data[5],
+                  pending.data[6], pending.data[7] },
+    };
+    spi_write_frame(&spi_retry_frame);
+    if (pending.type == LINK_TYPE_BATTERY) {
+        /* Battery is latest-state telemetry, not an urgent transition. It
+         * must not consume the 250 us Keyboard/Consumer duplicate slot. */
+        spi_retry_pending = false;
+    } else {
+        spi_retry_after_us = time_us_32() + SPI_REARM_GUARD_US;
+        spi_retry_pending = true;
     }
 }
 
-static void keyboard_spi_retry_task(void)
+static void spi_send_control_command(uint8_t command)
 {
-    if (!spi_keyboard_retry_pending) return;
+    struct link_input_frame const frame = {
+        .magic = LINK_MAGIC,
+        .version = LINK_VERSION,
+        .type = LINK_TYPE_CONTROL,
+        .sequence = spi_sequence++,
+        .data = { command, 0, 0, 0, 0, 0, 0, 0 },
+    };
 
-    if (radio_power_state != RADIO_AWAKE) {
-        spi_keyboard_retry_pending = false;
+    spi_write_frame(&frame);
+}
+
+static void spi_ack_poll_task(void)
+{
+    uint32_t const now = board_millis();
+
+    if (radio_power_state != RADIO_AWAKE || spi_retry_pending ||
+        spi_input_queue_count != 0 || battery_spi_pending ||
+        (uint32_t)(now - spi_last_ack_poll_ms) < SPI_ACK_POLL_MS) {
         return;
     }
-    if ((int32_t)(time_us_32() - spi_keyboard_retry_after_us) < 0) return;
 
-    spi_keyboard_retry_pending = false;
-    spi_send_input(LINK_TYPE_KEYBOARD, spi_keyboard_retry_data);
+    spi_last_ack_poll_ms = now;
+    spi_send_control_command(LINK_CONTROL_POLL_ACK);
 }
 
 static bool keyboard_report_is_released(void)
@@ -358,6 +506,9 @@ static void radio_start_wake(void)
     gpio_put(PIN_SPI_CSN, 0);
     sleep_us(100);
     gpio_put(PIN_SPI_CSN, 1);
+    /* A Receiver reboot may restart its LED sequence. The next valid ACK is
+     * allowed to establish a fresh epoch after wake. */
+    remote_keyboard_led_valid = false;
     radio_power_state = RADIO_WAKING;
     radio_wake_requested = false;
     radio_transition_after_ms = board_millis() + RADIO_BOOT_WAIT_MS;
@@ -387,29 +538,31 @@ static void radio_power_task(void)
 
         radio_power_state = RADIO_AWAKE;
         while (radio_wake_queue_count != 0) {
-            struct pending_radio_input const pending =
-                radio_wake_queue[radio_wake_queue_head];
-            radio_wake_queue_head = (uint8_t)(
-                (radio_wake_queue_head + 1u) % RADIO_WAKE_QUEUE_DEPTH);
-            --radio_wake_queue_count;
-            spi_send_input(pending.type, pending.data);
+            struct pending_radio_input pending;
+
+            if (!pending_radio_queue_pop(radio_wake_queue,
+                                         &radio_wake_queue_head,
+                                         &radio_wake_queue_count,
+                                         RADIO_WAKE_QUEUE_DEPTH, &pending)) {
+                break;
+            }
+            (void)spi_queue_input(pending.type, pending.data);
         }
-        spi_send_input(LINK_TYPE_KEYBOARD,
-                       previous_output_valid ? previous_output_report : released);
-        spi_send_input(LINK_TYPE_CONSUMER, consumer);
-        spi_reconcile_after_ms = board_millis() + SPI_STATE_RECONCILE_MS;
+        (void)spi_queue_input(LINK_TYPE_KEYBOARD,
+                              previous_output_valid ? previous_output_report : released);
+        (void)spi_queue_input(LINK_TYPE_CONSUMER, consumer);
         return;
     }
 
     if ((uint32_t)(now - radio_last_activity_ms) < RADIO_INACTIVITY_MS ||
         !keyboard_report_is_released() ||
         (previous_consumer_valid && previous_consumer_usage != 0) ||
-        keyboard_led_transfer_active) {
+        keyboard_led_transfer_active || spi_retry_pending ||
+        spi_input_queue_count != 0) {
         return;
     }
 
-    uint8_t control[KBD_REPORT_LEN] = { LINK_CONTROL_SYSTEM_OFF };
-    spi_send_input(LINK_TYPE_CONTROL, control);
+    spi_send_control_command(LINK_CONTROL_SYSTEM_OFF);
     radio_sleep_indicator_active = true;
     radio_sleep_indicator_started_ms = now;
     radio_power_state = RADIO_SYSTEM_OFF;
@@ -433,7 +586,7 @@ static void spi_link_test_task(void)
         0xAA, counter, 0xAA, counter, 0xAA, counter, 0xAA, counter
     };
     counter++;
-    spi_send_input(LINK_TYPE_KEYBOARD, test_data);
+    (void)spi_queue_input(LINK_TYPE_KEYBOARD, test_data);
 }
 #endif
 
@@ -607,7 +760,7 @@ static void forward_consumer_usage(uint16_t usage)
     uint8_t data[KBD_REPORT_LEN] = {
         (uint8_t)usage, (uint8_t)(usage >> 8), 0, 0, 0, 0, 0, 0
     };
-    spi_send_input(LINK_TYPE_CONSUMER, data);
+    if (!spi_queue_input(LINK_TYPE_CONSUMER, data)) return;
     previous_consumer_usage = usage;
     previous_consumer_valid = true;
 #if CONSUMER_DEBUG
@@ -796,8 +949,7 @@ static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN])
         return;
     }
 
-    spi_send_keyboard_transition(output);
-    spi_reconcile_after_ms = board_millis() + SPI_STATE_RECONCILE_MS;
+    if (!spi_send_keyboard_transition(output)) return;
     memcpy(previous_output_report, output, KBD_REPORT_LEN);
     previous_output_valid = true;
     total_output_reports_sent++;
@@ -808,22 +960,6 @@ static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN])
            output[0], output[1], output[2], output[3],
            output[4], output[5], output[6], output[7]);
 #endif
-}
-
-static void keyboard_spi_reconcile_task(void)
-{
-    uint32_t const now = board_millis();
-
-    if (radio_power_state != RADIO_AWAKE || !previous_output_valid ||
-        (int32_t)(now - spi_reconcile_after_ms) < 0) {
-        return;
-    }
-
-    /* SPI is write-only, so periodically restate the absolute keyboard state.
-     * Transmitter deduplicates it before ESB. A lost release is therefore
-     * repaired locally without adding periodic radio traffic. */
-    spi_send_input(LINK_TYPE_KEYBOARD, previous_output_report);
-    spi_reconcile_after_ms = now + SPI_STATE_RECONCILE_MS;
 }
 
 /*--------------------------------------------------------------------+
@@ -895,7 +1031,8 @@ static struct rgb_color battery_color_for_pct(uint8_t pct)
 }
 
 /*--------------------------------------------------------------------+
- *  Battery measurement/state machine — local ADC only, no radio data.
+ *  Battery measurement/state machine — local ADC authority plus low-priority
+ *  telemetry; never blocks or wakes the urgent input path.
  *--------------------------------------------------------------------*/
 enum battery_led_state {
     BATT_LED_BOOT,
@@ -997,6 +1134,9 @@ static void battery_start_display(void)
     battery_state_started_ms = board_millis();
     battery_last_check_ms = battery_state_started_ms;
     battery_led_state = BATT_LED_BOOT;
+    battery_last_tx_ms = battery_state_started_ms;
+    battery_tx_pending = false;
+    battery_spi_pending = false;
     battery_update_led(battery_state_started_ms);
 
 #if PERIODIC_DEBUG
@@ -1021,6 +1161,7 @@ static void battery_sample_task(uint32_t now)
      * 50 mV at GP28 corresponds to 150 mV at the battery through the x3
      * divider. Stable voltage is monitored silently and never latches an LED. */
     if (delta_mv >= (int32_t)BATT_EVENT_DELTA_MV) {
+        battery_material_step = true;
         if (battery_led_state == BATT_LED_BOOT) {
             battery_charge_detected_during_boot = true;
         } else {
@@ -1029,11 +1170,65 @@ static void battery_sample_task(uint32_t now)
             battery_state_started_ms = now;
         }
     } else if (delta_mv <= -(int32_t)BATT_EVENT_DELTA_MV) {
+        battery_material_step = true;
         battery_charge_detected_during_boot = false;
         if (battery_led_state != BATT_LED_BOOT) {
             battery_led_state = BATT_LED_UNPLUG_SHOW;
             battery_state_started_ms = now;
         }
+    }
+}
+
+static uint8_t battery_link_state(void)
+{
+    switch (battery_led_state) {
+    case BATT_LED_CHARGING:
+        return 1; /* charging */
+    case BATT_LED_FULL:
+        return 3; /* full */
+    case BATT_LED_UNPLUG_SHOW:
+        return 2; /* discharging */
+    case BATT_LED_IDLE:
+        return 0; /* idle */
+    case BATT_LED_BOOT:
+    default:
+        return 4; /* unknown */
+    }
+}
+
+static void battery_telemetry_task(uint32_t now)
+{
+    if ((uint32_t)(now - battery_last_tx_ms) >=
+        BATTERY_TELEMETRY_PERIOD_MS) {
+        battery_tx_pending = true;
+    }
+
+    if (!battery_tx_pending || radio_power_state != RADIO_AWAKE ||
+        (uint32_t)(now - radio_last_activity_ms) <
+            BATTERY_HID_QUIET_GUARD_MS ||
+        radio_wake_queue_count != 0 || spi_input_queue_count != 0 ||
+        spi_retry_pending || battery_spi_pending ||
+        !keyboard_report_is_released() ||
+        (previous_consumer_valid && previous_consumer_usage != 0) ||
+        keyboard_led_transfer_active) {
+        return;
+    }
+
+    uint8_t data[KBD_REPORT_LEN] = {
+        battery_pct,
+        battery_link_state(),
+        (uint8_t)battery_filtered_mv,
+        (uint8_t)(battery_filtered_mv >> 8),
+        battery_sequence++,
+        (uint8_t)(0x01u | (battery_material_step ? 0x02u : 0x00u)),
+        0,
+        0,
+    };
+
+    if (spi_queue_input(LINK_TYPE_BATTERY, data)) {
+        battery_tx_pending = false;
+        battery_material_step = false;
+        battery_last_tx_ms = now;
     }
 }
 
@@ -1056,6 +1251,7 @@ static void battery_task(void)
     }
 
     battery_update_led(now);
+    battery_telemetry_task(now);
 }
 
 /*--------------------------------------------------------------------+
@@ -1232,6 +1428,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
         kbd_dev_addr = dev_addr;
         kbd_instance = instance;
         kbd_is_mounted = true;
+        remote_keyboard_led_valid = false;
         keyboard_led_reset();
         previous_consumer_usage = 0;
         previous_consumer_valid = false;
@@ -1269,6 +1466,7 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
         null_movement_reset();
         keyboard_led_transfer_active = false;
         keyboard_led_update_pending = false;
+        remote_keyboard_led_valid = false;
         kbd_dev_addr = 0;
         kbd_is_mounted = false;
     }
@@ -1420,16 +1618,16 @@ int main(void)
 
     while (1) {
         tuh_task();
-        keyboard_spi_retry_task();
+        radio_power_task();
+        battery_task();
+        spi_ack_poll_task();
+        spi_service_task();
         usb_descriptor_dump_task();
 #if SPI_LINK_TEST_MODE
         spi_link_test_task();
 #endif
         led_blinking_task();
         keyboard_led_task();
-        radio_power_task();
-        keyboard_spi_reconcile_task();
-        battery_task();
         status_task();
     }
 }
