@@ -991,15 +991,14 @@ static bool keyboard_boot_report_has_error(
     return false;
 }
 
-static void __attribute__((unused)) forward_boot_keyboard_report(
-    uint8_t const *report, uint16_t len)
+/* The SPI/RF keyboard frame is the standard eight-byte 6KRO array.  Do not
+ * forward HID ErrorRollOver/POSTFail/ErrorUndefined usages as ordinary keys.
+ * This helper is valid only after the descriptor-selected payload has been
+ * verified as exactly that eight-byte array; it must never be applied to an
+ * NKRO bitmap. */
+static void keyboard_array_report_normalize(uint8_t const report[KBD_REPORT_LEN],
+                                            uint8_t normalized[KBD_REPORT_LEN])
 {
-    uint8_t normalized[KBD_REPORT_LEN];
-
-    /* Boot protocol is exactly modifier, reserved and six usages. Reject a
-     * malformed packet instead of indexing an alternate NKRO/report-ID layout. */
-    if (len != KBD_REPORT_LEN) return;
-
     memcpy(normalized, report, sizeof(normalized));
     if (keyboard_boot_report_has_error(normalized)) {
         /* Do not forward rollover/error usages through the RF link. Releasing
@@ -1007,7 +1006,6 @@ static void __attribute__((unused)) forward_boot_keyboard_report(
          * not manufacture an unexpected modifier-up edge. */
         memset(normalized + 2, 0, KBD_REPORT_LEN - 2);
     }
-    forward_keyboard_report(normalized);
 }
 
 static void keyboard_led_reset(void)
@@ -1942,13 +1940,17 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
         }
 #endif
         if (!keyboard_xfer_failed && keyboard_report && keyboard_uses_report_protocol &&
-            keyboard_payload_len >= KBD_REPORT_LEN) {
+            keyboard_payload_len == KBD_REPORT_LEN) {
+            uint8_t normalized[KBD_REPORT_LEN];
+            keyboard_array_report_normalize(keyboard_payload, normalized);
             (void)usb_host_event_push(USB_HOST_EVENT_KEYBOARD_REPORT,
-                                      dev_addr, instance, keyboard_payload);
+                                      dev_addr, instance, normalized);
         } else if (!keyboard_xfer_failed && keyboard_report && !keyboard_uses_report_protocol) {
             if (keyboard_payload_len == KBD_REPORT_LEN) {
+                uint8_t normalized[KBD_REPORT_LEN];
+                keyboard_array_report_normalize(keyboard_payload, normalized);
                 (void)usb_host_event_push(USB_HOST_EVENT_KEYBOARD_REPORT,
-                                          dev_addr, instance, keyboard_payload);
+                                          dev_addr, instance, normalized);
             }
 #if HOT_PATH_DEBUG
             if (keyboard_payload_len >= KBD_REPORT_LEN) {
