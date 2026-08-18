@@ -328,7 +328,7 @@ endpoint recovery. The Transmitter and Receiver artifacts remain:
 - Transmitter `firmware/transmitter.uf2`:
   `551751E5353223CFDB7CF2456723514039473C2D11304410888080C6B2FAF89D`
 - Receiver `firmware/receiver.hex`:
-  `493477721D33607CFB76381B041AA81F5913F3F3D72E69E370A7BA814B897C56`
+  `3E7B5B1A610147BEFC74AECE6F6D6DBC4123352EAEE6B5FC2A910B5DEE48FBFC`
 
 The Receiver artifact above includes the Windows HID descriptor validation
 fix: the eight-byte vendor Battery Input and Feature fields each declare their
