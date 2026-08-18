@@ -422,7 +422,7 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
 
     if (keyboard_led_state != remote_keyboard_led_state) {
         keyboard_led_state = remote_keyboard_led_state;
-        keyboard_led_update_pending = false;
+        keyboard_led_update_pending = true;
     }
 #if HID_DIAGNOSTIC_LOG
     static uint8_t last_logged_led = 0xFF;
@@ -1113,7 +1113,7 @@ static void keyboard_led_reset(void)
     keyboard_led_retry_after_ms = 0;
 }
 
-static void __unused keyboard_led_build_output_report(uint8_t led_state)
+static void keyboard_led_build_output_report(uint8_t led_state)
 {
     memset(keyboard_led_tx_report, 0, sizeof(keyboard_led_tx_report));
     for (uint8_t i = 0; i < 3; ++i) {
@@ -1158,11 +1158,24 @@ static void keyboard_led_toggle_on_press(
     keyboard_lock_pressed = pressed_now;
 }
 
-/* LED output is managed locally on keyboard hardware; disable runtime SET_REPORT
- * control transfers to prevent collisions with 1 kHz Interrupt-IN transfers. */
+/* Single-shot LED SET_REPORT to sync physical keyboard Num/Caps/Scroll LEDs */
 static void keyboard_led_task(void)
 {
+    if (!kbd_is_mounted || !keyboard_led_update_pending ||
+        keyboard_led_transfer_active) {
+        return;
+    }
+
+    keyboard_led_build_output_report(keyboard_led_state);
     keyboard_led_update_pending = false;
+
+    if (tuh_hid_set_report(kbd_dev_addr, kbd_instance,
+                           keyboard_led_output_report_id,
+                           HID_REPORT_TYPE_OUTPUT,
+                           keyboard_led_tx_report,
+                           keyboard_led_output_report_len)) {
+        keyboard_led_transfer_active = true;
+    }
 }
 
 static void null_movement_reset(void)
