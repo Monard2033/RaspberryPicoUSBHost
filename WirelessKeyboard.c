@@ -1686,6 +1686,11 @@ static void hid_receive_arm_or_defer(uint8_t dev_addr, uint8_t instance)
 
 static void hid_receive_rearm_task(void)
 {
+    static uint32_t last_rearm_check_ms = 0;
+    uint32_t const now = board_millis();
+    if ((uint32_t)(now - last_rearm_check_ms) < 2u) return;
+    last_rearm_check_ms = now;
+
     for (uint8_t instance = 0; instance < CFG_TUH_HID; ++instance) {
         if (!hid_receive_rearm_pending[instance]) continue;
 
@@ -1770,13 +1775,8 @@ static void keyboard_hid_stall_recovery_task(void)
      * it. Repair that case even if the last keyboard state was released. */
     if (tuh_hid_receive_ready(kbd_dev_addr, kbd_instance)) {
         hid_receive_arm_or_defer(kbd_dev_addr, kbd_instance);
-        keyboard_last_report_ms = now;
-        return;
     }
-
-    /* A busy interrupt-IN transfer with no completion is left to the PIO
-     * scheduler. Do not abort it here: a failed/stalled completion is detected
-     * as the zero-length HID callback and recovered by CLEAR_FEATURE above. */
+    keyboard_last_report_ms = now;
 }
 
 void tuh_mount_cb(uint8_t dev_addr)
@@ -1924,6 +1924,7 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
                                     uint8_t report_id, uint8_t report_type,
                                     uint16_t len)
 {
+    (void)len;
     if (dev_addr != kbd_dev_addr || instance != kbd_instance ||
         report_id != keyboard_led_output_report_id ||
         report_type != HID_REPORT_TYPE_OUTPUT) {
@@ -1931,13 +1932,7 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
     }
 
     keyboard_led_transfer_active = false;
-    if (len == keyboard_led_output_report_len &&
-        keyboard_led_tx_state == keyboard_led_state) {
-        keyboard_led_update_pending = false;
-    } else {
-        keyboard_led_update_pending = true;
-        keyboard_led_retry_after_ms = board_millis() + 100;
-    }
+    keyboard_led_update_pending = false;
 }
 
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,

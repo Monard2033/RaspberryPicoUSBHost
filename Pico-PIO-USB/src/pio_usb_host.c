@@ -221,10 +221,15 @@ static void __not_in_flash_func(busy_wait_1_us)(void) {
 
 static bool __no_inline_not_in_flash_func(connection_check)(root_port_t *port) {
   if (pio_usb_bus_get_line_state(port) == PORT_PIN_SE0) {
-    busy_wait_1_us();
-
-    if (pio_usb_bus_get_line_state(port) == PORT_PIN_SE0) {
+    uint32_t se0_count = 0;
+    for (int i = 0; i < 50; i++) {
       busy_wait_1_us();
+      if (pio_usb_bus_get_line_state(port) == PORT_PIN_SE0) {
+        se0_count++;
+      }
+    }
+
+    if (se0_count > 45) {
       // device disconnect
       port->connected = false;
       port->suspended = true;
