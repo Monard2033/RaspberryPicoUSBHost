@@ -112,10 +112,12 @@ the nRF52840 transmitter over SPI.
   quiet, only while awake and after urgent Keyboard/Consumer work is idle.
   Transmitter treats it as a one-slot low-priority packet, and Receiver exposes
   the cache through vendor HID report ID `3` without waking the radio.
-- [ ] Windows tray application and hardware/native-HID validation remain. The
-  vendor report contract is implemented, but no HIDAPI tray executable is
-  claimed until it is tested against the actual Receiver VID/PID and Windows
-  USB stack.
+- [x] Portable Windows tray application: `tools/WirelessKeyboardTray` provides
+  one native static EXE that reads only the Receiver's cached vendor Feature
+  report. It uses Plug-and-Play notifications plus one coalescable 30-second
+  timer, adds no radio packet, and never opens the Keyboard/Consumer HID
+  collections. Real Battery values and native Windows battery presentation
+  still require hardware validation after flashing the corrected Receiver.
 
 ## Active wiring
 

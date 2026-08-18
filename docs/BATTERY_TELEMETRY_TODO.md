@@ -184,15 +184,20 @@ driver.
 
 ## Windows tray application
 
-If native Windows USB battery display is absent or incomplete, create a small
-tray application using HIDAPI. It should:
+The portable implementation is in `tools/WirelessKeyboardTray`. It uses the
+built-in Windows HID/SetupAPI interfaces directly, avoiding a HIDAPI DLL and
+any external runtime. It:
 
-- identify the Receiver by VID/PID and the vendor battery report;
-- poll the local Receiver cache at a fixed interval such as 5 seconds;
-- display percentage, voltage, charging state and age of last wireless update;
-- use changing tray icons/tooltip and optionally start with Windows;
-- distinguish `LIVE`, `SLEEPING`, `STALE`, and `OFFLINE`;
-- perform no writes or radio wake requests merely to refresh the UI.
+- identifies VID/PID `1B4F:0001` and only vendor collection
+  `Usage Page 0xFF00 / Usage 0x01`;
+- reads the local Receiver cache once per 30 seconds, with a five-second timer
+  tolerance, or immediately after a Plug-and-Play/user refresh event;
+- displays percentage, voltage, charging state and cache age in its tooltip;
+- uses changing tray icons and an optional per-user `Start with Windows` entry;
+- distinguishes `LIVE`, `STALE`, waiting-for-telemetry and `OFFLINE`;
+- performs no writes or radio wake requests merely to refresh the UI;
+- uses no high-resolution timer, input hook, overlay, network connection,
+  background service, custom driver or administrator permission.
 
 Suggested meanings:
 
@@ -216,7 +221,7 @@ the last known value, not immediately treated as invalid.
 4. [x] Add Receiver cache and freshness tracking, separate from input queues.
 5. [ ] Prototype the standard HID battery report and test native Windows behavior.
 6. [x] Add the vendor-defined HID report as a stable application API.
-7. [ ] Build the optional HIDAPI tray application.
+7. [x] Build the portable native Windows tray application.
 8. [ ] Build and flash all three firmware images as a matched set; measure input
    latency, RF traffic, sleep entry, wake behavior and current consumption.
 
