@@ -460,6 +460,26 @@ static void dfu_send_status(uint8_t status, uint8_t progress, uint16_t offset_di
     spi_queue_input(LINK_TYPE_DFU_STATUS, data);
 }
 
+static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
+{
+    uint32_t const aligned_size = (size + FLASH_SECTOR_SIZE - 1u) & ~(FLASH_SECTOR_SIZE - 1u);
+    uint32_t const ints = save_and_disable_interrupts();
+    (void)ints;
+
+    /* 1. Erase Slot A (active application starting at offset 0) */
+    flash_range_erase(0, aligned_size);
+
+    /* 2. Copy verified new firmware from Staging Slot to Slot A */
+    const uint8_t *src = (const uint8_t *)(XIP_BASE + FLASH_STAGING_OFFSET);
+    flash_range_program(0, src, aligned_size);
+
+    /* 3. Reboot RP2040 into the newly installed firmware */
+    watchdog_reboot(0, 0, 0);
+    while (1) {
+        tight_loop_contents();
+    }
+}
+
 static void dfu_process_command(struct link_ack_frame const *ack)
 {
     uint8_t const cmd = ack->data[0];
@@ -523,7 +543,10 @@ static void dfu_process_command(struct link_ack_frame const *ack)
             dfu_send_status(DFU_STATUS_ERR_CRC, 0, 0);
         } else {
             dfu_send_status(DFU_STATUS_SUCCESS, 100, (uint16_t)(dfu_total_size / 4u));
+            sleep_ms(250);
+            dfu_apply_and_reboot(dfu_total_size);
         }
+        return;
     }
 }
 
