@@ -42,6 +42,7 @@ constexpr UINT kTrayIconId = 1;
 constexpr UINT kMenuRefresh = 1001;
 constexpr UINT kMenuAutostart = 1002;
 constexpr UINT kMenuExit = 1003;
+constexpr LONG kTrayMenuLiftPx = 50;
 
 enum class Availability {
     Offline,
@@ -576,11 +577,21 @@ void ShowTrayMenu()
 
     POINT cursor{};
     GetCursorPos(&cursor);
+    /* The notification overflow panel is topmost and can cover the lower
+     * menu rows. Anchor the menu 50 px above the click so Exit is neither
+     * hidden by the tray nor directly under the released mouse button. */
+    cursor.y -= kTrayMenuLiftPx;
     SetForegroundWindow(gWindow);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN,
-                   cursor.x, cursor.y, 0, gWindow, nullptr);
+    UINT const command = TrackPopupMenuEx(
+        menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN |
+                  TPM_RETURNCMD | TPM_NONOTIFY,
+        cursor.x, cursor.y, gWindow, nullptr);
+    PostMessageW(gWindow, WM_NULL, 0, 0);
     Shell_NotifyIconW(NIM_SETFOCUS, &gNotifyIcon);
     DestroyMenu(menu);
+    if (command != 0) {
+        SendMessageW(gWindow, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+    }
 }
 
 void RegisterForHidNotifications()

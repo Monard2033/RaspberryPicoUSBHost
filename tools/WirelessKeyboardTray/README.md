@@ -21,6 +21,9 @@ background service.
   the keyboard, and does not postpone System OFF.
 - Shows no automatic balloons, overlays, global hooks, Raw Input listeners, or
   focus-stealing windows. The context menu appears only after user interaction.
+- Anchors the context menu 50 px above the pointer and dispatches only the
+  command explicitly returned by Windows, preventing an accidental Exit on the
+  right-button release inside the notification overflow panel.
 - Runs below normal process priority; the HID worker runs at the lowest thread
   priority.
 
@@ -84,7 +87,7 @@ Current release:
 
 ```text
 size      243200 bytes
-SHA-256   A1A52579CEC024A85C143E4C34BA778DA77A8D3BE656B73402BE0E8083C69002
+SHA-256   8C1F47FECC0D5389F559E42695E91A67B11A946DA7A5BAA334B97C7E1C64A0F1
 ```
 
 Offline idle smoke test on Windows 11: zero additional CPU milliseconds during
