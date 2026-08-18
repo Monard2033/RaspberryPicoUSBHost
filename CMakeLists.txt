@@ -93,11 +93,14 @@ add_custom_command(TARGET WirelessKeyboard POST_BUILD
             "${CMAKE_CURRENT_LIST_DIR}/firmware"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_BINARY_DIR}/WirelessKeyboard.uf2"
+            "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard.uf2"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_BINARY_DIR}/WirelessKeyboard.uf2"
             "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard_OTA.uf2"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_BINARY_DIR}/WirelessKeyboard.bin"
             "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard_OTA.bin"
-    COMMENT "Updating firmware/WirelessKeyboard_OTA.uf2 and WirelessKeyboard_OTA.bin"
+    COMMENT "Updating firmware/WirelessKeyboard.uf2, WirelessKeyboard_OTA.uf2 and WirelessKeyboard_OTA.bin"
 )
 
 # RAM-only utility used to diagnose a QSPI flash that refuses UF2/OpenOCD
