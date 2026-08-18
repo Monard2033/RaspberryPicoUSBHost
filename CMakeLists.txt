@@ -70,6 +70,8 @@ target_link_libraries(WirelessKeyboard
     hardware_spi
     hardware_adc
     hardware_pwm
+    hardware_flash
+    hardware_sync
 )
 
 target_include_directories(WirelessKeyboard PRIVATE
@@ -85,15 +87,17 @@ target_sources(WirelessKeyboard PRIVATE
 pico_add_extra_outputs(WirelessKeyboard)
 
 # Keep the manually flashable image synchronized with every successful build.
-# This prevents an older firmware/WirelessKeyboard.uf2 from being copied to
-# the board after the ELF/UF2 in build/ has changed.
+# This produces both WirelessKeyboard_OTA.uf2 and WirelessKeyboard_OTA.bin.
 add_custom_command(TARGET WirelessKeyboard POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
             "${CMAKE_CURRENT_LIST_DIR}/firmware"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_BINARY_DIR}/WirelessKeyboard.uf2"
-            "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard.uf2"
-    COMMENT "Updating firmware/WirelessKeyboard.uf2"
+            "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard_OTA.uf2"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_BINARY_DIR}/WirelessKeyboard.bin"
+            "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard_OTA.bin"
+    COMMENT "Updating firmware/WirelessKeyboard_OTA.uf2 and WirelessKeyboard_OTA.bin"
 )
 
 # RAM-only utility used to diagnose a QSPI flash that refuses UF2/OpenOCD
