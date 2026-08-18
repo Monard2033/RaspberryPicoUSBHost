@@ -95,6 +95,9 @@ the nRF52840 transmitter over SPI.
   Windows through both control `SET_REPORT` and the interrupt OUT endpoint.
   Transmitter reads the ESB ACK payload and exposes it on SPI MISO
   (`GP8 <-> P0.08`); RP2040 applies it to the SONIX keyboard asynchronously.
+  Receiver accepts both ID-prefixed and ID-elided control payloads, while
+  RP2040 derives the real LED Output Report ID, length and bit positions from
+  the SONIX HID descriptor instead of assuming the Input Report layout.
 - [x] Reverse sequencing and stale-state handling: ACKs carry a sequence, a
   valid bit and a Receiver boot epoch; RP2040 ignores stale ACKs and accepts a
   fresh sequence after reconnect/wake. It retains Num Lock ON as the local
@@ -111,7 +114,9 @@ the nRF52840 transmitter over SPI.
   schedules one latest-state Battery packet every 30 seconds after 50 ms of HID
   quiet, only while awake and after urgent Keyboard/Consumer work is idle.
   Transmitter treats it as a one-slot low-priority packet, and Receiver exposes
-  the cache through vendor HID report ID `3` without waking the radio.
+  the cache through vendor HID report ID `3` without waking the radio. The USB
+  control response contains the required ID byte followed by eight payload
+  bytes, matching the nine-byte Windows `HidD_GetFeature` buffer.
 - [x] Portable Windows tray application: `tools/WirelessKeyboardTray` provides
   one native static EXE that reads only the Receiver's cached vendor Feature
   report. It uses Plug-and-Play notifications plus one coalescable 30-second
@@ -254,11 +259,11 @@ firmware/WirelessKeyboard.uf2
 The current matched protocol `0x03` artifacts have these SHA-256 values:
 
 - RP2040 `firmware/WirelessKeyboard.uf2`:
-  `8FFB42A7194850BCF5A24F8EBEDA8020CDE0274732B468997415B0C77FF2F572`
+  `96DD1F9AB4A7FD45D5ED73B33319BDBFEA2490D14B44085BAA37B22AD401BAEE`
 - Transmitter `firmware/transmitter.uf2`:
   `551751E5353223CFDB7CF2456723514039473C2D11304410888080C6B2FAF89D`
 - Receiver `firmware/receiver.hex`:
-  `FEC717F3DB77CE06AE598CF627150629B25E06D0291F94C2D8644A0DCF2F51CE`
+  `493477721D33607CFB76381B041AA81F5913F3F3D72E69E370A7BA814B897C56`
 
 The Receiver artifact above includes the Windows HID descriptor validation
 fix: the eight-byte vendor Battery Input and Feature fields each declare their

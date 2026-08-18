@@ -182,6 +182,11 @@ sequence, flags and age in seconds. Receiver remains HID-only: UART, Serial,
 CDC and a debug COM port stay disabled, so a reader requires no custom kernel
 driver.
 
+The Windows control-transfer buffer is nine bytes: byte `0` is report ID `3`
+and bytes `1..8` are the cached Battery payload. Receiver must return all nine
+bytes from its GET_REPORT callback; returning only the payload shifts every
+field and makes a valid cached value appear malformed to `HidD_GetFeature`.
+
 ## Windows tray application
 
 The portable implementation is in `tools/WirelessKeyboardTray`. It uses the
