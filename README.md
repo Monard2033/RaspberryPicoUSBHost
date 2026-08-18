@@ -10,10 +10,10 @@ the nRF52840 transmitter over SPI.
 - Current working trees are authoritative; cloud copies are older fallbacks.
   Work on the existing `codex/*` branches and back up every file before edits.
 - RP2040: `C:\Users\Monard\Raspberry\WirelessKeyboard`, branch
-  `codex/fix-keyboard-boot-rollover`. The current image keeps the ordered,
+  `codex/fix-wad-host-stall`. The current image keeps the ordered,
   nonblocking 1 kHz input path, recovers a transient TinyUSB HID endpoint
-  re-arm failure, and switches only the normal-keyboard interface to the
-  defined fixed-size HID Boot protocol after composite enumeration.
+  re-arm failure, and gives raw keyboard state priority over the optional
+  A/D–W/S game filter to prevent multi-key filter interactions.
 - Transmitter: `C:\ncs\v3.4.0\myproject\Transmitter`, branch
   `codex/ultra-fast-input-reliability`; the matched artifact is
   `firmware/transmitter.uf2`, SHA-256
@@ -97,6 +97,12 @@ the nRF52840 transmitter over SPI.
   The normal keyboard path accepts exactly its defined eight-byte report and
   treats HID `ErrorRollOver`/`POSTFail`/`ErrorUndefined` usages as a safe
   non-key state rather than forwarding them to the radio link.
+- [x] Held-key host-stall recovery: while the local keyboard state is pressed,
+  RP2040 detects 250 ms without a keyboard report, aborts only the stale HID
+  interrupt-IN transfer and re-arms it without waiting. The local A/D and W/S
+  last-input-wins filter is disabled by default: raw simultaneous keys are
+  forwarded unchanged, prioritizing reliability over that game-specific filter.
+  A one-second RP2040 hardware watchdog resets a genuine main-loop hard hang.
 - [ ] Hardware acceptance: validate Play/Pause, Previous, Next, Mute and
   Volume with repeated sub-10-ms actions, then verify `Ctrl+C`, `Ctrl+V`, Shift
   and Alt combinations at the 1 kHz source rate. Also hold and release 5 and 6
@@ -278,7 +284,7 @@ firmware/WirelessKeyboard.uf2
 The current matched protocol `0x03` artifacts have these SHA-256 values:
 
 - RP2040 `firmware/WirelessKeyboard.uf2`:
-  `2EC96286AE96DB6F55912D474D928E1B6325B84FA6C8448DF70C011628E48CDA`
+  `A1F9379F768A0E3CAD47A54378AD6D582B7F43976239234EF99DB6C507A23316`
 - Transmitter `firmware/transmitter.uf2`:
   `551751E5353223CFDB7CF2456723514039473C2D11304410888080C6B2FAF89D`
 - Receiver `firmware/receiver.hex`:
