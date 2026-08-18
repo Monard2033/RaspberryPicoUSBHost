@@ -61,6 +61,7 @@ endif()
 
 target_link_libraries(WirelessKeyboard
     pico_stdlib
+    pico_multicore
     tinyusb_host
     tinyusb_board
     pico_pio_usb
@@ -127,6 +128,7 @@ target_compile_definitions(WirelessKeyboardRam PRIVATE
 )
 target_link_libraries(WirelessKeyboardRam
     pico_stdlib
+    pico_multicore
     tinyusb_host
     tinyusb_board
     pico_pio_usb

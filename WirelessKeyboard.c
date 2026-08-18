@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
+#include "pico/multicore.h"
 #include "hardware/clocks.h"
+#include "hardware/sync.h"
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 #include "hardware/adc.h"
@@ -218,6 +220,72 @@ static uint16_t hid_activity_len[CFG_TUH_HID];
 static bool hid_activity_valid[CFG_TUH_HID];
 static bool hid_receive_rearm_pending[CFG_TUH_HID];
 
+/* PIO-USB is timing-sensitive: core 1 owns TinyUSB/PIO and writes this
+ * single-producer/single-consumer ring, while core 0 owns SPI/radio.  No
+ * callback may wait for SPI or issue radio traffic.  At 1 kHz this leaves
+ * 64 complete keyboard states (64 ms) of headroom without allocation/locks. */
+#define USB_HOST_EVENT_QUEUE_DEPTH 64u
+_Static_assert((USB_HOST_EVENT_QUEUE_DEPTH &
+                (USB_HOST_EVENT_QUEUE_DEPTH - 1u)) == 0,
+               "USB host event queue depth must be a power of two");
+enum usb_host_event_type {
+    USB_HOST_EVENT_DEVICE_MOUNT,
+    USB_HOST_EVENT_DEVICE_UMOUNT,
+    USB_HOST_EVENT_KEYBOARD_MOUNT,
+    USB_HOST_EVENT_KEYBOARD_UMOUNT,
+    USB_HOST_EVENT_KEYBOARD_REPORT,
+    USB_HOST_EVENT_CONSUMER_REPORT,
+};
+struct usb_host_event {
+    uint8_t type;
+    uint8_t dev_addr;
+    uint8_t instance;
+    uint8_t data[KBD_REPORT_LEN];
+};
+static struct usb_host_event usb_host_event_queue[USB_HOST_EVENT_QUEUE_DEPTH];
+static volatile uint8_t usb_host_event_head;
+static volatile uint8_t usb_host_event_tail;
+static volatile uint32_t usb_host_event_overruns;
+
+static bool usb_host_event_push(uint8_t type, uint8_t dev_addr,
+                                uint8_t instance, uint8_t const *data)
+{
+    uint8_t const head = usb_host_event_head;
+    uint8_t const next = (uint8_t)((head + 1u) &
+                                   (USB_HOST_EVENT_QUEUE_DEPTH - 1u));
+    if (next == usb_host_event_tail) {
+        /* Keyboard reports are absolute state snapshots.  Prefer the newest
+         * state to an old one, so a saturated queue can never leave a key
+         * logically held.  Normal operation never reaches this path. */
+        usb_host_event_tail = (uint8_t)((usb_host_event_tail + 1u) &
+                                        (USB_HOST_EVENT_QUEUE_DEPTH - 1u));
+        ++usb_host_event_overruns;
+    }
+
+    struct usb_host_event *event = &usb_host_event_queue[head];
+    event->type = type;
+    event->dev_addr = dev_addr;
+    event->instance = instance;
+    if (data != NULL) memcpy(event->data, data, KBD_REPORT_LEN);
+    else memset(event->data, 0, KBD_REPORT_LEN);
+    __dmb();
+    usb_host_event_head = next;
+    return true;
+}
+
+static bool usb_host_event_pop(struct usb_host_event *event)
+{
+    uint8_t const tail = usb_host_event_tail;
+    if (tail == usb_host_event_head) return false;
+
+    __dmb();
+    *event = usb_host_event_queue[tail];
+    __dmb();
+    usb_host_event_tail = (uint8_t)((tail + 1u) &
+                                    (USB_HOST_EVENT_QUEUE_DEPTH - 1u));
+    return true;
+}
+
 struct pending_radio_input {
     uint8_t type;
     uint8_t data[KBD_REPORT_LEN];
@@ -245,13 +313,13 @@ static uint8_t remote_keyboard_led_epoch;
 static bool remote_keyboard_led_valid;
 
 /* Locally simulated keyboard lock state. */
-static uint8_t           keyboard_led_state;
+static volatile uint8_t  keyboard_led_state;
 static uint8_t           keyboard_led_tx_report[MAX_LED_OUTPUT_REPORT_LEN];
 static uint8_t           keyboard_led_tx_state;
 static uint8_t           keyboard_lock_pressed;
-static bool              keyboard_led_update_pending;
-static bool              keyboard_led_transfer_active;
-static uint32_t          keyboard_led_retry_after_ms;
+static volatile bool     keyboard_led_update_pending;
+static volatile bool     keyboard_led_transfer_active;
+static volatile uint32_t keyboard_led_retry_after_ms;
 
 static bool              battery_tx_pending;
 static bool              battery_material_step;
@@ -923,7 +991,8 @@ static bool keyboard_boot_report_has_error(
     return false;
 }
 
-static void forward_boot_keyboard_report(uint8_t const *report, uint16_t len)
+static void __attribute__((unused)) forward_boot_keyboard_report(
+    uint8_t const *report, uint16_t len)
 {
     uint8_t normalized[KBD_REPORT_LEN];
 
@@ -947,11 +1016,8 @@ static void keyboard_led_reset(void)
      * that known state locally as soon as the keyboard mounts so its keypad
      * and physical Num Lock LED do not start inverted relative to Windows. */
     keyboard_led_state = HID_LED_NUM_LOCK;
-    keyboard_led_tx_state = 0;
-    memset(keyboard_led_tx_report, 0, sizeof(keyboard_led_tx_report));
     keyboard_lock_pressed = 0;
     keyboard_led_update_pending = true;
-    keyboard_led_transfer_active = false;
     keyboard_led_retry_after_ms = 0;
 }
 
@@ -1638,18 +1704,14 @@ static void keyboard_hid_stall_recovery_task(void)
 
 void tuh_mount_cb(uint8_t dev_addr)
 {
-    radio_note_activity();
     printf("\n*** [USB] DEVICE MOUNTED: addr=%u ***\n", dev_addr);
-    blink_interval_ms = BLINK_MOUNTED;
-    pending_descriptor_dev_addr = dev_addr;
-    descriptor_dump_after_ms = board_millis() + 250;
+    (void)usb_host_event_push(USB_HOST_EVENT_DEVICE_MOUNT, dev_addr, 0, NULL);
 }
 
 void tuh_umount_cb(uint8_t dev_addr)
 {
-    radio_note_activity();
     printf("\n*** [USB] DEVICE UNMOUNTED: addr=%u ***\n", dev_addr);
-    blink_interval_ms = BLINK_NOT_MOUNTED;
+    (void)usb_host_event_push(USB_HOST_EVENT_DEVICE_UMOUNT, dev_addr, 0, NULL);
     if (dev_addr == kbd_dev_addr) { kbd_dev_addr = 0; kbd_is_mounted = false; }
 }
 
@@ -1675,12 +1737,6 @@ static tuh_hid_report_info_t const *hid_report_info_for_input(
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
                       uint8_t const *desc_report, uint16_t desc_len)
 {
-    /* Pico-PIO-USB reaches the HID class callback reliably even on paths
-     * where the optional general tuh_mount_cb() is not observed. */
-    if (pending_descriptor_dev_addr == 0) {
-        pending_descriptor_dev_addr = dev_addr;
-        descriptor_dump_after_ms = board_millis() + 250;
-    }
     uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
     printf("\n[HID] MOUNTED dev=%u inst=%u protocol=%s\n", dev_addr, instance,
            itf_protocol == HID_ITF_PROTOCOL_KEYBOARD ? "KEYBOARD" :
@@ -1719,10 +1775,6 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
         kbd_dev_addr = dev_addr;
         kbd_instance = instance;
         kbd_is_mounted = true;
-        remote_keyboard_led_valid = false;
-        keyboard_led_reset();
-        previous_consumer_usage = 0;
-        previous_consumer_valid = false;
         keyboard_input_report_id = 0;
         keyboard_led_output_report_id = 0;
         keyboard_led_output_report_len = 1;
@@ -1739,6 +1791,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
         keyboard_recovery_after_ms = keyboard_last_report_ms;
         keyboard_halt_recovery_pending = false;
         keyboard_halt_recovery_in_progress = false;
+        keyboard_led_transfer_active = false;
         if (state != NULL) {
             for (uint8_t i = 0; i < state->report_count; ++i) {
                 if (state->reports[i].usage_page == HID_USAGE_PAGE_DESKTOP &&
@@ -1763,22 +1816,19 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
          * another control transfer from this mount callback would interrupt
          * TinyUSB while it is still configuring the remaining HID interfaces. */
     }
+    if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
+        (void)usb_host_event_push(USB_HOST_EVENT_KEYBOARD_MOUNT,
+                                  dev_addr, instance, NULL);
+    }
     hid_receive_arm_or_defer(dev_addr, instance);
 }
 
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
 {
-    radio_note_activity();
     printf("[HID] UNMOUNTED dev=%u inst=%u\n", dev_addr, instance);
     if (dev_addr == kbd_dev_addr && instance == kbd_instance) {
-        uint8_t const released[KBD_REPORT_LEN] = { 0 };
-
-        spi_send_keyboard_transition(released);
-        forward_consumer_usage(0);
-        null_movement_reset();
-        keyboard_led_transfer_active = false;
-        keyboard_led_update_pending = false;
-        remote_keyboard_led_valid = false;
+        (void)usb_host_event_push(USB_HOST_EVENT_KEYBOARD_UMOUNT,
+                                  dev_addr, instance, NULL);
         kbd_dev_addr = 0;
         kbd_is_mounted = false;
         keyboard_last_report_ms = 0;
@@ -1819,9 +1869,7 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
     total_hid_reports_received++;
 
     bool const hid_changed = hid_report_changed(instance, report, len);
-    if (hid_changed) {
-        radio_note_activity();
-    }
+    (void)hid_changed;
 
 #if CONSUMER_DEBUG
     static uint8_t previous_raw[CFG_TUH_HID][64];
@@ -1891,10 +1939,13 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
 #endif
         if (!keyboard_xfer_failed && keyboard_report && keyboard_uses_report_protocol &&
             keyboard_payload_len >= KBD_REPORT_LEN) {
-            forward_keyboard_report(keyboard_payload);
+            (void)usb_host_event_push(USB_HOST_EVENT_KEYBOARD_REPORT,
+                                      dev_addr, instance, keyboard_payload);
         } else if (!keyboard_xfer_failed && keyboard_report && !keyboard_uses_report_protocol) {
-            forward_boot_keyboard_report(keyboard_payload,
-                                         keyboard_payload_len);
+            if (keyboard_payload_len == KBD_REPORT_LEN) {
+                (void)usb_host_event_push(USB_HOST_EVENT_KEYBOARD_REPORT,
+                                          dev_addr, instance, keyboard_payload);
+            }
 #if HOT_PATH_DEBUG
             if (keyboard_payload_len >= KBD_REPORT_LEN) {
                 printf("[HID RX #%lu] mod=%02x res=%02x keys=%02x %02x %02x %02x %02x %02x\n",
@@ -1916,13 +1967,97 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
     }
 
     if (consumer_report && state != NULL) {
-        forward_consumer_usage(decode_consumer_usage(state, report, len));
+        uint16_t const usage = decode_consumer_usage(state, report, len);
+        uint8_t consumer[KBD_REPORT_LEN] = {
+            (uint8_t)usage, (uint8_t)(usage >> 8), 0, 0, 0, 0, 0, 0
+        };
+        (void)usb_host_event_push(USB_HOST_EVENT_CONSUMER_REPORT,
+                                  dev_addr, instance, consumer);
     }
 
     /* Re-arm immediately. A transient busy result is recovered by the
      * nonblocking main-loop task instead of freezing this HID endpoint. */
     if (!(dev_addr == kbd_dev_addr && instance == kbd_instance && len == 0)) {
         hid_receive_arm_or_defer(dev_addr, instance);
+    }
+}
+
+/* Core 0 consumes complete reports in arrival order.  The only work in the
+ * PIO-USB callback is descriptor decoding, copying eight bytes and immediately
+ * arming the next IN transfer. */
+static void usb_host_event_task(void)
+{
+    struct usb_host_event event;
+
+    while (usb_host_event_pop(&event)) {
+        switch (event.type) {
+        case USB_HOST_EVENT_DEVICE_MOUNT:
+            radio_note_activity();
+            blink_interval_ms = BLINK_MOUNTED;
+            pending_descriptor_dev_addr = event.dev_addr;
+            descriptor_dump_after_ms = board_millis() + 250u;
+            break;
+
+        case USB_HOST_EVENT_DEVICE_UMOUNT:
+            radio_note_activity();
+            blink_interval_ms = BLINK_NOT_MOUNTED;
+            break;
+
+        case USB_HOST_EVENT_KEYBOARD_MOUNT:
+            radio_note_activity();
+            remote_keyboard_led_valid = false;
+            previous_consumer_usage = 0;
+            previous_consumer_valid = false;
+            keyboard_led_reset();
+            break;
+
+        case USB_HOST_EVENT_KEYBOARD_UMOUNT: {
+            uint8_t const released[KBD_REPORT_LEN] = { 0 };
+            radio_note_activity();
+            (void)spi_send_keyboard_transition(released);
+            forward_consumer_usage(0);
+            null_movement_reset();
+            keyboard_led_update_pending = false;
+            remote_keyboard_led_valid = false;
+            break;
+        }
+
+        case USB_HOST_EVENT_KEYBOARD_REPORT:
+            radio_note_activity();
+            forward_keyboard_report(event.data);
+            break;
+
+        case USB_HOST_EVENT_CONSUMER_REPORT:
+            radio_note_activity();
+            forward_consumer_usage((uint16_t)(event.data[0] |
+                                              (event.data[1] << 8)));
+            break;
+
+        default:
+            break;
+        }
+    }
+}
+
+static void usb_host_core1_main(void)
+{
+    /* PIO-USB polls at USB bit timing.  Keep this task on the otherwise idle
+     * core so SPI retries, ADC/RGB updates and radio wakeups cannot defer an
+     * EP 0x81 re-arm during a multi-key transition. */
+    pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+    pio_cfg.pin_dp = USB_HOST_DP_PIN;
+    tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION,
+                  &pio_cfg);
+    tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT);
+    tuh_init(BOARD_TUH_RHPORT);
+
+    while (true) {
+        tuh_task();
+        hid_receive_rearm_task();
+        keyboard_halt_recovery_task();
+        keyboard_hid_stall_recovery_task();
+        keyboard_led_task();
+        usb_descriptor_dump_task();
     }
 }
 
@@ -1959,17 +2094,14 @@ int main(void)
     printf("\n\n=== RP2040 USB HID HOST + BATTERY/RGB LED (fully local) -> SPI BRIDGE ===\n");
     printf("[INIT] D+ = GP%d, D- = GP%d\n", USB_HOST_DP_PIN, USB_HOST_DP_PIN + 1);
 
-    pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
-    pio_cfg.pin_dp = USB_HOST_DP_PIN;
-    tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
-    tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT);
-    tuh_init(BOARD_TUH_RHPORT);
-    printf("[INIT] TinyUSB host stack initialized\n");
-
     spi_master_init();
     led_pwm_init();
     battery_adc_init();
     watchdog_enable(RP2040_WATCHDOG_TIMEOUT_MS, true);
+
+    multicore_reset_core1();
+    multicore_launch_core1(usb_host_core1_main);
+    printf("[INIT] TinyUSB host stack initialized on core 1\n");
 
     printf("[INIT] Starting 5-second battery display...\n");
     battery_start_display();
@@ -1979,20 +2111,15 @@ int main(void)
 
     while (1) {
         watchdog_update();
-        tuh_task();
-        hid_receive_rearm_task();
-        keyboard_halt_recovery_task();
-        keyboard_hid_stall_recovery_task();
+        usb_host_event_task();
         radio_power_task();
         battery_task();
         spi_ack_poll_task();
         spi_service_task();
-        usb_descriptor_dump_task();
 #if SPI_LINK_TEST_MODE
         spi_link_test_task();
 #endif
         led_blinking_task();
-        keyboard_led_task();
         status_task();
     }
 }
