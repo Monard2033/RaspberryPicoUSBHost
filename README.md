@@ -64,6 +64,12 @@ the nRF52840 transmitter over SPI.
 
 ## TODO
 
+- Reproduce and fix the confirmed sticky Consumer Control release: after
+  pressing `Fn+F3` (`Multimedia Next`, usage `0x00B5`), Windows can continue
+  advancing media as if the control were still pressed until `Fn+F3` is pressed
+  again. Treat this as a lost `LINK_TYPE_CONSUMER` release, not as a SONIX key
+  mapping problem; trace RP2040 SPI delivery, Transmitter ESB acknowledgement/
+  retry and Receiver HID release handling before changing code.
 - Rapid consecutive multimedia actions currently have a visible delay compared
   with normal keyboard keys. Apply the same non-blocking reliability principle
   used by `LINK_TYPE_KEYBOARD` to `LINK_TYPE_CONSUMER`, without placing a sleep
@@ -76,6 +82,8 @@ the nRF52840 transmitter over SPI.
   distinct rapid press/release transitions. Validate Play/Pause, Previous,
   Next, Mute and Volume with repeated sub-10-ms actions, while confirming that
   the 1 kHz normal-key path and low-power inactivity behavior are unchanged.
+  Acceptance requires that every multimedia action returns to Consumer usage
+  zero after physical release and never needs a second press to become released.
 
 ### Bidirectional lock-state synchronization
 
