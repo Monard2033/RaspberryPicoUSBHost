@@ -1,7 +1,10 @@
 # Wireless battery telemetry handoff
 
-Status: design/TODO only. No battery-radio or Windows tray code is implemented
-yet. This document is the implementation contract for a future clean session.
+Status: RP2040 -> Transmitter -> Receiver firmware transport/cache is
+implemented on branch `codex/ultra-fast-input-reliability`. Receiver exposes a
+vendor-defined HID Input/Feature report (ID `3`) for a no-driver reader. A
+Windows HIDAPI tray executable, native Windows battery UI validation, and
+hardware latency/radio-power validation remain TODO.
 
 ## Objective
 
@@ -9,7 +12,7 @@ Expose the RP2040 battery measurement through the wireless link and Receiver
 without compromising keyboard latency, ordered multimedia transitions, or the
 five-minute nRF52840 System OFF behavior.
 
-The intended path is:
+The implemented path is:
 
 ```text
 RP2040 GP28 ADC -> SPI -> nRF52840 Transmitter -> ESB -> Receiver cache
@@ -68,8 +71,8 @@ human-triggered wake and a 50 ms quiet window.
 
 ## Packet contract
 
-Add a typed frame such as `LINK_TYPE_BATTERY = 0x04`. Keep the existing fixed
-8-byte data area and use integer values only:
+The versioned implementation uses `LINK_TYPE_BATTERY = 0x04`. It keeps the
+fixed 8-byte data area and uses integer values only:
 
 ```text
 data[0]    percentage, 0..100
@@ -104,14 +107,14 @@ Use the RP2040 filtered battery millivolts and percentage already maintained by
 the local battery task. Do not transmit floats or raw ADC samples. A sequence
 change lets the Receiver distinguish a fresh update from an ESB duplicate.
 
-This protocol extension must be versioned and RP2040, Transmitter and Receiver
-must be built/flashed as a matched set. Update the shared type/version constants
-and reject malformed percentage, state, length or reserved values.
+This protocol extension is version `0x03`; RP2040, Transmitter and Receiver
+must be built/flashed as a matched set. All three implementations reject
+malformed percentage, state, length or reserved values.
 
 ## RP2040 implementation
 
-Add a non-blocking state machine; do not send from the ADC task and do not put
-sleep calls in TinyUSB callbacks. Conceptual logic:
+The implementation is a non-blocking state machine; it does not send from the
+ADC task and does not put sleep calls in TinyUSB callbacks:
 
 ```c
 battery_sample_once_per_second();
@@ -128,15 +131,15 @@ if (battery_tx_pending &&
 }
 ```
 
-Mark the send complete only after it has been accepted by the local SPI
-scheduler. If it cannot be scheduled, retain the single latest pending state.
-Battery must not use the Keyboard 250 us duplicate slot and must not displace an
-ordered Consumer edge.
+The 30-second deadline keeps one pending latest state. The local SPI scheduler
+marks it accepted only after it owns the one-slot Battery frame. Battery does
+not use the Keyboard 250 us duplicate slot and cannot displace an ordered
+Consumer edge.
 
 ## Transmitter implementation
 
-Treat Battery as low-priority latest-state telemetry, not as an input
-transition. Prefer a separate one-slot pending state rather than putting it in
+Battery is implemented as low-priority latest-state telemetry, not as an input
+transition, using a separate one-slot pending state rather than placing it in
 front of Keyboard/Consumer frames in the urgent queue.
 
 - Always drain urgent Keyboard/Consumer work first.
@@ -144,15 +147,16 @@ front of Keyboard/Consumer frames in the urgent queue.
 - Use ESB acknowledgement, but do not enter an aggressive 8 ms retry loop.
 - On failure, retain only the newest Battery state and retry in a later idle
   opportunity; input traffic may preempt it at any time.
-- Battery success/failure must not alter `keyboard_delivery_pending` or held-key
+- Battery success/failure does not alter `keyboard_delivery_pending` or held-key
   keepalive timing.
 - A Battery frame must never be interpreted as activity that prevents System
   OFF.
 
 ## Receiver cache and USB exposure
 
-Do not insert Battery into the Keyboard/Consumer HID transition queue. Validate
-it in the ESB handler and update a dedicated cache safely:
+The implementation does not insert Battery into the Keyboard/Consumer HID
+transition queue. It validates the frame in the ESB handler and updates a
+dedicated cache safely:
 
 ```text
 percentage
@@ -172,10 +176,11 @@ Investigate a standards-based USB HID battery usage first, but verify on the
 target Windows version whether it is actually shown in native device UI.
 Bluetooth-style battery display must not be assumed for arbitrary USB HID.
 
-The reliable fallback is a vendor-defined HID Feature/Input report. Keep the
-Receiver HID-only: do not restore UART, Serial, CDC, or a debug COM port. The
-report should expose the cached fields plus freshness/online flags and require
-no custom kernel driver.
+The reliable fallback is implemented as a vendor-defined HID Feature/Input
+report with report ID `3`. It exposes percentage, state, millivolts, battery
+sequence, flags and age in seconds. Receiver remains HID-only: UART, Serial,
+CDC and a debug COM port stay disabled, so a reader requires no custom kernel
+driver.
 
 ## Windows tray application
 
@@ -205,14 +210,14 @@ the last known value, not immediately treated as invalid.
 
 ## Implementation order
 
-1. Define/version `LINK_TYPE_BATTERY`, payload validation and shared constants.
-2. Add RP2040 pending/timing logic without touching the 1 kHz HID callback.
-3. Add low-priority Transmitter scheduling and ESB acknowledgement handling.
-4. Add Receiver cache and freshness tracking, separate from input queues.
-5. Prototype the standard HID battery report and test native Windows behavior.
-6. Add the vendor-defined HID report regardless, as a stable application API.
-7. Build the optional HIDAPI tray application.
-8. Build and flash all three firmware images as a matched set; measure input
+1. [x] Define/version `LINK_TYPE_BATTERY`, payload validation and shared constants.
+2. [x] Add RP2040 pending/timing logic without touching the 1 kHz HID callback.
+3. [x] Add low-priority Transmitter scheduling and ESB acknowledgement handling.
+4. [x] Add Receiver cache and freshness tracking, separate from input queues.
+5. [ ] Prototype the standard HID battery report and test native Windows behavior.
+6. [x] Add the vendor-defined HID report as a stable application API.
+7. [ ] Build the optional HIDAPI tray application.
+8. [ ] Build and flash all three firmware images as a matched set; measure input
    latency, RF traffic, sleep entry, wake behavior and current consumption.
 
 ## Acceptance criteria
@@ -234,14 +239,19 @@ the last known value, not immediately treated as invalid.
 - Hardware tests confirm negligible latency impact and no material autonomy
   regression; compile success alone is not hardware validation.
 
-## Related future work
+## Related reverse-channel implementation
 
-Lock LED synchronization is a separate reverse-direction protocol:
+Lock LED synchronization is implemented as a separate reverse-direction
+protocol:
 
 ```text
 Windows HID Output -> Receiver -> ESB ACK payload -> Transmitter
 -> SPI MISO (P0.08 to RP2040 GP8) -> RP2040 HID SET_REPORT -> SONIX
 ```
+
+The ACK carries LED bits, a validity flag and a Receiver boot epoch so an
+8-bit sequence restart after reconnect/wake cannot be mistaken for an old
+state.
 
 It may share protocol-version work with Battery, but Battery remains a forward,
 low-priority telemetry stream. Do not couple tray polling to the reverse lock

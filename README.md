@@ -5,22 +5,21 @@ It reads the keyboard as a USB HID host through PIO-USB, applies local keyboard
 filters, then forwards keyboard state and supported Consumer Control keys to
 the nRF52840 transmitter over SPI.
 
-## Current handoff (2026-08-17)
+## Current handoff (2026-08-18)
 
 - Current working trees are authoritative; cloud copies are older fallbacks.
   Work on the existing `codex/*` branches and back up every file before edits.
 - RP2040: `C:\Users\Monard\Raspberry\WirelessKeyboard`, branch
-  `codex/sticky-key-release-hardening`. Key commits: `0e0156d` (Consumer frames),
-  `5410728` (four HID interfaces), `68516f4` (complete enumeration), `94a9d29`
-  (release diagnostics off).
+  `codex/ultra-fast-input-reliability`. The current change removes blocking SPI
+  work from the TinyUSB report callback and adds an ordered input FIFO.
 - Transmitter: `C:\ncs\v3.4.0\myproject\Transmitter`, branch
-  `codex/sticky-key-release-hardening`; the matched artifact is
+  `codex/ultra-fast-input-reliability`; the matched artifact is
   `firmware/transmitter.uf2`, SHA-256
-  `39752BBAB30D0BFE655A21C82A2996D9A4A71A6632ED0E6343589ACD99D89837`.
+  `6111667082C1A91297C663901D25FBFD05EC4D0FFF685633A5F95FB70726C6E9`.
 - Receiver: `C:\ncs\v3.4.0\myproject\Receiver`, branch
-  `codex/sticky-key-release-hardening`; matched artifact
+  `codex/ultra-fast-input-reliability`; matched artifact
   `firmware/receiver.hex`, SHA-256
-  `40CB154AC61EDFBE82812DEC32CECAFC70E167B54DCE1522C969A9867DFEAC94`.
+  `EA869379BB86AF601607D0A5783F6B7BD1D94FE1741CE54AFBCE3466906A6ACB`.
 - A4Tech `VID 09DA / PID EA04` has three HID interfaces: keyboard (`inst=0`,
   EP `0x81`), mouse (`inst=1`, EP `0x82`), multimedia (`inst=2`, EP `0x83`,
   Report ID 3). `Fn+F2` was verified as Play/Pause `0x00CD`; multimedia works
@@ -31,13 +30,19 @@ the nRF52840 transmitter over SPI.
   enumeration before `inst=1/2`.
 - `CONSUMER_DEBUG=0` is release mode; temporarily set `1` for changed raw HID
   reports and descriptor dumps over DAPLink UART (`COM25`).
-- Link protocol is version `0x02` in all three firmware images. The fixed
+- Link protocol is version `0x03` in all three firmware images. The fixed
   12-byte SPI/ESB frame is magic `A5`, version, type, sequence, payload[8].
-  Types: Keyboard `0x01`, Consumer `0x02`, local Control `0x03`; Consumer
-  contains a little-endian 16-bit usage and preserves press/release. Control
-  command `0x01` requests Transmitter System OFF and is never relayed by ESB.
-- Num/Caps/Scroll LED feedback and battery/RGB behavior stay local to RP2040;
-  neither lock state nor battery data is sent by radio.
+  Types: Keyboard `0x01`, Consumer `0x02`, Control `0x03`, Battery `0x04`.
+  Consumer contains a little-endian 16-bit usage and preserves every ordered
+  press/release edge. Control `0x01` requests Transmitter System OFF; Control
+  `0x02` is a low-rate reverse LED-state poll and is relayed to Receiver over
+  ESB. Receiver ACK payloads use magic `0x5A`, version `0x03`, type `0x01` and
+  return the latest valid Windows Num/Caps/Scroll bits plus a Receiver boot
+  epoch so a reconnect can restart the 8-bit LED sequence safely.
+- Num/Caps/Scroll LED state remains locally simulated on RP2040 until the first
+  authoritative Windows HID Output report arrives through the Receiver. Battery
+  telemetry is forwarded as a low-priority latest-state packet and cached on
+  Receiver; the RGB animation and ADC sampling remain local to RP2040.
 - RGB uses red `GP21`, green `GP20`, blue `GP19`; this pin-only adjustment was
   isolated in commit `ea4827d` before the low-power implementation.
 - Low-power Stage 1 is implemented. RP2040 remains at 120 MHz to service the
@@ -45,15 +50,19 @@ the nRF52840 transmitter over SPI.
   OFF after five minutes without changed HID input. CSN/P0.22 wakes it and the
   RP2040 retransmits keyboard and Consumer state after the boot guard time.
   Hardware sleep-current and wake-latency validation remains required.
-- Sticky-key release hardening is implemented across the matched set. RP2040
-  sends each changed keyboard state immediately and schedules a non-blocking
-  duplicate after a 250 us SPIS re-arm guard, then restates its absolute state
-  over SPI every 10 ms while the radio is awake;
-  the Transmitter deduplicates these frames and retries an unacknowledged
-  all-released radio report until delivery; the Receiver prioritizes the newest
-  keyboard state and locally releases all keys after 250 ms without a valid
-  keyboard packet. A legitimately held key remains active because its 8 ms
-  radio keepalive continuously refreshes this watchdog.
+- Sticky Consumer-release and modifier-order hardening is implemented across
+  the matched set. RP2040 captures changed USB reports immediately, places them
+  in a bounded FIFO, and schedules an exact-sequence duplicate after a 250 us
+  SPIS re-arm guard without sleeping in the TinyUSB callback. Transmitter keeps
+  the exact frame pending until ESB acknowledgement, including Consumer release
+  frames. Receiver deduplicates Consumer packets by sequence, never purges the
+  queue on a normal keyboard transition, and uses a nonblocking HID sender; this
+  preserves `modifier down -> Ctrl+C -> modifier up` ordering. A legitimately
+  held key remains active because its 8 ms radio keepalive refreshes the watchdog.
+- Personal performance requirement: all three firmware projects must capture and
+  forward input fast enough for a physical 1 kHz polling rate. No blocking HID
+  callback, large retry sleep, or delayed deduplication may be used on the
+  urgent Keyboard/Consumer path. Hardware acceptance tests are still required.
 - Normal RP2040 UART output and all Transmitter/Receiver logging, console,
   boot-banner, UART and USB-CDC debug output are disabled in release builds.
   Receiver enumerates as HID only; its former debug COM port is intentionally
@@ -64,57 +73,49 @@ the nRF52840 transmitter over SPI.
 
 ## TODO
 
-- Reproduce and fix the confirmed sticky Consumer Control release: after
-  pressing `Fn+F3` (`Multimedia Next`, usage `0x00B5`), Windows can continue
-  advancing media as if the control were still pressed until `Fn+F3` is pressed
-  again. Treat this as a lost `LINK_TYPE_CONSUMER` release, not as a SONIX key
-  mapping problem; trace RP2040 SPI delivery, Transmitter ESB acknowledgement/
-  retry and Receiver HID release handling before changing code.
-- Rapid consecutive multimedia actions currently have a visible delay compared
-  with normal keyboard keys. Apply the same non-blocking reliability principle
-  used by `LINK_TYPE_KEYBOARD` to `LINK_TYPE_CONSUMER`, without placing a sleep
-  in the TinyUSB callback.
-- Preserve every ordered Consumer Control edge (`press -> release -> press`):
-  use a small transition queue rather than only a single latest-state slot,
-  schedule the RP2040 SPI retry outside the callback, and keep each Consumer
-  frame pending in the Transmitter until ESB acknowledges it.
-- Receiver must discard only true retransmission duplicates while preserving
-  distinct rapid press/release transitions. Validate Play/Pause, Previous,
-  Next, Mute and Volume with repeated sub-10-ms actions, while confirming that
-  the 1 kHz normal-key path and low-power inactivity behavior are unchanged.
-  Acceptance requires that every multimedia action returns to Consumer usage
-  zero after physical release and never needs a second press to become released.
+- [x] Sticky Consumer Control release path: RP2040 now retains ordered
+  `LINK_TYPE_CONSUMER` edges, Transmitter retries the exact sequence/data pair,
+  and Receiver accepts a new sequence even when its payload repeats. The
+  confirmed `Fn+F3`/`0x00B5` failure is addressed in source; physical validation
+  is still required.
+- [x] Rapid multimedia path: Consumer work uses the same nonblocking SPI FIFO
+  and ESB-pending mechanism as keyboard input. No sleep is placed in the
+  TinyUSB callback and the 250 us guard is outside the callback.
+- [x] Ordered Consumer transitions: press -> release -> press remains queued;
+  Receiver discards only a same-sequence retransmission after its first queue
+  insertion succeeds. Queue-overrun counters remain visible in diagnostic logs.
+- [ ] Hardware acceptance: validate Play/Pause, Previous, Next, Mute and
+  Volume with repeated sub-10-ms actions, then verify `Ctrl+C`, `Ctrl+V`, Shift
+  and Alt combinations at the 1 kHz source rate. Every multimedia release must
+  return to Consumer usage zero without a second press.
 
 ### Bidirectional lock-state synchronization
 
-- Add a reverse data path for Num Lock, Caps Lock and Scroll Lock so Windows,
-  rather than the RP2040 boot assumption, becomes the authoritative state.
-  Receiver must capture the keyboard HID Output report from Windows and return
-  its LED bits through an ESB acknowledgement payload.
-- Transmitter must read the ESB ACK payload and deliver it to RP2040 over the
-  currently reserved SPI MISO connection (`GP8 <-> P0.08`). RP2040 must then
-  send the received state to the SONIX keyboard with HID `SET_REPORT`, without
-  blocking the 1 kHz input callback or waking/sending radio traffic repeatedly
-  when the state has not changed.
-- Define sequencing, acknowledgement, retry and stale-state handling for the
-  reverse direction. Retain Num Lock ON as the local boot fallback until the
-  first authoritative Windows LED state arrives. This protocol change must be
-  versioned and all three firmware images must be flashed as a matched set.
-- Validate changes initiated by the local lock keys, Windows software, another
-  keyboard, Remote Desktop and reconnect/resume, including synchronization
-  after Transmitter System OFF wake-up.
+- [x] Reverse data path: Receiver captures keyboard HID Output reports from
+  Windows through both control `SET_REPORT` and the interrupt OUT endpoint.
+  Transmitter reads the ESB ACK payload and exposes it on SPI MISO
+  (`GP8 <-> P0.08`); RP2040 applies it to the SONIX keyboard asynchronously.
+- [x] Reverse sequencing and stale-state handling: ACKs carry a sequence, a
+  valid bit and a Receiver boot epoch; RP2040 ignores stale ACKs and accepts a
+  fresh sequence after reconnect/wake. It retains Num Lock ON as the local
+  fallback until a real Windows LED report arrives. The protocol is versioned
+  as `0x03` and all three images are built as a matched set.
+- [ ] Hardware acceptance: validate local lock keys, Windows software, another
+  keyboard, Remote Desktop, reconnect/resume and synchronization after
+  Transmitter System OFF wake-up. The low-rate poll is intentionally bounded
+  and sends no radio packet until the RP2040 is awake and otherwise idle.
 
 ### Wireless battery telemetry
 
-- Implement the complete design in
-  [`docs/BATTERY_TELEMETRY_TODO.md`](docs/BATTERY_TELEMETRY_TODO.md). RP2040
-  samples locally once per second but normally sends only one latest-state
-  packet every 30 seconds, after 50 ms without changed HID input and only while
-  the radio is already awake and all urgent Keyboard/Consumer work is idle.
-- Battery traffic must remain lower priority, must not wake the Transmitter or
-  reset/postpone the five-minute inactivity deadline, and must expose a cached
-  Receiver value through tested standard HID support or a vendor HID report for
-  a no-driver Windows tray application.
+- [x] Firmware transport and cache: RP2040 samples locally once per second and
+  schedules one latest-state Battery packet every 30 seconds after 50 ms of HID
+  quiet, only while awake and after urgent Keyboard/Consumer work is idle.
+  Transmitter treats it as a one-slot low-priority packet, and Receiver exposes
+  the cache through vendor HID report ID `3` without waking the radio.
+- [ ] Windows tray application and hardware/native-HID validation remain. The
+  vendor report contract is implemented, but no HIDAPI tray executable is
+  claimed until it is tested against the actual Receiver VID/PID and Windows
+  USB stack.
 
 ## Active wiring
 
@@ -132,7 +133,7 @@ the nRF52840 transmitter over SPI.
 | --- | --- | --- |
 | GP6 | P0.17 | SPI SCK |
 | GP7 | P0.20 | SPI MOSI, RP2040 to nRF |
-| GP8 | P0.08 | SPI MISO, reserved; unused by the current write-only protocol |
+| GP8 | P0.08 | SPI MISO, Transmitter ACK/status to RP2040 |
 | GP9 | P0.22 | SPI CSN, driven low for each 12-byte typed frame |
 | VSYS | RAW / VIN only | Use only when the nRF board has an onboard input regulator |
 | 3V3(OUT) | 3V3 / VCC direct supply | Use for a direct 3.3 V nRF52840 supply pin |
@@ -174,7 +175,8 @@ Do not connect a Li-ion/LiPo battery directly to GP28. The documented
 - The SPI/radio frame is 12 bytes: magic, protocol version, input type,
   sequence number, and an 8-byte payload. Keyboard payloads contain the
   standard boot-keyboard report; Consumer Control payloads contain a
-  normalized 16-bit usage ID.
+  normalized 16-bit usage ID; Battery payloads contain the validated integer
+  telemetry record described in `docs/BATTERY_TELEMETRY_TODO.md`.
 - Next, Previous, Mute, Play/Pause, Volume Down, and Volume Up are detected from
   HID Consumer Control reports and forwarded to the PC through the nRF52840
   receiver. Press and release transitions are preserved, while radio
@@ -198,33 +200,31 @@ Do not connect a Li-ion/LiPo battery directly to GP28. The documented
 - Per-report UART logging is disabled by default because it breaks 1 kHz input.
 - Long key holds are forwarded as state changes instead of being cut after the
   first few repeats.
-- RP2040 sends every changed keyboard state immediately, schedules its duplicate
-  non-blocking after a 250 us SPIS re-arm guard, and repeats the complete state
-  every 10 ms while awake. The TinyUSB callback contains no retry sleep and
-  rearms the keyboard endpoint immediately, preserving one new input report per
-  1 ms USB frame for a 1000 Hz source. Identical restatements are discarded
-  before radio transmission, so this repairs a lost write-only SPI transition
-  without adding normal RF traffic or exposing recovery delay to normal input.
+- RP2040 sends every changed keyboard/Consumer state into an ordered FIFO,
+  schedules one exact-sequence duplicate nonblocking after a 250 us SPIS
+  re-arm guard, and rearms the TinyUSB endpoint immediately. There is no 10 ms
+  reconciliation loop on the urgent path: the duplicate and the Transmitter's
+  ESB-pending retry repair a lost write without delaying the next 1 ms USB
+  report. Keyboard restatements are deduplicated by absolute state; distinct
+  Consumer sequences are retained.
 - A keyboard release that misses its ESB acknowledgement remains pending in the
   Transmitter and is retried; released-state keepalive stops only after a
   successful delivery. Application-level ESB failure handling makes up to two
   additional attempts before the next pending retry.
-- Receiver HID writes use a 20 ms bounded wait instead of blocking forever. Its
-  queue keeps the newest absolute keyboard state ahead of stale transitions,
-  and a 250 ms link watchdog sends an all-released report if pressed state is
-  no longer refreshed. The normal 8 ms held-key keepalive prevents false
-  releases during legitimate long holds.
-- Num Lock, Caps Lock, and Scroll Lock are tracked locally by the RP2040. On
-  each new physical press, RP2040 toggles the matching HID Output bit and sends
-  it back to the attached USB keyboard. No lock-state data is added to the
-  nRF52840 radio protocol.
-- Whenever the keyboard is mounted, the local state starts with Num Lock ON,
+- Receiver HID writes are nonblocking: a static report buffer is held until the
+  interrupt-IN completion callback releases it. The ordered queue no longer
+  purges keyboard/modifier transitions; a 250 ms link watchdog still sends an
+  all-released report if pressed state is no longer refreshed. The normal 8 ms
+  held-key keepalive prevents false releases during legitimate long holds.
+- Num Lock, Caps Lock, and Scroll Lock start with the RP2040 Num Lock fallback,
+  but Windows becomes authoritative after Receiver captures a HID Output
+  report. Receiver returns the LED bits in ESB ACK payloads; Transmitter caches
+  them and returns them over SPI MISO. RP2040 applies only newer valid ACKs and
+  uses the low-rate Control `0x02` poll while awake and idle.
+- Whenever the keyboard is mounted, the local fallback starts with Num Lock ON,
   Caps Lock OFF and Scroll Lock OFF. RP2040 schedules the corresponding HID
-  Output report immediately after enumeration, matching the target Windows
-  boot state and preventing the keypad/LED from starting inverted. Because
-  lock state remains intentionally local, a later change made by software or
-  another keyboard can still make the physical LEDs differ from the operating
-  system until the local lock key is toggled again.
+  Output report immediately after enumeration, then accepts the first valid
+  Windows state received through the reverse path.
 - At startup the RGB LED shows battery level for five seconds: green at
   75–100%, yellow at 50–74%, orange at 25–49%, and red at 0–24%.
 - Battery voltage continues to be sampled once per second in the background.
@@ -235,6 +235,11 @@ Do not connect a Li-ion/LiPo battery directly to GP28. The documented
   battery color for five seconds. Stable or slowly changing voltage keeps the
   LED off after the five-second boot display, so an old event cannot latch a
   continuous animation.
+- Once every 30 seconds, if the radio is already awake and there has been at
+  least 50 ms without changed HID input or urgent work, RP2040 queues one latest
+  Battery record. Transmitter sends it below Keyboard/Consumer priority and
+  Receiver caches it in vendor HID report ID `3`; telemetry never wakes radio
+  System OFF or resets the five-minute inactivity deadline.
 
 ## Firmware
 
@@ -244,10 +249,16 @@ The build copies the current UF2 to:
 firmware/WirelessKeyboard.uf2
 ```
 
-The current sticky-key-hardened RP2040 artifact has SHA-256
-`05F575DF656CDCBFDC20944FE0C18B537DB89DFAEB252BAC149537D302FEE5D9`.
+The current matched protocol `0x03` artifacts have these SHA-256 values:
 
-Flash all three artifacts as one matched protocol `0x02` set. Mixing one of
+- RP2040 `firmware/WirelessKeyboard.uf2`:
+  `8FFB42A7194850BCF5A24F8EBEDA8020CDE0274732B468997415B0C77FF2F572`
+- Transmitter `firmware/transmitter.uf2`:
+  `551751E5353223CFDB7CF2456723514039473C2D11304410888080C6B2FAF89D`
+- Receiver `firmware/receiver.hex`:
+  `F1A41F0FCC0A02D81575DD4D940830A9331F07B568ADE7B4048910DEDF9AD192`
+
+Flash all three artifacts as one matched protocol `0x03` set. Mixing one of
 these images with an older peer can restore the exact release-loss behavior
 that this hardening is designed to eliminate.
 
