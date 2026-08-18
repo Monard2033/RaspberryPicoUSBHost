@@ -19,9 +19,9 @@ background service.
   `Refresh now` or left-clicks the tray icon.
 - Reads only Receiver RAM cache. A refresh emits no ESB packet, does not wake
   the keyboard, and does not postpone System OFF.
-- Shows no automatic balloons, overlays, global hooks, Raw Input listeners, or
-  focus-stealing windows. The detail/action popup appears only after user
-  interaction.
+- Shows no automatic balloons, global hooks, Raw Input listeners, or permanent
+  focus-stealing windows. The small modeless detail/action popup is created
+  only after user interaction.
 - Anchors the context menu with its configured lift above the pointer and
   dispatches only the
   command explicitly returned by Windows, preventing an accidental Exit on the
@@ -31,10 +31,13 @@ background service.
 
 The tooltip explicitly requests the Windows standard hover UI and shows
 percentage, voltage, charge state, LIVE/STALE state, and the age of the last
-wireless Battery packet. Left-click and right-click both open a native popup
-that shows Battery percentage, voltage, charge state, telemetry state/age and
-sequence above the action commands. The icon is green/yellow/red according to
-level, blue while charging, and gray while offline or waiting for telemetry.
+wireless Battery packet. Left-click and right-click both open a native modeless
+popup that shows Battery percentage, voltage, charge state, telemetry state/age
+and sequence above the action buttons. `Refresh now` keeps the popup open and
+updates its values in place when the worker returns. Clicks anywhere inside the
+popup keep it active; a click outside hides it through normal Win32 activation,
+without a global mouse hook. The icon is green/yellow/red according to level,
+blue while charging, and gray while offline or waiting for telemetry.
 
 ## Portable usage
 
@@ -92,8 +95,8 @@ The committed `dist\WirelessKeyboardTray.exe` is the portable release artifact.
 Current release:
 
 ```text
-size      244224 bytes
-SHA-256   03FFDA3D498A36DE80DBB9B95F7481700F9DB4BFC89AE598EA0A481EABAD66E1
+size      245760 bytes
+SHA-256   8DB2314EBCB77BCB05CE5E0FBE1B05FCF0B40FDBB6C93F01A5A8F0DACF7F871A
 ```
 
 Offline idle smoke test on Windows 11: zero additional CPU milliseconds during
