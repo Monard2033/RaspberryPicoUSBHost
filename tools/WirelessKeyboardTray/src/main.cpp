@@ -42,7 +42,7 @@ constexpr UINT kTrayIconId = 1;
 constexpr UINT kMenuRefresh = 1001;
 constexpr UINT kMenuAutostart = 1002;
 constexpr UINT kMenuExit = 1003;
-constexpr LONG kTrayMenuLiftPx = 50;
+constexpr LONG kTrayMenuLiftPx = 23;
 
 enum class Availability {
     Offline,
@@ -315,7 +315,7 @@ void UpdateTray(BatterySnapshot const &snapshot)
     gCurrentIcon = nextIcon;
     gNotifyIcon.hIcon = gCurrentIcon;
     CopyTooltip(BuildTooltip(snapshot));
-    gNotifyIcon.uFlags = NIF_ICON | NIF_TIP;
+    gNotifyIcon.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     Shell_NotifyIconW(NIM_MODIFY, &gNotifyIcon);
 
     if (previousIcon != nullptr && previousIcon != gCurrentIcon &&
@@ -335,7 +335,7 @@ void AddTrayIcon()
     gNotifyIcon.cbSize = sizeof(gNotifyIcon);
     gNotifyIcon.hWnd = gWindow;
     gNotifyIcon.uID = kTrayIconId;
-    gNotifyIcon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    gNotifyIcon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     gNotifyIcon.uCallbackMessage = kTrayCallbackMessage;
     gCurrentIcon = CreateBatteryIcon(gLastSnapshot);
     gNotifyIcon.hIcon = gCurrentIcon;
@@ -561,6 +561,51 @@ void RequestRefresh()
     }
 }
 
+void AppendBatteryDetails(HMENU menu, BatterySnapshot const &snapshot)
+{
+    constexpr UINT kDetailFlags = MF_STRING | MF_DISABLED;
+    wchar_t text[128]{};
+
+    AppendMenuW(menu, kDetailFlags, 0, L"Wireless Keyboard Battery");
+
+    switch (snapshot.availability) {
+    case Availability::Offline:
+        AppendMenuW(menu, kDetailFlags, 0, L"Receiver: offline");
+        break;
+    case Availability::WaitingForTelemetry:
+        AppendMenuW(menu, kDetailFlags, 0,
+                    L"Waiting for battery telemetry...");
+        break;
+    case Availability::ReadError:
+        std::swprintf(text, std::size(text), L"HID read error: %lu",
+                      static_cast<unsigned long>(snapshot.error));
+        AppendMenuW(menu, kDetailFlags, 0, text);
+        break;
+    case Availability::Live:
+    case Availability::Stale:
+        std::swprintf(text, std::size(text), L"Battery: %u%%",
+                      static_cast<unsigned>(snapshot.percentage));
+        AppendMenuW(menu, kDetailFlags, 0, text);
+        std::swprintf(text, std::size(text), L"Voltage: %.3f V",
+                      static_cast<double>(snapshot.millivolts) / 1000.0);
+        AppendMenuW(menu, kDetailFlags, 0, text);
+        std::swprintf(text, std::size(text), L"State: %ls",
+                      BatteryStateName(snapshot.batteryState));
+        AppendMenuW(menu, kDetailFlags, 0, text);
+        std::swprintf(text, std::size(text), L"Telemetry: %ls, age %u s",
+                      snapshot.availability == Availability::Live ?
+                          L"LIVE" : L"STALE",
+                      static_cast<unsigned>(snapshot.ageSeconds));
+        AppendMenuW(menu, kDetailFlags, 0, text);
+        std::swprintf(text, std::size(text), L"Sequence: %u",
+                      static_cast<unsigned>(snapshot.sequence));
+        AppendMenuW(menu, kDetailFlags, 0, text);
+        break;
+    }
+
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+}
+
 void ShowTrayMenu()
 {
     HMENU const menu = CreatePopupMenu();
@@ -568,6 +613,7 @@ void ShowTrayMenu()
         return;
     }
 
+    AppendBatteryDetails(menu, gLastSnapshot);
     AppendMenuW(menu, MF_STRING, kMenuRefresh, L"Refresh now");
     AppendMenuW(menu, MF_STRING |
                           (IsAutostartEnabled() ? MF_CHECKED : MF_UNCHECKED),
@@ -578,7 +624,7 @@ void ShowTrayMenu()
     POINT cursor{};
     GetCursorPos(&cursor);
     /* The notification overflow panel is topmost and can cover the lower
-     * menu rows. Anchor the menu 50 px above the click so Exit is neither
+     * menu rows. Lift the anchor above the click so Exit is neither
      * hidden by the tray nor directly under the released mouse button. */
     cursor.y -= kTrayMenuLiftPx;
     SetForegroundWindow(gWindow);
@@ -647,6 +693,7 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam,
         } else if (event == NIN_SELECT || event == NIN_KEYSELECT ||
                    event == WM_LBUTTONUP) {
             RequestRefresh();
+            ShowTrayMenu();
         }
         return 0;
     }
