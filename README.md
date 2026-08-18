@@ -10,10 +10,9 @@ the nRF52840 transmitter over SPI.
 - Current working trees are authoritative; cloud copies are older fallbacks.
   Work on the existing `codex/*` branches and back up every file before edits.
 - RP2040: `C:\Users\Monard\Raspberry\WirelessKeyboard`, branch
-  `codex/fix-wad-host-stall`. The current image keeps the ordered,
-  nonblocking 1 kHz input path, recovers a transient TinyUSB HID endpoint
-  re-arm failure, and gives raw keyboard state priority over the optional
-  A/D–W/S game filter to prevent multi-key filter interactions.
+  `codex/uart-wad-diagnostic`. The current artifact is a temporary bounded
+  UART diagnostic image for the `V+A+W+D` host failure; it is not the normal
+  silent release image.
 - Transmitter: `C:\ncs\v3.4.0\myproject\Transmitter`, branch
   `codex/ultra-fast-input-reliability`; the matched artifact is
   `firmware/transmitter.uf2`, SHA-256
@@ -30,8 +29,10 @@ the nRF52840 transmitter over SPI.
   `tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT)`. Do not call
   `tuh_hid_set_protocol()` from the first mount callback; it interrupts
   enumeration before `inst=1/2`.
-- `CONSUMER_DEBUG=0` is release mode; temporarily set `1` for changed raw HID
-  reports and descriptor dumps over DAPLink UART (`COM25`).
+- `WIRELESS_KEYBOARD_UART_DIAGNOSTIC=OFF` is release mode. The temporary
+  diagnostic build enables UART plus bounded changed-keyboard traces on DAPLink
+  (`COM25`); it deliberately leaves `HOT_PATH_DEBUG`, `PERIODIC_DEBUG` and
+  `CONSUMER_DEBUG` disabled so no per-poll 1 kHz logging is introduced.
 - Link protocol is version `0x03` in all three firmware images. The fixed
   12-byte SPI/ESB frame is magic `A5`, version, type, sequence, payload[8].
   Types: Keyboard `0x01`, Consumer `0x02`, Control `0x03`, Battery `0x04`.
@@ -281,10 +282,35 @@ The build copies the current UF2 to:
 firmware/WirelessKeyboard.uf2
 ```
 
-The current matched protocol `0x03` artifacts have these SHA-256 values:
+### Temporary UART diagnostic artifact
+
+The current `firmware/WirelessKeyboard.uf2` is intentionally built with
+`-DWIRELESS_KEYBOARD_UART_DIAGNOSTIC=ON` to investigate the `V+A+W+D` host
+failure. It outputs UART0 at 115200 baud, 8 data bits, no parity, 1 stop bit:
+
+| RP2040 | DAPLink UART |
+| --- | --- |
+| GP0 / UART0 TX | DAPLink RX |
+| GND | DAPLink GND |
+
+GP1/UART0 RX is optional and must not be connected for this capture. Open the
+DAPLink virtual COM port (normally `COM25`) at `115200 8N1`, flash the image,
+wait for the mount/protocol lines, then reproduce `V+A+W+D` once. Save and
+share the complete text from startup through the first failure or watchdog
+restart. The trace is bounded to changed reports and a five-millisecond minimum
+interval; it is diagnostic only and must not be used as the 1 kHz release.
+
+Diagnostic SHA-256:
 
 - RP2040 `firmware/WirelessKeyboard.uf2`:
-  `A1F9379F768A0E3CAD47A54378AD6D582B7F43976239234EF99DB6C507A23316`
+  `7666C853C41524FE7E2A16917BE53566C684FBC063CB078040D855FAD9A2EF79`
+
+### Release matched protocol `0x03` artifacts
+
+The last release RP2040 artifact before this UART diagnostic build is
+`A1F9379F768A0E3CAD47A54378AD6D582B7F43976239234EF99DB6C507A23316`.
+The Transmitter and Receiver artifacts remain:
+
 - Transmitter `firmware/transmitter.uf2`:
   `551751E5353223CFDB7CF2456723514039473C2D11304410888080C6B2FAF89D`
 - Receiver `firmware/receiver.hex`:
