@@ -533,6 +533,19 @@ bool pio_usb_host_endpoint_abort_transfer(uint8_t root_idx, uint8_t device_addre
   return still_active; // still active means transfer is successfully aborted
 }
 
+bool pio_usb_host_endpoint_reset_toggle(uint8_t root_idx, uint8_t device_address,
+                                        uint8_t ep_address) {
+  endpoint_t *ep = _find_ep(root_idx, device_address, ep_address);
+  if (!ep || ep->has_transfer || ep->transfer_started) {
+    return false;
+  }
+
+  /* USB CLEAR_FEATURE(ENDPOINT_HALT) resets the data toggle to DATA0. */
+  ep->data_id = 0;
+  ep->failed_count = 0;
+  return true;
+}
+
 //--------------------------------------------------------------------+
 // Transaction helper
 //--------------------------------------------------------------------+

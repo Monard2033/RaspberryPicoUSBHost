@@ -11,6 +11,7 @@
 #include "tusb.h"
 #include "host/usbh.h"
 #include "pio_usb.h"
+#include "pio_usb_ll.h"
 
 #ifndef RUNTIME_LOGGING
 #define RUNTIME_LOGGING 0
@@ -54,6 +55,8 @@
 #define SPI_REARM_GUARD_US 250u
 #define SPI_ACK_POLL_MS 100u
 #define KEYBOARD_HID_STALL_RECOVERY_MS 250u
+#define SONIX_KEYBOARD_EP_IN 0x81u
+#define PIO_USB_ROOT_INDEX 0u
 #define RP2040_WATCHDOG_TIMEOUT_MS 1000u
 #define BATTERY_TELEMETRY_PERIOD_MS 30000u
 #define BATTERY_HID_QUIET_GUARD_MS 50u
@@ -147,6 +150,8 @@ static uint16_t          keyboard_led_output_bit_offsets[3] = { 0, 1, 2 };
 static bool              keyboard_uses_report_protocol;
 static uint32_t          keyboard_last_report_ms;
 static uint32_t          keyboard_recovery_after_ms;
+static bool              keyboard_halt_recovery_pending;
+static bool              keyboard_halt_recovery_in_progress;
 #if HID_DIAGNOSTIC_LOG
 static uint32_t          keyboard_last_diagnostic_ms;
 #endif
@@ -1553,9 +1558,63 @@ static void hid_receive_rearm_task(void)
     }
 }
 
+static void keyboard_halt_recovery_complete(tuh_xfer_t *xfer)
+{
+    keyboard_halt_recovery_in_progress = false;
+
+    if (!kbd_is_mounted || xfer->daddr != kbd_dev_addr ||
+        xfer->result != XFER_RESULT_SUCCESS) {
+        keyboard_recovery_after_ms = board_millis() + 20u;
+        return;
+    }
+
+    /* CLEAR_FEATURE(ENDPOINT_HALT) resets the device toggle to DATA0. Keep
+     * the PIO scheduler in the same state before the first new IN poll. */
+    pio_usb_host_endpoint_reset_toggle(PIO_USB_ROOT_INDEX, kbd_dev_addr,
+                                       SONIX_KEYBOARD_EP_IN);
+    keyboard_halt_recovery_pending = false;
+    keyboard_last_report_ms = board_millis();
+    hid_receive_arm_or_defer(kbd_dev_addr, kbd_instance);
+}
+
+static void keyboard_halt_recovery_task(void)
+{
+    if (!kbd_is_mounted || !keyboard_halt_recovery_pending ||
+        keyboard_halt_recovery_in_progress ||
+        (int32_t)(board_millis() - keyboard_recovery_after_ms) < 0) {
+        return;
+    }
+
+    static tusb_control_request_t const clear_halt_request = {
+        .bmRequestType_bit = {
+            .recipient = TUSB_REQ_RCPT_ENDPOINT,
+            .type = TUSB_REQ_TYPE_STANDARD,
+            .direction = TUSB_DIR_OUT,
+        },
+        .bRequest = TUSB_REQ_CLEAR_FEATURE,
+        .wValue = tu_htole16(TUSB_REQ_FEATURE_EDPT_HALT),
+        .wIndex = tu_htole16(SONIX_KEYBOARD_EP_IN),
+        .wLength = 0,
+    };
+    tuh_xfer_t const xfer = {
+        .daddr = kbd_dev_addr,
+        .ep_addr = 0,
+        .setup = &clear_halt_request,
+        .complete_cb = keyboard_halt_recovery_complete,
+    };
+
+    if (tuh_control_xfer((tuh_xfer_t *)&xfer)) {
+        keyboard_halt_recovery_in_progress = true;
+    } else {
+        /* An unrelated control transfer is active. Retry shortly without
+         * touching any interrupt endpoint or delaying input. */
+        keyboard_recovery_after_ms = board_millis() + 2u;
+    }
+}
+
 static void keyboard_hid_stall_recovery_task(void)
 {
-    if (!kbd_is_mounted) return;
+    if (!kbd_is_mounted || keyboard_halt_recovery_pending) return;
 
     uint32_t const now = board_millis();
     if ((int32_t)(now - keyboard_recovery_after_ms) < 0 ||
@@ -1572,22 +1631,9 @@ static void keyboard_hid_stall_recovery_task(void)
         return;
     }
 
-    if (keyboard_report_is_released()) return;
-
-    /* A pressed keyboard with no callback has a stale queued IN transfer.
-     * Pico-PIO-USB abort is nonblocking: an in-progress USB frame simply
-     * returns false and this task retries next frame. It must never spin or
-     * suspend the independently working Consumer endpoint. */
-    keyboard_recovery_after_ms = now + 1u;
-    if (!tuh_hid_receive_abort(kbd_dev_addr, kbd_instance)) return;
-
-    keyboard_last_report_ms = now;
-#if HID_DIAGNOSTIC_LOG
-    printf("[HID RECOVER] stale keyboard IN after %lu ms; re-arm dev=%u inst=%u\n",
-           (unsigned long)KEYBOARD_HID_STALL_RECOVERY_MS,
-           kbd_dev_addr, kbd_instance);
-#endif
-    hid_receive_arm_or_defer(kbd_dev_addr, kbd_instance);
+    /* A busy interrupt-IN transfer with no completion is left to the PIO
+     * scheduler. Do not abort it here: a failed/stalled completion is detected
+     * as the zero-length HID callback and recovered by CLEAR_FEATURE above. */
 }
 
 void tuh_mount_cb(uint8_t dev_addr)
@@ -1691,6 +1737,8 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
         keyboard_uses_report_protocol = true;
         keyboard_last_report_ms = board_millis();
         keyboard_recovery_after_ms = keyboard_last_report_ms;
+        keyboard_halt_recovery_pending = false;
+        keyboard_halt_recovery_in_progress = false;
         if (state != NULL) {
             for (uint8_t i = 0; i < state->report_count; ++i) {
                 if (state->reports[i].usage_page == HID_USAGE_PAGE_DESKTOP &&
@@ -1735,6 +1783,8 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
         kbd_is_mounted = false;
         keyboard_last_report_ms = 0;
         keyboard_recovery_after_ms = 0;
+        keyboard_halt_recovery_pending = false;
+        keyboard_halt_recovery_in_progress = false;
     }
     if (instance < CFG_TUH_HID) {
         hid_receive_rearm_pending[instance] = false;
@@ -1802,7 +1852,16 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
         info->usage == HID_USAGE_CONSUMER_CONTROL;
 
     if (dev_addr == kbd_dev_addr && instance == kbd_instance) {
-        keyboard_last_report_ms = board_millis();
+        bool const keyboard_xfer_failed = len == 0;
+        if (keyboard_xfer_failed) {
+            /* TinyUSB delivers FAILED/STALLED interrupt-IN completions through
+             * this callback with zero bytes. Do not interpret that as a normal
+             * key report or immediately re-arm a halted SONiX endpoint. */
+            keyboard_halt_recovery_pending = true;
+            keyboard_recovery_after_ms = board_millis();
+        } else {
+            keyboard_last_report_ms = board_millis();
+        }
         bool const keyboard_report = !keyboard_uses_report_protocol ||
             (info != NULL && info->usage_page == HID_USAGE_PAGE_DESKTOP &&
              info->usage == HID_USAGE_DESKTOP_KEYBOARD);
@@ -1830,10 +1889,10 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
             diagnostic_emitted = true;
         }
 #endif
-        if (keyboard_report && keyboard_uses_report_protocol &&
+        if (!keyboard_xfer_failed && keyboard_report && keyboard_uses_report_protocol &&
             keyboard_payload_len >= KBD_REPORT_LEN) {
             forward_keyboard_report(keyboard_payload);
-        } else if (keyboard_report && !keyboard_uses_report_protocol) {
+        } else if (!keyboard_xfer_failed && keyboard_report && !keyboard_uses_report_protocol) {
             forward_boot_keyboard_report(keyboard_payload,
                                          keyboard_payload_len);
 #if HOT_PATH_DEBUG
@@ -1862,7 +1921,9 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
 
     /* Re-arm immediately. A transient busy result is recovered by the
      * nonblocking main-loop task instead of freezing this HID endpoint. */
-    hid_receive_arm_or_defer(dev_addr, instance);
+    if (!(dev_addr == kbd_dev_addr && instance == kbd_instance && len == 0)) {
+        hid_receive_arm_or_defer(dev_addr, instance);
+    }
 }
 
 /*--------------------------------------------------------------------+
@@ -1920,6 +1981,7 @@ int main(void)
         watchdog_update();
         tuh_task();
         hid_receive_rearm_task();
+        keyboard_halt_recovery_task();
         keyboard_hid_stall_recovery_task();
         radio_power_task();
         battery_task();

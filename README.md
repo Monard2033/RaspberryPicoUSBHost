@@ -10,9 +10,9 @@ the nRF52840 transmitter over SPI.
 - Current working trees are authoritative; cloud copies are older fallbacks.
   Work on the existing `codex/*` branches and back up every file before edits.
 - RP2040: `C:\Users\Monard\Raspberry\WirelessKeyboard`, branch
-  `codex/fix-keyboard-endpoint-recovery`. The current artifact is the silent
-  release image for the `V+A+W+D` host-stall investigation; its keyboard HID
-  interface remains in REPORT protocol and has nonblocking endpoint recovery.
+  `codex/fix-keyboard-halt-recovery`. The current artifact is the silent
+  release image for the keyboard host-stall investigation; its Keyboard HID
+  endpoint has explicit asynchronous halt recovery.
 - Transmitter: `C:\ncs\v3.4.0\myproject\Transmitter`, branch
   `codex/ultra-fast-input-reliability`; the matched artifact is
   `firmware/transmitter.uf2`, SHA-256
@@ -107,6 +107,13 @@ the nRF52840 transmitter over SPI.
   keys are forwarded unchanged, prioritizing reliability over that game-specific
   filter. A one-second RP2040 hardware watchdog resets a genuine main-loop hard
   hang.
+- [x] SONiX Keyboard halt recovery: TinyUSB reports a failed/stalled Keyboard
+  interrupt-IN completion as a zero-length callback. RP2040 recognizes this as
+  transport state, not a key report, sends asynchronous standard
+  `CLEAR_FEATURE(ENDPOINT_HALT)` solely to Keyboard endpoint `0x81`, resets the
+  matching PIO-USB DATA toggle to DATA0 after success, then re-arms Keyboard.
+  Normal 1 kHz input sends no control requests; Multimedia endpoint `0x83` is
+  never reset or delayed by this recovery.
 - [ ] Hardware acceptance: validate Play/Pause, Previous, Next, Mute and
   Volume with repeated sub-10-ms actions, then verify `Ctrl+C`, `Ctrl+V`, Shift
   and Alt combinations at the 1 kHz source rate. Also hold and release 5 and 6
@@ -305,10 +312,10 @@ the 1 kHz release.
 ### Release matched protocol `0x03` artifacts
 
 The current RP2040 release artifact is
-`4A3B723B5FAEB16DC0D4B6D912A1562D936480ACF748F168E94D7FF6C4F7DBFD`.
-It removes the post-mount BOOT protocol switch and makes Keyboard endpoint
-recovery nonblocking while Multimedia continues independently. The Transmitter
-and Receiver artifacts remain:
+`3675D044D83B3DD30300793B76389778E161EBBED4AE214EE4D223E7C7987C3C`.
+It removes the post-mount BOOT protocol switch, makes Keyboard endpoint
+recovery nonblocking, and clears a detected Keyboard endpoint halt without
+resetting Multimedia. The Transmitter and Receiver artifacts remain:
 
 - Transmitter `firmware/transmitter.uf2`:
   `551751E5353223CFDB7CF2456723514039473C2D11304410888080C6B2FAF89D`
