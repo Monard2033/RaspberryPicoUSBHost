@@ -6,6 +6,7 @@
 #include "hardware/gpio.h"
 #include "hardware/adc.h"
 #include "hardware/pwm.h"
+#include "hardware/watchdog.h"
 #include "bsp/board_api.h"
 #include "tusb.h"
 #include "host/usbh.h"
@@ -54,6 +55,8 @@
 #define SPI_ACK_POLL_MS 100u
 #define KEYBOARD_BOOT_PROTOCOL_DELAY_MS 250u
 #define KEYBOARD_BOOT_PROTOCOL_RETRY_MS 50u
+#define KEYBOARD_HID_STALL_RECOVERY_MS 250u
+#define RP2040_WATCHDOG_TIMEOUT_MS 1000u
 #define BATTERY_TELEMETRY_PERIOD_MS 30000u
 #define BATTERY_HID_QUIET_GUARD_MS 50u
 #define MAX_HID_REPORTS   8
@@ -120,7 +123,7 @@
 #endif
 
 #ifndef NULL_MOVEMENT_ENABLED
-#define NULL_MOVEMENT_ENABLED 1 /* Last-input-wins for A/D and W/S. */
+#define NULL_MOVEMENT_ENABLED 0 /* Raw keyboard state has priority over game filtering. */
 #endif
 
 /*--------------------------------------------------------------------+
@@ -143,6 +146,7 @@ static bool              keyboard_uses_report_protocol;
 static bool              keyboard_boot_protocol_pending;
 static bool              keyboard_boot_protocol_transfer_active;
 static uint32_t          keyboard_boot_protocol_after_ms;
+static uint32_t          keyboard_last_report_ms;
 
 struct link_input_frame {
     uint8_t magic;
@@ -1020,6 +1024,7 @@ static void null_movement_reset(void)
     previous_output_valid = false;
 }
 
+#if NULL_MOVEMENT_ENABLED
 static uint8_t select_last_input_key(bool first_now, bool second_now,
                                      bool first_pressed, bool second_pressed,
                                      uint8_t first_key, uint8_t second_key,
@@ -1050,6 +1055,7 @@ static void append_key_once(uint8_t output[KBD_REPORT_LEN],
     }
     output[(*output_index)++] = key;
 }
+#endif
 
 /*
  * Implements the attached AutoHotkey script in firmware. Physical state and
@@ -1544,6 +1550,24 @@ static void hid_receive_rearm_task(void)
     }
 }
 
+static void keyboard_hid_stall_recovery_task(void)
+{
+    if (!kbd_is_mounted || keyboard_report_is_released()) return;
+
+    uint32_t const now = board_millis();
+    if ((uint32_t)(now - keyboard_last_report_ms) <
+        KEYBOARD_HID_STALL_RECOVERY_MS) {
+        return;
+    }
+
+    /* A PIO-USB interrupt transfer can stall without delivering a callback.
+     * While keys are held, cancel only that stale IN transfer and request a
+     * fresh one. This never runs while released and never blocks the callback. */
+    keyboard_last_report_ms = now;
+    (void)tuh_hid_receive_abort(kbd_dev_addr, kbd_instance);
+    hid_receive_arm_or_defer(kbd_dev_addr, kbd_instance);
+}
+
 static void keyboard_boot_protocol_task(void)
 {
     if (!kbd_is_mounted || !keyboard_boot_protocol_pending ||
@@ -1663,6 +1687,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
         keyboard_boot_protocol_transfer_active = false;
         keyboard_boot_protocol_after_ms = board_millis() +
             KEYBOARD_BOOT_PROTOCOL_DELAY_MS;
+        keyboard_last_report_ms = board_millis();
         if (state != NULL) {
             for (uint8_t i = 0; i < state->report_count; ++i) {
                 if (state->reports[i].usage_page == HID_USAGE_PAGE_DESKTOP &&
@@ -1707,6 +1732,7 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
         kbd_is_mounted = false;
         keyboard_boot_protocol_pending = false;
         keyboard_boot_protocol_transfer_active = false;
+        keyboard_last_report_ms = 0;
     }
     if (instance < CFG_TUH_HID) {
         hid_receive_rearm_pending[instance] = false;
@@ -1792,6 +1818,7 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
         info->usage == HID_USAGE_CONSUMER_CONTROL;
 
     if (dev_addr == kbd_dev_addr && instance == kbd_instance) {
+        keyboard_last_report_ms = board_millis();
         bool const keyboard_report = !keyboard_uses_report_protocol ||
             (info != NULL && info->usage_page == HID_USAGE_PAGE_DESKTOP &&
              info->usage == HID_USAGE_DESKTOP_KEYBOARD);
@@ -1867,6 +1894,7 @@ int main(void)
     spi_master_init();
     led_pwm_init();
     battery_adc_init();
+    watchdog_enable(RP2040_WATCHDOG_TIMEOUT_MS, true);
 
     printf("[INIT] Starting 5-second battery display...\n");
     battery_start_display();
@@ -1875,9 +1903,11 @@ int main(void)
     radio_last_activity_ms = board_millis();
 
     while (1) {
+        watchdog_update();
         tuh_task();
         keyboard_boot_protocol_task();
         hid_receive_rearm_task();
+        keyboard_hid_stall_recovery_task();
         radio_power_task();
         battery_task();
         spi_ack_poll_task();
