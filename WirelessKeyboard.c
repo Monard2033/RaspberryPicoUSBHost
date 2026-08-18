@@ -999,7 +999,7 @@ static bool keyboard_boot_report_has_error(
 static void keyboard_array_report_normalize(uint8_t const report[KBD_REPORT_LEN],
                                             uint8_t normalized[KBD_REPORT_LEN])
 {
-    memcpy(normalized, report, sizeof(normalized));
+    memcpy(normalized, report, KBD_REPORT_LEN);
     if (keyboard_boot_report_has_error(normalized)) {
         /* Do not forward rollover/error usages through the RF link. Releasing
          * regular keys is safe; retain modifiers so a transient rollover does
