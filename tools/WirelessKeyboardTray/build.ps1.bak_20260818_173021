@@ -28,12 +28,13 @@ $arguments = @(
     '-Wall',
     '-Wextra',
     '-Wpedantic',
-    '-Werror',
     '-municode',
     '-mwindows',
     '-static',
     '-static-libgcc',
     '-static-libstdc++',
+    '-DUNICODE',
+    '-D_UNICODE',
     '-DWINVER=0x0A00',
     '-D_WIN32_WINNT=0x0A00',
     $sourcePath,
@@ -45,9 +46,7 @@ $arguments = @(
     '-lshell32',
     '-luser32',
     '-lgdi32',
-    '-ladvapi32',
-    '-ldwmapi',
-    '-luxtheme'
+    '-ladvapi32'
 )
 
 & $compiler.Source @arguments

@@ -8,6 +8,7 @@
 #include "hardware/gpio.h"
 #include "hardware/adc.h"
 #include "hardware/pwm.h"
+#include "hardware/flash.h"
 #include "hardware/watchdog.h"
 #include "bsp/board_api.h"
 #include "tusb.h"
@@ -43,10 +44,26 @@
 #define LINK_TYPE_CONSUMER 0x02
 #define LINK_TYPE_CONTROL  0x03
 #define LINK_TYPE_BATTERY  0x04
+#define LINK_TYPE_DFU_START     0x10
+#define LINK_TYPE_DFU_DATA      0x11
+#define LINK_TYPE_DFU_FINISH    0x12
+#define LINK_TYPE_DFU_STATUS    0x13
 #define LINK_CONTROL_SYSTEM_OFF 0x01
 #define LINK_CONTROL_POLL_ACK   0x02
 #define LINK_ACK_MAGIC           0x5A
 #define LINK_ACK_TYPE_LOCK_STATE 0x01
+#define LINK_ACK_TYPE_DFU       0x02
+
+#define FLASH_STAGING_OFFSET (2048u * 1024u)   /* 2MB offset for WeAct RP2040 4MB Flash */
+#define FLASH_STAGING_MAX_SIZE (1900u * 1024u) /* Up to 1.9MB firmware image size */
+
+#define DFU_STATUS_IDLE         0x00u
+#define DFU_STATUS_BUSY         0x01u
+#define DFU_STATUS_OK           0x02u
+#define DFU_STATUS_ERR_SIZE     0x03u
+#define DFU_STATUS_ERR_CRC      0x04u
+#define DFU_STATUS_ERR_FLASH    0x05u
+#define DFU_STATUS_SUCCESS      0x06u
 #define RADIO_INACTIVITY_MS (5u * 60u * 1000u)
 #define RADIO_OFF_SETTLE_MS 10u
 #define RADIO_BOOT_WAIT_MS  75u
@@ -130,7 +147,7 @@
 #endif
 
 #ifndef NULL_MOVEMENT_ENABLED
-#define NULL_MOVEMENT_ENABLED 0 /* Raw keyboard state has priority over game filtering. */
+#define NULL_MOVEMENT_ENABLED 1 /* Null Movement (Snap Tap / SOCD Last Win) enabled for A/D and W/S */
 #endif
 
 /*--------------------------------------------------------------------+
@@ -393,13 +410,161 @@ static bool pending_radio_queue_pop(struct pending_radio_input *queue,
     return true;
 }
 
+static uint32_t dfu_total_size = 0;
+static uint32_t dfu_expected_crc32 = 0;
+static uint32_t dfu_bytes_written = 0;
+static uint8_t dfu_page_buffer[FLASH_PAGE_SIZE];
+static uint16_t dfu_page_buffer_len = 0;
+static uint8_t dfu_last_seq = 0xFF;
+
+static uint32_t calculate_crc32(const uint8_t *data, size_t length)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < length; ++i) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; ++j) {
+            if (crc & 1) {
+                crc = (crc >> 1) ^ 0xEDB88320u;
+            } else {
+                crc = (crc >> 1);
+            }
+        }
+    }
+    return ~crc;
+}
+
+static void dfu_flash_erase_staging(uint32_t size)
+{
+    uint32_t const aligned_size = (size + FLASH_SECTOR_SIZE - 1u) & ~(FLASH_SECTOR_SIZE - 1u);
+    uint32_t const ints = save_and_disable_interrupts();
+    flash_range_erase(FLASH_STAGING_OFFSET, aligned_size);
+    restore_interrupts(ints);
+}
+
+static void dfu_flash_program_page(uint32_t offset, const uint8_t *data)
+{
+    uint32_t const ints = save_and_disable_interrupts();
+    flash_range_program(FLASH_STAGING_OFFSET + offset, data, FLASH_PAGE_SIZE);
+    restore_interrupts(ints);
+}
+
+static bool spi_queue_input(uint8_t type, const uint8_t data[KBD_REPORT_LEN]);
+
+static void dfu_send_status(uint8_t status, uint8_t progress, uint16_t offset_div_4)
+{
+    uint8_t data[KBD_REPORT_LEN] = { 0 };
+    data[0] = status;
+    data[1] = progress;
+    data[2] = (uint8_t)offset_div_4;
+    data[3] = (uint8_t)(offset_div_4 >> 8);
+    spi_queue_input(LINK_TYPE_DFU_STATUS, data);
+}
+
+static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
+{
+    uint32_t const aligned_size = (size + FLASH_SECTOR_SIZE - 1u) & ~(FLASH_SECTOR_SIZE - 1u);
+    uint32_t const ints = save_and_disable_interrupts();
+    (void)ints;
+
+    /* 1. Erase Slot A (active application starting at offset 0) */
+    flash_range_erase(0, aligned_size);
+
+    /* 2. Copy verified new firmware from Staging Slot to Slot A */
+    const uint8_t *src = (const uint8_t *)(XIP_BASE + FLASH_STAGING_OFFSET);
+    flash_range_program(0, src, aligned_size);
+
+    /* 3. Reboot RP2040 into the newly installed firmware */
+    watchdog_reboot(0, 0, 0);
+    while (1) {
+        tight_loop_contents();
+    }
+}
+
+static void dfu_process_command(struct link_ack_frame const *ack)
+{
+    uint8_t const cmd = ack->data[0];
+
+    if (cmd == LINK_TYPE_DFU_START) {
+        dfu_total_size = (uint32_t)ack->data[1] |
+                         ((uint32_t)ack->data[2] << 8) |
+                         ((uint32_t)ack->data[3] << 16) |
+                         ((uint32_t)ack->data[4] << 24);
+        dfu_expected_crc32 = (uint32_t)ack->data[5] |
+                            ((uint32_t)ack->data[6] << 8) |
+                            ((uint32_t)ack->data[7] << 16);
+        if (dfu_total_size == 0 || dfu_total_size > FLASH_STAGING_MAX_SIZE) {
+            dfu_send_status(DFU_STATUS_ERR_SIZE, 0, 0);
+            return;
+        }
+        dfu_flash_erase_staging(dfu_total_size);
+        dfu_bytes_written = 0;
+        dfu_page_buffer_len = 0;
+        dfu_last_seq = ack->sequence;
+        dfu_send_status(DFU_STATUS_OK, 0, 0);
+        return;
+    }
+
+    if (cmd == LINK_TYPE_DFU_DATA) {
+        if (ack->sequence == dfu_last_seq) {
+            uint8_t const prog = (uint8_t)((dfu_bytes_written * 100u) / (dfu_total_size ? dfu_total_size : 1u));
+            dfu_send_status(DFU_STATUS_OK, prog, (uint16_t)(dfu_bytes_written / 4u));
+            return;
+        }
+        dfu_last_seq = ack->sequence;
+
+        for (int i = 2; i < 8; ++i) {
+            if (dfu_bytes_written + dfu_page_buffer_len < dfu_total_size) {
+                dfu_page_buffer[dfu_page_buffer_len++] = ack->data[i];
+                if (dfu_page_buffer_len == FLASH_PAGE_SIZE) {
+                    dfu_flash_program_page(dfu_bytes_written, dfu_page_buffer);
+                    dfu_bytes_written += FLASH_PAGE_SIZE;
+                    dfu_page_buffer_len = 0;
+                }
+            }
+        }
+
+        uint8_t const prog = (uint8_t)((dfu_bytes_written * 100u) / (dfu_total_size ? dfu_total_size : 1u));
+        dfu_send_status(DFU_STATUS_OK, prog, (uint16_t)(dfu_bytes_written / 4u));
+        return;
+    }
+
+    if (cmd == LINK_TYPE_DFU_FINISH) {
+        if (dfu_page_buffer_len > 0) {
+            memset(&dfu_page_buffer[dfu_page_buffer_len], 0xFF, FLASH_PAGE_SIZE - dfu_page_buffer_len);
+            dfu_flash_program_page(dfu_bytes_written, dfu_page_buffer);
+            dfu_bytes_written += dfu_page_buffer_len;
+            dfu_page_buffer_len = 0;
+        }
+
+        const uint8_t *staging_flash = (const uint8_t *)(XIP_BASE + FLASH_STAGING_OFFSET);
+        uint32_t const actual_crc = calculate_crc32(staging_flash, dfu_total_size);
+
+        if (dfu_expected_crc32 != 0 && (actual_crc & 0x00FFFFFFu) != (dfu_expected_crc32 & 0x00FFFFFFu)) {
+            dfu_send_status(DFU_STATUS_ERR_CRC, 0, 0);
+        } else {
+            dfu_send_status(DFU_STATUS_SUCCESS, 100, (uint16_t)(dfu_total_size / 4u));
+            sleep_ms(250);
+            dfu_apply_and_reboot(dfu_total_size);
+        }
+        return;
+    }
+}
+
 static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
 {
     struct link_ack_frame ack;
 
     memcpy(&ack, rx, sizeof(ack));
-    if (ack.magic != LINK_ACK_MAGIC || ack.version != LINK_VERSION ||
-        ack.type != LINK_ACK_TYPE_LOCK_STATE ||
+    if (ack.magic != LINK_ACK_MAGIC || ack.version != LINK_VERSION) {
+        return;
+    }
+
+    if (ack.type == LINK_ACK_TYPE_DFU) {
+        dfu_process_command(&ack);
+        return;
+    }
+
+    if (ack.type != LINK_ACK_TYPE_LOCK_STATE ||
         (ack.data[1] & 0x01u) == 0) {
         return;
     }
@@ -528,14 +693,7 @@ static void spi_service_task(void)
                   pending.data[6], pending.data[7] },
     };
     spi_write_frame(&spi_retry_frame);
-    if (pending.type == LINK_TYPE_BATTERY) {
-        /* Battery is latest-state telemetry, not an urgent transition. It
-         * must not consume the 250 us Keyboard/Consumer duplicate slot. */
-        spi_retry_pending = false;
-    } else {
-        spi_retry_after_us = time_us_32() + SPI_REARM_GUARD_US;
-        spi_retry_pending = true;
-    }
+    spi_retry_pending = false;
 }
 
 static void __unused spi_send_control_command(uint8_t command)
