@@ -164,6 +164,17 @@ the nRF52840 transmitter over SPI.
   collections. Real Battery values and native Windows battery presentation
   still require hardware validation after flashing the corrected Receiver.
 
+### Wireless OTA Firmware Updates (RP2040 & nRF52840 Transmitter)
+
+See [OTA DFU Roadmap & TODO](file:///c:/Users/Monard/Raspberry/WirelessKeyboard/docs/OTA_DFU_TODO.md) for full technical specifications.
+
+- [x] **RP2040 Host Wireless OTA DFU**: Dual-Bank 4MB Winbond Flash partitioning (2MB Slot A + 2MB Slot B Staging), CRC32 verification, RAM-resident `dfu_apply_and_reboot()`, and standalone native Windows tool `tools/flash_ota.exe` (C++).
+- [ ] **nRF52840 Transmitter Wireless OTA DFU via Receiver**: Research and verify feasibility of flashing the Transmitter module wirelessly over the 2.4GHz ESB radio link from the Receiver Dongle.
+  - Investigate nRF52840 1MB flash layout (MCUboot Dual-Bank vs custom RAM ESB DFU writer) compatible with the onboard Adafruit UF2 bootloader.
+  - Extend DFU header with target selector (RP2040 vs Transmitter).
+  - Add Transmitter internal flash staging write, checksum verification, and fallback recovery.
+  - Add `--target transmitter` support to `tools/flash_ota.exe`.
+
 ## Active wiring
 
 ### USB keyboard / converter board to RP2040
