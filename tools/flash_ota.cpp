@@ -89,22 +89,13 @@ static HANDLE OpenReceiverDongle() {
         attr.Size = sizeof(attr);
         HidD_GetAttributes(inspect, &attr);
 
-        // Try getting DFU Feature report ID 4 or Battery Feature report ID 3
+        // Test specifically for DFU Feature Report ID 4
         uint8_t testReport[9] = { HID_REPORT_ID_DFU, 0 };
         BOOLEAN dfuOk = HidD_GetFeature(inspect, testReport, sizeof(testReport));
-        
-        if (!dfuOk) {
-            // Check if it is the Dongle (VID 0x1915 or battery report capable)
-            uint8_t battReport[9] = { 0x03, 0 };
-            BOOLEAN battOk = HidD_GetFeature(inspect, battReport, sizeof(battReport));
-            if (battOk || attr.VendorID == 0x1915) {
-                std::cout << "[OTA DFU] Found Dongle (VID: 0x" << std::hex << attr.VendorID 
-                          << " PID: 0x" << attr.ProductID << std::dec << ")!" << std::endl;
-                dfuOk = TRUE;
-            }
-        }
 
         if (dfuOk) {
+            std::cout << "[OTA DFU] Connected to Dongle (VID: 0x" << std::hex << attr.VendorID 
+                      << " PID: 0x" << attr.ProductID << std::dec << ") - DFU Feature Ready!" << std::endl;
             result = CreateFileW(
                 detail->DevicePath, GENERIC_READ | GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
@@ -170,14 +161,16 @@ int main(int argc, char* argv[]) {
     std::cout << "Binary Size    : " << totalSize << " bytes (" << (totalSize / 1024.0) << " KB)\n";
     std::cout << "CRC32 Checksum : 0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << crc32 << std::dec << "\n\n";
 
-    std::cout << "[OTA DFU] Searching for nRF52840 Receiver Dongle..." << std::endl;
+    std::cout << "[OTA DFU] Searching for nRF52840 Receiver Dongle with DFU support..." << std::endl;
     HANDLE dongle = OpenReceiverDongle();
     if (dongle == INVALID_HANDLE_VALUE) {
-        std::cerr << "[OTA DFU] Error: Dongle not detected. Please ensure receiver_OTA.hex is flashed on the Dongle and plugged into USB." << std::endl;
+        std::cerr << "[OTA DFU] Error: Dongle not detected.\n"
+                  << "          Please make sure 'Write' was pressed in Nordic Programmer,\n"
+                  << "          and the Dongle is running in standard USB mode." << std::endl;
         return 1;
     }
 
-    std::cout << "[OTA DFU] Dongle connected! Initiating DFU OTA session..." << std::endl;
+    std::cout << "[OTA DFU] Initiating Wireless OTA DFU session..." << std::endl;
 
     // Send START command
     uint8_t startPayload[8] = {
@@ -251,7 +244,7 @@ int main(int argc, char* argv[]) {
     if (success) {
         std::cout << "[OTA DFU] >>> UPGRADE COMPLETED SUCCESSFULLY in " << std::fixed << std::setprecision(2) << elapsed << "s! <<<\n";
     } else {
-        std::cout << "[OTA DFU] Transmission finished (" << std::fixed << std::setprecision(2) << elapsed << "s). RP2040 rebooting into new firmware.\n";
+        std::cout << "[OTA DFU] Transmission finished (" << std::fixed << std::setprecision(2) << elapsed << "s). RP2040 Flash updated.\n";
     }
 
     return 0;

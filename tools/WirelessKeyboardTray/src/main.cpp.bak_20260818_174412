@@ -1,14 +1,11 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
-#include <windowsx.h>
 #include <dbt.h>
-#include <dwmapi.h>
 #include <hidsdi.h>
 #include <hidpi.h>
 #include <setupapi.h>
 #include <shellapi.h>
-#include <uxtheme.h>
 
 #include <algorithm>
 #include <array>
@@ -16,20 +13,11 @@
 #include <cwchar>
 #include <new>
 #include <string>
-#include <utility>
 #include <vector>
-
-#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
-#define DWMWA_WINDOW_CORNER_PREFERENCE 33
-#endif
-#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
-#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
-#endif
 
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"WirelessKeyboardTrayHiddenWindow";
-constexpr wchar_t kPopupWindowClass[] = L"WirelessKeyboardTrayModernPopup";
 constexpr wchar_t kAppName[] = L"Wireless Keyboard Battery";
 constexpr wchar_t kRunValueName[] = L"WirelessKeyboardTray";
 constexpr wchar_t kSingleInstanceName[] =
@@ -51,13 +39,9 @@ constexpr UINT kStatusMessage = WM_APP + 2;
 constexpr UINT kRefreshMessage = WM_APP + 3;
 constexpr UINT kTrayIconId = 1;
 
-constexpr int kItemRefresh = 0;
-constexpr int kItemAutostart = 1;
-constexpr int kItemExit = 2;
-
-constexpr LONG kTrayMenuLiftPx = 23;
-constexpr int kSideMargin = 5;
-constexpr int kItemHeight = 30;
+constexpr UINT kMenuRefresh = 1001;
+constexpr UINT kMenuAutostart = 1002;
+constexpr UINT kMenuExit = 1003;
 
 enum class Availability {
     Offline,
@@ -78,33 +62,8 @@ struct BatterySnapshot {
     DWORD error = ERROR_SUCCESS;
 };
 
-struct PopupColors {
-    COLORREF bg;
-    COLORREF border;
-    COLORREF title;
-    COLORREF textPrimary;
-    COLORREF textSecondary;
-    COLORREF separator;
-    COLORREF itemHoverBg;
-    COLORREF itemPressedBg;
-    COLORREF checkColor;
-};
-
-struct PopupLayout {
-    int width = 236;
-    int height = 0;
-    RECT titleRect{};
-    std::vector<std::pair<std::wstring, COLORREF>> telemetryLines;
-    int sep1Y = 0;
-    RECT refreshRect{};
-    RECT autostartRect{};
-    int sep2Y = 0;
-    RECT exitRect{};
-};
-
 HINSTANCE gInstance = nullptr;
 HWND gWindow = nullptr;
-HWND gPopupWindow = nullptr;
 HANDLE gSingleInstance = nullptr;
 HANDLE gStopEvent = nullptr;
 HANDLE gRefreshEvent = nullptr;
@@ -116,10 +75,6 @@ HICON gCurrentIcon = nullptr;
 UINT gTaskbarCreatedMessage = 0;
 volatile LONG gDeviceEpoch = 0;
 BatterySnapshot gLastSnapshot{};
-
-bool gIsRefreshing = false;
-int gHoverItem = -1;
-int gPressedItem = -1;
 
 std::wstring GetExecutablePath()
 {
@@ -192,55 +147,6 @@ bool SetAutostartEnabled(bool enabled)
         return false;
     }
     return true;
-}
-
-bool IsSystemDarkMode()
-{
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-            0, KEY_QUERY_VALUE, &key) == ERROR_SUCCESS) {
-        DWORD value = 1;
-        DWORD size = sizeof(value);
-        DWORD type = REG_DWORD;
-        if (RegQueryValueExW(key, L"AppsUseLightTheme", nullptr, &type,
-                             reinterpret_cast<LPBYTE>(&value),
-                             &size) == ERROR_SUCCESS) {
-            RegCloseKey(key);
-            return value == 0;
-        }
-        RegCloseKey(key);
-    }
-    return false;
-}
-
-PopupColors GetCurrentColors()
-{
-    bool const isDark = IsSystemDarkMode();
-    PopupColors c{};
-    if (isDark) {
-        c.bg = RGB(44, 44, 44);
-        c.border = RGB(65, 65, 65);
-        c.title = RGB(190, 190, 190);
-        c.textPrimary = RGB(255, 255, 255);
-        c.textSecondary = RGB(180, 180, 180);
-        c.separator = RGB(60, 60, 60);
-        c.itemHoverBg = RGB(58, 58, 58);
-        c.itemPressedBg = RGB(70, 70, 70);
-        c.checkColor = RGB(255, 255, 255);
-    } else {
-        c.bg = RGB(242, 242, 242);
-        c.border = RGB(214, 214, 214);
-        c.title = RGB(55, 55, 55);
-        c.textPrimary = RGB(20, 20, 20);
-        c.textSecondary = RGB(85, 85, 85);
-        c.separator = RGB(222, 222, 222);
-        c.itemHoverBg = RGB(226, 226, 226);
-        c.itemPressedBg = RGB(212, 212, 212);
-        c.checkColor = RGB(20, 20, 20);
-    }
-    return c;
 }
 
 uint32_t Argb(COLORREF color)
@@ -401,73 +307,6 @@ void CopyTooltip(std::wstring const &tooltip)
     gNotifyIcon.szTip[std::size(gNotifyIcon.szTip) - 1] = L'\0';
 }
 
-PopupLayout ComputeLayout(BatterySnapshot const &snapshot,
-                         PopupColors const &colors)
-{
-    PopupLayout l{};
-    l.width = 236;
-    int y = 10;
-
-    l.titleRect = {16, y, l.width - 16, y + 18};
-    y += 20;
-
-    wchar_t text[128]{};
-    switch (snapshot.availability) {
-    case Availability::Offline:
-        l.telemetryLines.push_back({L"Receiver: offline", colors.textPrimary});
-        break;
-    case Availability::WaitingForTelemetry:
-        l.telemetryLines.push_back(
-            {L"Waiting for battery telemetry...", colors.textPrimary});
-        break;
-    case Availability::ReadError:
-        std::swprintf(text, std::size(text), L"HID read error: %lu",
-                      static_cast<unsigned long>(snapshot.error));
-        l.telemetryLines.push_back({text, colors.textPrimary});
-        break;
-    case Availability::Live:
-    case Availability::Stale:
-        std::swprintf(text, std::size(text), L"Battery: %u%%",
-                      static_cast<unsigned>(snapshot.percentage));
-        l.telemetryLines.push_back({text, colors.textPrimary});
-        std::swprintf(text, std::size(text), L"Voltage: %.3f V",
-                      static_cast<double>(snapshot.millivolts) / 1000.0);
-        l.telemetryLines.push_back({text, colors.textPrimary});
-        std::swprintf(text, std::size(text), L"State: %ls",
-                      BatteryStateName(snapshot.batteryState));
-        l.telemetryLines.push_back({text, colors.textPrimary});
-        std::swprintf(text, std::size(text), L"Telemetry: %ls, age %u s",
-                      snapshot.availability == Availability::Live ?
-                          L"LIVE" : L"STALE",
-                      static_cast<unsigned>(snapshot.ageSeconds));
-        l.telemetryLines.push_back({text, colors.textSecondary});
-        std::swprintf(text, std::size(text), L"Sequence: %u",
-                      static_cast<unsigned>(snapshot.sequence));
-        l.telemetryLines.push_back({text, colors.textSecondary});
-        break;
-    }
-
-    y += static_cast<int>(l.telemetryLines.size()) * 20 + 6;
-
-    l.sep1Y = y;
-    y += 6;
-
-    l.refreshRect = {kSideMargin, y, l.width - kSideMargin, y + kItemHeight};
-    y += kItemHeight + 2;
-
-    l.autostartRect = {kSideMargin, y, l.width - kSideMargin, y + kItemHeight};
-    y += kItemHeight + 4;
-
-    l.sep2Y = y;
-    y += 5;
-
-    l.exitRect = {kSideMargin, y, l.width - kSideMargin, y + kItemHeight};
-    y += kItemHeight + 6;
-
-    l.height = y;
-    return l;
-}
-
 void UpdateTray(BatterySnapshot const &snapshot)
 {
     HICON const nextIcon = CreateBatteryIcon(snapshot);
@@ -475,30 +314,14 @@ void UpdateTray(BatterySnapshot const &snapshot)
     gCurrentIcon = nextIcon;
     gNotifyIcon.hIcon = gCurrentIcon;
     CopyTooltip(BuildTooltip(snapshot));
-    gNotifyIcon.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    gNotifyIcon.uFlags = NIF_ICON | NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &gNotifyIcon);
-
-    gLastSnapshot = snapshot;
-    gIsRefreshing = false;
-
-    if (gPopupWindow != nullptr && IsWindowVisible(gPopupWindow)) {
-        PopupColors const colors = GetCurrentColors();
-        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors);
-        RECT currentRect{};
-        GetWindowRect(gPopupWindow, &currentRect);
-        int const diff = layout.height - (currentRect.bottom - currentRect.top);
-        int const newY = currentRect.top - diff;
-        SetWindowPos(gPopupWindow, HWND_TOPMOST, currentRect.left, newY,
-                     layout.width, layout.height,
-                     SWP_NOACTIVATE | SWP_NOZORDER);
-        InvalidateRect(gPopupWindow, nullptr, TRUE);
-        UpdateWindow(gPopupWindow);
-    }
 
     if (previousIcon != nullptr && previousIcon != gCurrentIcon &&
         previousIcon != LoadIconW(nullptr, IDI_APPLICATION)) {
         DestroyIcon(previousIcon);
     }
+    gLastSnapshot = snapshot;
 }
 
 void AddTrayIcon()
@@ -511,7 +334,7 @@ void AddTrayIcon()
     gNotifyIcon.cbSize = sizeof(gNotifyIcon);
     gNotifyIcon.hWnd = gWindow;
     gNotifyIcon.uID = kTrayIconId;
-    gNotifyIcon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    gNotifyIcon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     gNotifyIcon.uCallbackMessage = kTrayCallbackMessage;
     gCurrentIcon = CreateBatteryIcon(gLastSnapshot);
     gNotifyIcon.hIcon = gCurrentIcon;
@@ -642,6 +465,12 @@ BatterySnapshot ReadBattery(HANDLE handle)
         return snapshot;
     }
 
+    if (report[1] > 100U || report[2] > 4U) {
+        snapshot.availability = Availability::ReadError;
+        snapshot.error = ERROR_INVALID_DATA;
+        return snapshot;
+    }
+
     snapshot.percentage = report[1];
     snapshot.batteryState = report[2];
     snapshot.millivolts = static_cast<uint16_t>(report[3]) |
@@ -731,286 +560,27 @@ void RequestRefresh()
     }
 }
 
-void ShowModernPopup()
+void ShowTrayMenu()
 {
-    PopupColors const colors = GetCurrentColors();
-    PopupLayout const layout = ComputeLayout(gLastSnapshot, colors);
-
-    if (gPopupWindow == nullptr) {
-        gPopupWindow = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kPopupWindowClass, kAppName,
-            WS_POPUP, 0, 0, layout.width, layout.height, gWindow,
-            nullptr, gInstance, nullptr);
-        if (gPopupWindow == nullptr) return;
-
-        DWORD corner = 2; // DWMWCP_ROUND
-        DwmSetWindowAttribute(gPopupWindow, DWMWA_WINDOW_CORNER_PREFERENCE,
-                              &corner, sizeof(corner));
+    HMENU const menu = CreatePopupMenu();
+    if (menu == nullptr) {
+        return;
     }
 
-    BOOL isDark = IsSystemDarkMode() ? TRUE : FALSE;
-    DwmSetWindowAttribute(gPopupWindow, DWMWA_USE_IMMERSIVE_DARK_MODE,
-                          &isDark, sizeof(isDark));
+    AppendMenuW(menu, MF_STRING, kMenuRefresh, L"Refresh now");
+    AppendMenuW(menu, MF_STRING |
+                          (IsAutostartEnabled() ? MF_CHECKED : MF_UNCHECKED),
+                kMenuAutostart, L"Start with Windows");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kMenuExit, L"Exit");
 
     POINT cursor{};
     GetCursorPos(&cursor);
-    HMONITOR const monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    GetMonitorInfoW(monitor, &mi);
-    RECT const work = mi.rcWork;
-
-    LONG x = std::clamp(cursor.x - layout.width / 2, work.left,
-                        work.right - layout.width);
-    LONG y = cursor.y - kTrayMenuLiftPx - layout.height;
-    y = std::clamp(y, work.top, work.bottom - layout.height);
-
-    SetWindowPos(gPopupWindow, HWND_TOPMOST, x, y, layout.width, layout.height,
-                 SWP_SHOWWINDOW);
-    SetForegroundWindow(gPopupWindow);
-    SetFocus(gPopupWindow);
-    InvalidateRect(gPopupWindow, nullptr, TRUE);
-}
-
-LRESULT CALLBACK PopupWindowProcedure(HWND window, UINT message, WPARAM wParam,
-                                      LPARAM lParam)
-{
-    switch (message) {
-    case WM_CREATE:
-        return 0;
-
-    case WM_MOUSEMOVE: {
-        int const x = GET_X_LPARAM(lParam);
-        int const y = GET_Y_LPARAM(lParam);
-        PopupColors const colors = GetCurrentColors();
-        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors);
-
-        int hovered = -1;
-        POINT pt = {x, y};
-        if (PtInRect(&layout.refreshRect, pt)) hovered = kItemRefresh;
-        else if (PtInRect(&layout.autostartRect, pt)) hovered = kItemAutostart;
-        else if (PtInRect(&layout.exitRect, pt)) hovered = kItemExit;
-
-        if (hovered != gHoverItem) {
-            gHoverItem = hovered;
-            InvalidateRect(window, nullptr, FALSE);
-        }
-
-        TRACKMOUSEEVENT tme{};
-        tme.cbSize = sizeof(tme);
-        tme.dwFlags = TME_LEAVE;
-        tme.hwndTrack = window;
-        TrackMouseEvent(&tme);
-        return 0;
-    }
-
-    case WM_MOUSELEAVE:
-        if (gHoverItem != -1 || gPressedItem != -1) {
-            gHoverItem = -1;
-            gPressedItem = -1;
-            InvalidateRect(window, nullptr, FALSE);
-        }
-        return 0;
-
-    case WM_LBUTTONDOWN: {
-        int const x = GET_X_LPARAM(lParam);
-        int const y = GET_Y_LPARAM(lParam);
-        PopupColors const colors = GetCurrentColors();
-        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors);
-
-        POINT pt = {x, y};
-        if (PtInRect(&layout.refreshRect, pt)) gPressedItem = kItemRefresh;
-        else if (PtInRect(&layout.autostartRect, pt)) gPressedItem = kItemAutostart;
-        else if (PtInRect(&layout.exitRect, pt)) gPressedItem = kItemExit;
-        else gPressedItem = -1;
-
-        InvalidateRect(window, nullptr, FALSE);
-        return 0;
-    }
-
-    case WM_LBUTTONUP: {
-        int const x = GET_X_LPARAM(lParam);
-        int const y = GET_Y_LPARAM(lParam);
-        PopupColors const colors = GetCurrentColors();
-        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors);
-
-        int releasedItem = -1;
-        POINT pt = {x, y};
-        if (PtInRect(&layout.refreshRect, pt)) releasedItem = kItemRefresh;
-        else if (PtInRect(&layout.autostartRect, pt)) releasedItem = kItemAutostart;
-        else if (PtInRect(&layout.exitRect, pt)) releasedItem = kItemExit;
-
-        if (releasedItem == gPressedItem && releasedItem != -1) {
-            switch (releasedItem) {
-            case kItemRefresh:
-                gIsRefreshing = true;
-                RequestRefresh();
-                InvalidateRect(window, nullptr, FALSE);
-                break;
-            case kItemAutostart:
-                SetAutostartEnabled(!IsAutostartEnabled());
-                InvalidateRect(window, nullptr, FALSE);
-                break;
-            case kItemExit:
-                ShowWindow(window, SW_HIDE);
-                DestroyWindow(gWindow);
-                break;
-            }
-        }
-        gPressedItem = -1;
-        InvalidateRect(window, nullptr, FALSE);
-        return 0;
-    }
-
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(window, &ps);
-        RECT rc;
-        GetClientRect(window, &rc);
-
-        HDC memDC = CreateCompatibleDC(hdc);
-        HBITMAP memBmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-        HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
-
-        PopupColors const colors = GetCurrentColors();
-        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors);
-
-        HBRUSH bgBrush = CreateSolidBrush(colors.bg);
-        FillRect(memDC, &rc, bgBrush);
-        DeleteObject(bgBrush);
-
-        HPEN borderPen = CreatePen(PS_SOLID, 1, colors.border);
-        HGDIOBJ oldPen = SelectObject(memDC, borderPen);
-        HGDIOBJ oldBrush = SelectObject(memDC, GetStockObject(HOLLOW_BRUSH));
-        Rectangle(memDC, rc.left, rc.top, rc.right, rc.bottom);
-        SelectObject(memDC, oldBrush);
-        SelectObject(memDC, oldPen);
-        DeleteObject(borderPen);
-
-        HFONT fontTitle = CreateFontW(-12, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE,
-                                     FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                                     DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        HFONT fontRegular = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE,
-                                       FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                                       CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                                       DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        HFONT fontCheck = CreateFontW(-13, 0, 0, 0, FW_BOLD, FALSE, FALSE,
-                                     FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                                     DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-
-        SetBkMode(memDC, TRANSPARENT);
-
-        HGDIOBJ oldFont = SelectObject(memDC, fontTitle);
-        SetTextColor(memDC, colors.title);
-        RECT tr = layout.titleRect;
-        DrawTextW(memDC, kAppName, -1, &tr,
-                  DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-
-        SelectObject(memDC, fontRegular);
-        int lineY = layout.titleRect.bottom + 2;
-        for (auto const &line : layout.telemetryLines) {
-            RECT lr = {16, lineY, layout.width - 16, lineY + 20};
-            SetTextColor(memDC, line.second);
-            DrawTextW(memDC, line.first.c_str(), -1, &lr,
-                      DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-            lineY += 20;
-        }
-
-        auto drawSep = [&](int sepY) {
-            HPEN sepPen = CreatePen(PS_SOLID, 1, colors.separator);
-            HGDIOBJ prevPen = SelectObject(memDC, sepPen);
-            MoveToEx(memDC, 10, sepY, nullptr);
-            LineTo(memDC, layout.width - 10, sepY);
-            SelectObject(memDC, prevPen);
-            DeleteObject(sepPen);
-        };
-
-        drawSep(layout.sep1Y);
-
-        auto drawItem = [&](int itemId, RECT const &itemRect,
-                            wchar_t const *label, bool hasCheck,
-                            bool isChecked) {
-            bool const isHover = (gHoverItem == itemId);
-            bool const isPress = (gPressedItem == itemId);
-
-            if (isHover || isPress) {
-                COLORREF itemBg = isPress ? colors.itemPressedBg :
-                                            colors.itemHoverBg;
-                HBRUSH itemBrush = CreateSolidBrush(itemBg);
-                HPEN itemPen = CreatePen(PS_NULL, 0, itemBg);
-                HGDIOBJ pPen = SelectObject(memDC, itemPen);
-                HGDIOBJ pBrush = SelectObject(memDC, itemBrush);
-                RoundRect(memDC, itemRect.left, itemRect.top, itemRect.right,
-                          itemRect.bottom, 6, 6);
-                SelectObject(memDC, pBrush);
-                SelectObject(memDC, pPen);
-                DeleteObject(itemPen);
-                DeleteObject(itemBrush);
-            }
-
-            if (hasCheck && isChecked) {
-                SelectObject(memDC, fontCheck);
-                SetTextColor(memDC, colors.checkColor);
-                RECT cr = {itemRect.left + 8, itemRect.top, itemRect.left + 24,
-                           itemRect.bottom};
-                DrawTextW(memDC, L"\x2713", -1, &cr,
-                          DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-            }
-
-            SelectObject(memDC, fontRegular);
-            SetTextColor(memDC, colors.textPrimary);
-            RECT lr = {itemRect.left + 26, itemRect.top, itemRect.right - 8,
-                       itemRect.bottom};
-            DrawTextW(memDC, label, -1, &lr,
-                      DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-        };
-
-        drawItem(kItemRefresh, layout.refreshRect,
-                 gIsRefreshing ? L"Refreshing..." : L"Refresh now", false,
-                 false);
-        drawItem(kItemAutostart, layout.autostartRect, L"Start with Windows",
-                 true, IsAutostartEnabled());
-
-        drawSep(layout.sep2Y);
-
-        drawItem(kItemExit, layout.exitRect, L"Exit", false, false);
-
-        SelectObject(memDC, oldFont);
-        DeleteObject(fontTitle);
-        DeleteObject(fontRegular);
-        DeleteObject(fontCheck);
-
-        BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
-        SelectObject(memDC, oldBmp);
-        DeleteObject(memBmp);
-        DeleteDC(memDC);
-
-        EndPaint(window, &ps);
-        return 0;
-    }
-
-    case WM_ACTIVATE:
-        if (LOWORD(wParam) == WA_INACTIVE) {
-            ShowWindow(window, SW_HIDE);
-        }
-        return 0;
-
-    case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE) {
-            ShowWindow(window, SW_HIDE);
-        }
-        return 0;
-
-    case WM_DESTROY:
-        gPopupWindow = nullptr;
-        return 0;
-
-    default:
-        break;
-    }
-    return DefWindowProcW(window, message, wParam, lParam);
+    SetForegroundWindow(gWindow);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN,
+                   cursor.x, cursor.y, 0, gWindow, nullptr);
+    Shell_NotifyIconW(NIM_SETFOCUS, &gNotifyIcon);
+    DestroyMenu(menu);
 }
 
 void RegisterForHidNotifications()
@@ -1061,10 +631,11 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam,
     switch (message) {
     case kTrayCallbackMessage: {
         UINT const event = LOWORD(lParam);
-        if (event == WM_CONTEXTMENU || event == WM_RBUTTONUP ||
-            event == NIN_SELECT || event == NIN_KEYSELECT ||
-            event == WM_LBUTTONUP) {
-            ShowModernPopup();
+        if (event == WM_CONTEXTMENU || event == WM_RBUTTONUP) {
+            ShowTrayMenu();
+        } else if (event == NIN_SELECT || event == NIN_KEYSELECT ||
+                   event == WM_LBUTTONUP) {
+            RequestRefresh();
         }
         return 0;
     }
@@ -1081,10 +652,10 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam,
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
-        case kItemRefresh:
+        case kMenuRefresh:
             RequestRefresh();
             return 0;
-        case kItemAutostart: {
+        case kMenuAutostart: {
             bool const enable = !IsAutostartEnabled();
             if (!SetAutostartEnabled(enable)) {
                 MessageBoxW(window,
@@ -1094,7 +665,7 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam,
             }
             return 0;
         }
-        case kItemExit:
+        case kMenuExit:
             DestroyWindow(window);
             return 0;
         default:
@@ -1175,18 +746,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     windowClass.lpszClassName = kWindowClass;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     if (!RegisterClassExW(&windowClass)) {
-        CloseHandle(gSingleInstance);
-        return 2;
-    }
-
-    WNDCLASSEXW popupClass{};
-    popupClass.cbSize = sizeof(popupClass);
-    popupClass.hInstance = instance;
-    popupClass.lpfnWndProc = PopupWindowProcedure;
-    popupClass.lpszClassName = kPopupWindowClass;
-    popupClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    popupClass.style = CS_DROPSHADOW | CS_HREDRAW | CS_VREDRAW;
-    if (!RegisterClassExW(&popupClass)) {
         CloseHandle(gSingleInstance);
         return 2;
     }
