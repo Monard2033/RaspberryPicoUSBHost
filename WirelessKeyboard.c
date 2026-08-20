@@ -1620,6 +1620,12 @@ static uint8_t battery_pct_for_mv(uint32_t batt_mv)
 
 static void battery_update_led(uint32_t now)
 {
+    static uint32_t last_led_update_ms = 0;
+    if ((uint32_t)(now - last_led_update_ms) < 20u) {
+        return;
+    }
+    last_led_update_ms = now;
+
     if (radio_sleep_indicator_active) {
         uint32_t const elapsed = now - radio_sleep_indicator_started_ms;
         uint32_t const duration = RADIO_SLEEP_BLINK_COUNT * 2u *
@@ -1767,14 +1773,7 @@ static void battery_telemetry_task(uint32_t now)
         battery_tx_pending = true;
     }
 
-    if (!battery_tx_pending) {
-        return;
-    }
-
-    if (radio_power_state != RADIO_AWAKE) {
-        if (!radio_wake_requested) {
-            radio_wake_requested = true;
-        }
+    if (!battery_tx_pending || radio_power_state != RADIO_AWAKE) {
         return;
     }
 
