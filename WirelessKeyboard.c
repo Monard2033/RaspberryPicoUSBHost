@@ -1581,6 +1581,8 @@ static enum battery_led_state battery_led_state = BATT_LED_BOOT;
 static uint32_t battery_state_started_ms;
 static uint32_t battery_filtered_mv;
 static uint32_t battery_previous_sample_mv;
+static uint32_t battery_baseline_mv;
+static int8_t   battery_trend_counter;
 static uint8_t battery_pct;
 static bool battery_charge_detected_during_boot;
 
@@ -1664,6 +1666,8 @@ static void battery_start_display(void)
 
     battery_filtered_mv = initial_mv;
     battery_previous_sample_mv = initial_mv;
+    battery_baseline_mv = initial_mv;
+    battery_trend_counter = 0;
     battery_pct = battery_pct_for_mv(initial_mv);
     battery_state_started_ms = board_millis();
     battery_last_check_ms = battery_state_started_ms;
@@ -1685,27 +1689,52 @@ static void battery_sample_task(uint32_t now)
     battery_last_check_ms = now;
 
     uint32_t const sample_mv = battery_read_mv();
-    int32_t const delta_mv = (int32_t)sample_mv -
-                             (int32_t)battery_previous_sample_mv;
-    battery_previous_sample_mv = sample_mv;
     battery_filtered_mv = (battery_filtered_mv * 3 + sample_mv) / 4;
     battery_pct = battery_pct_for_mv(battery_filtered_mv);
 
-    /* Detect plugged-in charging step or unplug step */
-    if (delta_mv >= (int32_t)BATT_EVENT_DELTA_MV ||
-        ((battery_led_state == BATT_LED_CHARGING || battery_led_state == BATT_LED_FULL) && sample_mv >= 3920)) {
+    if (battery_baseline_mv == 0) {
+        battery_baseline_mv = battery_filtered_mv;
+    }
+
+    int32_t const diff_from_baseline = (int32_t)battery_filtered_mv - (int32_t)battery_baseline_mv;
+
+    /* If voltage is rising above baseline by >= 8mV, increment charging trend counter */
+    if (diff_from_baseline >= 8) {
+        if (battery_trend_counter < 10) battery_trend_counter += 2;
+        /* Pull baseline up smoothly as charging voltage climbs */
+        battery_baseline_mv = (battery_baseline_mv * 7 + battery_filtered_mv) / 8;
+    } else if (diff_from_baseline <= -25) {
+        /* Voltage dropped below baseline (unplugged or discharge) */
+        if (battery_trend_counter > -10) battery_trend_counter -= 3;
+        battery_baseline_mv = (battery_baseline_mv * 3 + battery_filtered_mv) / 4;
+    } else {
+        /* Minor drift: slowly decay trend towards neutral */
+        if (battery_trend_counter > 0) battery_trend_counter--;
+        else if (battery_trend_counter < 0) battery_trend_counter++;
+    }
+
+    /* Charging detection:
+     * 1. Positive trend counter (voltage actively rising over time)
+     * 2. OR high plateau voltage (>= 3950 mV and stable / not dropping)
+     * 3. OR direct full charge (>= 4180 mV)
+     */
+    bool const is_charging_or_full = (battery_trend_counter > 0) ||
+                                     (battery_filtered_mv >= 3950 && diff_from_baseline >= -10) ||
+                                     (battery_filtered_mv >= 4180);
+
+    if (is_charging_or_full) {
         battery_material_step = true;
         if (battery_led_state == BATT_LED_BOOT) {
             battery_charge_detected_during_boot = true;
         } else {
-            battery_led_state = (battery_pct >= 100 || sample_mv >= 4180) ?
+            battery_led_state = (battery_pct >= 100 || battery_filtered_mv >= 4180) ?
                 BATT_LED_FULL : BATT_LED_CHARGING;
             battery_state_started_ms = now;
         }
-    } else if (delta_mv <= -(int32_t)BATT_EVENT_DELTA_MV) {
-        battery_material_step = true;
-        battery_charge_detected_during_boot = false;
-        if (battery_led_state != BATT_LED_BOOT) {
+    } else {
+        /* Transition from charging to unplugged */
+        if (battery_led_state == BATT_LED_CHARGING || battery_led_state == BATT_LED_FULL) {
+            battery_material_step = true;
             battery_led_state = BATT_LED_UNPLUG_SHOW;
             battery_state_started_ms = now;
         }
