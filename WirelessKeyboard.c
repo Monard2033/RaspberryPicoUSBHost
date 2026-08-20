@@ -116,7 +116,7 @@
 #define BATT_EVENT_SHOW_MS 5000
 #define BATT_PULSE_WINDOW_MS 2000
 #define BATT_PULSE_PERIOD_MS 1000
-#define BATT_PIN_EVENT_DELTA_MV 50
+#define BATT_PIN_EVENT_DELTA_MV 15
 #define BATT_EVENT_DELTA_MV (BATT_PIN_EVENT_DELTA_MV * BATT_DIVIDER_RATIO)
 
 // --- RGB LED, driven locally by RP2040 PWM, 3 consecutive free pins -----
@@ -341,6 +341,7 @@ static volatile uint32_t keyboard_led_retry_after_ms;
 static bool              battery_tx_pending;
 static bool              battery_material_step;
 static uint32_t          battery_last_tx_ms;
+static uint32_t          battery_last_check_ms;
 static uint8_t           battery_sequence;
 
 static uint32_t total_hid_reports_received = 0;
@@ -571,6 +572,12 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
     if (ack.type == LINK_ACK_TYPE_DFU) {
         dfu_process_command(&ack);
         return;
+    }
+
+    if (ack.type == LINK_ACK_TYPE_LOCK_STATE && (ack.data[1] & 0x02u)) {
+        battery_last_check_ms = 0;
+        battery_tx_pending = true;
+        battery_last_tx_ms = 0;
     }
 
     if (ack.type != LINK_ACK_TYPE_LOCK_STATE ||
@@ -1572,7 +1579,6 @@ enum battery_led_state {
 
 static enum battery_led_state battery_led_state = BATT_LED_BOOT;
 static uint32_t battery_state_started_ms;
-static uint32_t battery_last_check_ms;
 static uint32_t battery_filtered_mv;
 static uint32_t battery_previous_sample_mv;
 static uint8_t battery_pct;
@@ -1685,15 +1691,14 @@ static void battery_sample_task(uint32_t now)
     battery_filtered_mv = (battery_filtered_mv * 3 + sample_mv) / 4;
     battery_pct = battery_pct_for_mv(battery_filtered_mv);
 
-    /* Detect only a large step between consecutive one-second ADC samples.
-     * 50 mV at GP28 corresponds to 150 mV at the battery through the x3
-     * divider. Stable voltage is monitored silently and never latches an LED. */
-    if (delta_mv >= (int32_t)BATT_EVENT_DELTA_MV) {
+    /* Detect plugged-in charging step or unplug step */
+    if (delta_mv >= (int32_t)BATT_EVENT_DELTA_MV ||
+        ((battery_led_state == BATT_LED_CHARGING || battery_led_state == BATT_LED_FULL) && sample_mv >= 3920)) {
         battery_material_step = true;
         if (battery_led_state == BATT_LED_BOOT) {
             battery_charge_detected_during_boot = true;
         } else {
-            battery_led_state = battery_pct >= 100 ?
+            battery_led_state = (battery_pct >= 100 || sample_mv >= 4180) ?
                 BATT_LED_FULL : BATT_LED_CHARGING;
             battery_state_started_ms = now;
         }
@@ -1772,7 +1777,7 @@ static void battery_task(void)
             (battery_pct >= 100 ? BATT_LED_FULL : BATT_LED_CHARGING) :
             BATT_LED_IDLE;
         battery_state_started_ms = now;
-    } else if (battery_led_state != BATT_LED_IDLE &&
+    } else if (battery_led_state == BATT_LED_UNPLUG_SHOW &&
                now - battery_state_started_ms >= BATT_EVENT_SHOW_MS) {
         battery_led_state = BATT_LED_IDLE;
         battery_state_started_ms = now;
