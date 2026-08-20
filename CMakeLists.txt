@@ -15,6 +15,8 @@ endif()
 set(PICO_BOARD pico CACHE STRING "Board type")
 option(WIRELESS_KEYBOARD_UART_DIAGNOSTIC
        "Enable bounded DAPLink UART diagnostics in WirelessKeyboard" OFF)
+set(POWER_SAVING_DIAGNOSTIC_IDLE_MS "" CACHE STRING
+    "Override radio inactivity timeout for a diagnostic build only")
 
 cmake_minimum_required(VERSION 3.13)
 
@@ -48,6 +50,12 @@ target_compile_definitions(WirelessKeyboard PRIVATE
     CFG_TUD_ENABLED=0
     PIO_USB_USE_TINYUSB
 )
+
+if(POWER_SAVING_DIAGNOSTIC_IDLE_MS)
+    target_compile_definitions(WirelessKeyboard PRIVATE
+        RADIO_INACTIVITY_MS=${POWER_SAVING_DIAGNOSTIC_IDLE_MS}
+    )
+endif()
 
 if(WIRELESS_KEYBOARD_UART_DIAGNOSTIC)
     target_compile_definitions(WirelessKeyboard PRIVATE

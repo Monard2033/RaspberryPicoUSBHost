@@ -65,7 +65,9 @@
 #define DFU_STATUS_ERR_CRC      0x04u
 #define DFU_STATUS_ERR_FLASH    0x05u
 #define DFU_STATUS_SUCCESS      0x06u
+#ifndef RADIO_INACTIVITY_MS
 #define RADIO_INACTIVITY_MS (5u * 60u * 1000u)
+#endif
 #define RADIO_OFF_SETTLE_MS 10u
 #define RADIO_BOOT_WAIT_MS  75u
 #define RADIO_WAKE_QUEUE_DEPTH 128u
@@ -233,6 +235,7 @@ static bool previous_consumer_valid;
 
 enum radio_power_state {
     RADIO_AWAKE,
+    RADIO_POWERING_OFF,
     RADIO_SYSTEM_OFF,
     RADIO_WAKING,
 };
@@ -684,7 +687,8 @@ static void spi_service_task(void)
     struct pending_radio_input pending;
 
     if (spi_retry_pending) {
-        if (radio_power_state != RADIO_AWAKE ||
+        if ((radio_power_state != RADIO_AWAKE &&
+             radio_power_state != RADIO_POWERING_OFF) ||
             (int32_t)(time_us_32() - spi_retry_after_us) < 0) {
             return;
         }
@@ -695,7 +699,8 @@ static void spi_service_task(void)
         return;
     }
 
-    if (radio_power_state != RADIO_AWAKE) return;
+    if (radio_power_state != RADIO_AWAKE &&
+        radio_power_state != RADIO_POWERING_OFF) return;
 
     /* EasyDMA is now rearmed in the Transmitter SPIS IRQ. Keep a bounded
      * inter-frame gap only for queued bursts; normal 1 kHz input already has
@@ -806,7 +811,8 @@ static bool hid_report_changed(uint8_t instance,
 static void radio_note_activity(void)
 {
     radio_last_activity_ms = board_millis();
-    if (radio_power_state == RADIO_SYSTEM_OFF) {
+    if (radio_power_state == RADIO_SYSTEM_OFF ||
+        radio_power_state == RADIO_POWERING_OFF) {
         radio_wake_requested = true;
     }
 }
@@ -826,7 +832,7 @@ static void radio_start_wake(void)
     radio_transition_after_ms = board_millis() + RADIO_BOOT_WAIT_MS;
 }
 
-static void __unused radio_power_task(void)
+static void radio_power_task(void)
 {
     uint32_t const now = board_millis();
 
@@ -835,6 +841,25 @@ static void __unused radio_power_task(void)
             (int32_t)(now - radio_transition_after_ms) >= 0) {
             radio_start_wake();
         }
+        return;
+    }
+
+    if (radio_power_state == RADIO_POWERING_OFF) {
+        if (spi_retry_pending || spi_input_queue_count != 0) {
+            return;
+        }
+
+        /* The control frame and its SPI safety copy have both completed.
+         * Battery is latest-state-only and must never postpone System OFF. */
+        battery_spi_pending = false;
+        battery_tx_pending = true;
+        radio_sleep_indicator_active = true;
+        radio_sleep_indicator_started_ms = now;
+        radio_power_state = RADIO_SYSTEM_OFF;
+        radio_transition_after_ms = now + RADIO_OFF_SETTLE_MS;
+#if PERIODIC_DEBUG
+        printf("[POWER] nRF52840 System OFF control completed\n");
+#endif
         return;
     }
 
@@ -870,20 +895,25 @@ static void __unused radio_power_task(void)
         !keyboard_report_is_released() ||
         (previous_consumer_valid && previous_consumer_usage != 0) ||
         keyboard_led_transfer_active || spi_retry_pending ||
-        spi_input_queue_count != 0) {
+        spi_input_queue_count != 0 || radio_wake_queue_count != 0) {
         return;
     }
 
-    spi_send_control_command(LINK_CONTROL_SYSTEM_OFF);
-    radio_sleep_indicator_active = true;
-    radio_sleep_indicator_started_ms = now;
-    radio_power_state = RADIO_SYSTEM_OFF;
-    radio_wake_queue_head = 0;
-    radio_wake_queue_count = 0;
+    /* Drop/retain only the latest low-priority telemetry; it will be sent
+     * after a real keyboard/Consumer wake, never as a wake source itself. */
+    battery_spi_pending = false;
+    battery_tx_pending = true;
+    uint8_t const command[KBD_REPORT_LEN] = {
+        LINK_CONTROL_SYSTEM_OFF, 0, 0, 0, 0, 0, 0, 0
+    };
+    if (!spi_queue_input(LINK_TYPE_CONTROL, command)) {
+        return;
+    }
+
+    radio_power_state = RADIO_POWERING_OFF;
     radio_wake_requested = false;
-    radio_transition_after_ms = now + RADIO_OFF_SETTLE_MS;
 #if PERIODIC_DEBUG
-    printf("[POWER] nRF52840 System OFF requested after 5 minutes idle\n");
+    printf("[POWER] nRF52840 System OFF queued after idle timeout\n");
 #endif
 }
 
@@ -1177,6 +1207,7 @@ static void forward_consumer_usage(uint16_t usage)
     uint8_t data[KBD_REPORT_LEN] = {
         (uint8_t)usage, (uint8_t)(usage >> 8), 0, 0, 0, 0, 0, 0
     };
+    radio_note_activity();
     if (!spi_queue_input(LINK_TYPE_CONSUMER, data)) return;
     previous_consumer_usage = usage;
     previous_consumer_valid = true;
@@ -1484,6 +1515,7 @@ static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN])
         return;
     }
 
+    radio_note_activity();
     if (!spi_send_keyboard_transition(output)) return;
     memcpy(previous_output_report, output, KBD_REPORT_LEN);
     previous_output_valid = true;
@@ -2398,12 +2430,10 @@ static void usb_host_event_task(void)
         }
 
         case USB_HOST_EVENT_KEYBOARD_REPORT:
-            radio_note_activity();
             forward_keyboard_report(event.data);
             break;
 
         case USB_HOST_EVENT_CONSUMER_REPORT:
-            radio_note_activity();
             forward_consumer_usage((uint16_t)(event.data[0] |
                                               (event.data[1] << 8)));
             break;
@@ -2423,6 +2453,7 @@ static void worker_core1_main(void)
         usb_host_event_task();
         consumer_task();
         spi_service_task();
+        radio_power_task();
         battery_task();
 #if SPI_LINK_TEST_MODE
         spi_link_test_task();
