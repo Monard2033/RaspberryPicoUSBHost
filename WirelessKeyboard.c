@@ -462,6 +462,7 @@ static void dfu_send_status(uint8_t status, uint8_t progress, uint16_t offset_di
 
 static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
 {
+    uint8_t ram_page[FLASH_PAGE_SIZE]; /* Must reside in SRAM */
     uint32_t const aligned_size = (size + FLASH_SECTOR_SIZE - 1u) & ~(FLASH_SECTOR_SIZE - 1u);
     uint32_t const ints = save_and_disable_interrupts();
     (void)ints;
@@ -469,9 +470,14 @@ static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
     /* 1. Erase Slot A (active application starting at offset 0) */
     flash_range_erase(0, aligned_size);
 
-    /* 2. Copy verified new firmware from Staging Slot to Slot A */
-    const uint8_t *src = (const uint8_t *)(XIP_BASE + FLASH_STAGING_OFFSET);
-    flash_range_program(0, src, aligned_size);
+    /* 2. Copy page-by-page from Staging Slot into SRAM, then program into Slot A */
+    for (uint32_t offset = 0; offset < aligned_size; offset += FLASH_PAGE_SIZE) {
+        const uint8_t *src_xip = (const uint8_t *)(XIP_BASE + FLASH_STAGING_OFFSET + offset);
+        for (uint16_t i = 0; i < FLASH_PAGE_SIZE; ++i) {
+            ram_page[i] = src_xip[i];
+        }
+        flash_range_program(offset, ram_page, FLASH_PAGE_SIZE);
+    }
 
     /* 3. Reboot RP2040 into the newly installed firmware */
     watchdog_reboot(0, 0, 0);
