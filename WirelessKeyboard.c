@@ -121,7 +121,7 @@
 #define BATT_BOOT_SHOW_MS  5000
 #define BATT_EVENT_SHOW_MS 5000
 #define BATT_PULSE_WINDOW_MS 2000
-#define BATT_PULSE_PERIOD_MS 1000
+#define BATT_PULSE_PERIOD_MS 5000
 #define BATT_LED_UPDATE_MS  20
 #define BATT_PIN_EVENT_DELTA_MV 15
 #define BATT_EVENT_DELTA_MV (BATT_PIN_EVENT_DELTA_MV * BATT_DIVIDER_RATIO)
@@ -1625,7 +1625,6 @@ static uint32_t battery_previous_sample_mv;
 static uint32_t battery_baseline_mv;
 static int8_t   battery_trend_counter;
 static uint8_t battery_pct;
-static bool battery_charge_detected_during_boot;
 static bool battery_sample_valid;
 static uint32_t battery_invalid_sample_count;
 
@@ -1795,6 +1794,15 @@ static void battery_sample_task(uint32_t now)
     battery_previous_sample_mv = previous_filtered_mv;
     battery_pct = battery_pct_for_mv(battery_filtered_mv);
 
+    /* The GP28 capacitor charges from zero after power-up. During Boot,
+     * update voltage/percentage but continuously rebuild the baseline and
+     * suppress slope detection, so RC settling cannot look like Charging. */
+    if (battery_led_state == BATT_LED_BOOT) {
+        battery_baseline_mv = battery_filtered_mv;
+        battery_trend_counter = 0;
+        return;
+    }
+
     if (battery_baseline_mv == 0) {
         battery_baseline_mv = battery_filtered_mv;
     }
@@ -1828,11 +1836,6 @@ static void battery_sample_task(uint32_t now)
         (battery_trend_counter >= BATT_CHARGE_TREND_ENTER ||
          (battery_led_state == BATT_LED_CHARGING &&
           battery_trend_counter > 0));
-
-    if (battery_led_state == BATT_LED_BOOT) {
-        battery_charge_detected_during_boot = is_full || is_charging;
-        return;
-    }
 
     if (is_full) {
         battery_set_led_state(BATT_LED_FULL, now);
@@ -1922,9 +1925,9 @@ static void battery_task(void)
 
     if (battery_led_state == BATT_LED_BOOT &&
         now - battery_state_started_ms >= BATT_BOOT_SHOW_MS) {
-        battery_led_state = battery_charge_detected_during_boot ?
-            (battery_pct >= 100 ? BATT_LED_FULL : BATT_LED_CHARGING) :
-            BATT_LED_IDLE;
+        battery_led_state = battery_sample_valid &&
+                            battery_filtered_mv >= BATT_MAX_MV ?
+                            BATT_LED_FULL : BATT_LED_IDLE;
         battery_state_started_ms = now;
     } else if (battery_led_state == BATT_LED_UNPLUG_SHOW &&
                now - battery_state_started_ms >= BATT_EVENT_SHOW_MS) {
