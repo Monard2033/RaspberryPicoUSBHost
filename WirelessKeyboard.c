@@ -1161,13 +1161,8 @@ static uint16_t decode_consumer_usage(struct hid_instance_state const *state,
     return 0;
 }
 
-static uint32_t consumer_auto_release_ms = 0;
-
 static void forward_consumer_usage(uint16_t usage)
 {
-    if (usage != 0) {
-        consumer_auto_release_ms = board_millis() + 80u;
-    }
     if (previous_consumer_valid && usage == previous_consumer_usage) return;
     uint8_t data[KBD_REPORT_LEN] = {
         (uint8_t)usage, (uint8_t)(usage >> 8), 0, 0, 0, 0, 0, 0
@@ -1182,11 +1177,6 @@ static void forward_consumer_usage(uint16_t usage)
 
 static void consumer_task(void)
 {
-    if (previous_consumer_valid && previous_consumer_usage != 0) {
-        if ((int32_t)(board_millis() - consumer_auto_release_ms) >= 0) {
-            forward_consumer_usage(0);
-        }
-    }
 }
 
 static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN]);
