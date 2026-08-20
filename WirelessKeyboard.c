@@ -109,13 +109,17 @@
 #define PIN_BATT_ADC      28   // GP28 = ADC2. Battery divider tap goes here.
 #define BATT_ADC_INPUT    2    // adc_select_input() channel matching GP28
 #define BATT_DIVIDER_RATIO 3   // Vbat--200k--node--100k--GND: node=Vbat/3
-#define BATT_MIN_MV        3430  // 1S empty: 3.43V
-#define BATT_MAX_MV        4200  // 1S full:  4.20V
+#define BATT_ADC_VREF_MV   3260  // Measured ADC AVDD/VREF on this board.
+#define BATT_VALID_MIN_MV  2800  // Reject impossible/corrupt 1S telemetry.
+#define BATT_VALID_MAX_MV  4300
+#define BATT_MIN_MV        3050  // User-selected 1S empty reference.
+#define BATT_MAX_MV        4180  // Measured full-charge reference.
 #define BATT_CHECK_MS      1000
 #define BATT_BOOT_SHOW_MS  5000
 #define BATT_EVENT_SHOW_MS 5000
 #define BATT_PULSE_WINDOW_MS 2000
 #define BATT_PULSE_PERIOD_MS 1000
+#define BATT_LED_UPDATE_MS  20
 #define BATT_PIN_EVENT_DELTA_MV 15
 #define BATT_EVENT_DELTA_MV (BATT_PIN_EVENT_DELTA_MV * BATT_DIVIDER_RATIO)
 
@@ -725,7 +729,8 @@ static void spi_service_task(void)
      * the same sequence and is removed by the Transmitter before ESB, so the
      * Receiver still sees exactly one ordered keyboard/Consumer transition. */
     if (pending.type == LINK_TYPE_KEYBOARD ||
-        pending.type == LINK_TYPE_CONSUMER) {
+        pending.type == LINK_TYPE_CONSUMER ||
+        pending.type == LINK_TYPE_BATTERY) {
         spi_retry_after_us = time_us_32() + SPI_REARM_GUARD_US;
         spi_retry_pending = true;
     } else {
@@ -1547,6 +1552,15 @@ static void led_apply(struct rgb_color color)
     pwm_set_chan_level(slice_b, chan_b, led_pwm_level(color.b));
 }
 
+static struct rgb_color led_scale(struct rgb_color color, uint8_t level)
+{
+    return (struct rgb_color) {
+        .r = (uint8_t)(((uint16_t)color.r * level) / 255u),
+        .g = (uint8_t)(((uint16_t)color.g * level) / 255u),
+        .b = (uint8_t)(((uint16_t)color.b * level) / 255u),
+    };
+}
+
 static void led_off(void)
 {
     led_apply((struct rgb_color) { 0, 0, 0 });
@@ -1580,6 +1594,8 @@ static uint32_t battery_baseline_mv;
 static int8_t   battery_trend_counter;
 static uint8_t battery_pct;
 static bool battery_charge_detected_during_boot;
+static bool battery_sample_valid;
+static uint32_t battery_invalid_sample_count;
 
 static void battery_adc_init(void)
 {
@@ -1596,13 +1612,22 @@ static uint32_t battery_read_mv(void)
     adc_select_input(BATT_ADC_INPUT);
     uint32_t raw_sum = 0;
 
+    /* Discard the first conversion after selecting the high-impedance divider
+     * channel, then average sixteen conversions without blocking sleeps. */
+    (void)adc_read();
     for (uint8_t i = 0; i < 16; ++i) {
         raw_sum += adc_read();
     }
 
     uint32_t const raw_average = raw_sum / 16;
-    uint32_t const pin_mv = raw_average * 3300 / 4095;
-    return pin_mv * BATT_DIVIDER_RATIO;
+    uint32_t const pin_mv = raw_average * BATT_ADC_VREF_MV / 4095u;
+    uint32_t const battery_mv = pin_mv * BATT_DIVIDER_RATIO;
+    if (battery_mv < BATT_VALID_MIN_MV ||
+        battery_mv > BATT_VALID_MAX_MV) {
+        battery_invalid_sample_count++;
+        return 0;
+    }
+    return battery_mv;
 }
 
 static uint8_t battery_pct_for_mv(uint32_t batt_mv)
@@ -1613,10 +1638,18 @@ static uint8_t battery_pct_for_mv(uint32_t batt_mv)
                      (BATT_MAX_MV - BATT_MIN_MV));
 }
 
+static bool battery_visual_update_deferred(void)
+{
+    return spi_retry_pending || spi_input_queue_count != 0 ||
+           radio_wake_queue_count != 0 ||
+           usb_host_event_head != usb_host_event_tail;
+}
+
 static void battery_update_led(uint32_t now)
 {
     static uint32_t last_led_update_ms = 0;
-    if ((uint32_t)(now - last_led_update_ms) < 20u) {
+    if (battery_visual_update_deferred() ||
+        (uint32_t)(now - last_led_update_ms) < BATT_LED_UPDATE_MS) {
         return;
     }
     last_led_update_ms = now;
@@ -1637,6 +1670,11 @@ static void battery_update_led(uint32_t now)
         radio_sleep_indicator_active = false;
     }
 
+    if (!battery_sample_valid) {
+        led_off();
+        return;
+    }
+
     struct rgb_color const color = battery_color_for_pct(battery_pct);
 
     switch (battery_led_state) {
@@ -1646,12 +1684,17 @@ static void battery_update_led(uint32_t now)
         led_apply(color);
         break;
     case BATT_LED_CHARGING:
-        /* Exactly two ON/OFF cycles in every two-second animation window. */
-        if (((now - battery_state_started_ms) % BATT_PULSE_WINDOW_MS) %
-             BATT_PULSE_PERIOD_MS < (BATT_PULSE_PERIOD_MS / 2)) {
-            led_apply(color);
-        } else {
-            led_off();
+        /* Hardware-PWM breathing: one 0->100->0 pulse per second, or two
+         * smooth pulses in the existing two-second animation window. */
+        {
+            uint32_t const phase = (now - battery_state_started_ms) %
+                                   BATT_PULSE_PERIOD_MS;
+            uint32_t const half_period = BATT_PULSE_PERIOD_MS / 2u;
+            uint32_t const ramp = phase < half_period ?
+                                  phase : (BATT_PULSE_PERIOD_MS - phase);
+            uint8_t const brightness = (uint8_t)(
+                (ramp * LED_PWM_WRAP) / half_period);
+            led_apply(led_scale(color, brightness));
         }
         break;
     case BATT_LED_IDLE:
@@ -1669,7 +1712,8 @@ static void battery_start_display(void)
     battery_previous_sample_mv = initial_mv;
     battery_baseline_mv = initial_mv;
     battery_trend_counter = 0;
-    battery_pct = battery_pct_for_mv(initial_mv);
+    battery_sample_valid = initial_mv != 0;
+    battery_pct = battery_sample_valid ? battery_pct_for_mv(initial_mv) : 0;
     battery_state_started_ms = board_millis();
     battery_last_check_ms = battery_state_started_ms;
     battery_led_state = BATT_LED_BOOT;
@@ -1690,6 +1734,19 @@ static void battery_sample_task(uint32_t now)
     battery_last_check_ms = now;
 
     uint32_t const sample_mv = battery_read_mv();
+    if (sample_mv == 0) {
+        return;
+    }
+    if (!battery_sample_valid) {
+        battery_filtered_mv = sample_mv;
+        battery_previous_sample_mv = sample_mv;
+        battery_baseline_mv = sample_mv;
+        battery_trend_counter = 0;
+        battery_pct = battery_pct_for_mv(sample_mv);
+        battery_sample_valid = true;
+        battery_material_step = true;
+        return;
+    }
     battery_filtered_mv = (battery_filtered_mv * 3 + sample_mv) / 4;
     battery_pct = battery_pct_for_mv(battery_filtered_mv);
 
@@ -1761,14 +1818,13 @@ static uint8_t battery_link_state(void)
 
 static void battery_telemetry_task(uint32_t now)
 {
-    uint32_t const period_ms = (battery_led_state == BATT_LED_CHARGING ||
-                                battery_led_state == BATT_LED_FULL) ? 5000u : BATTERY_TELEMETRY_PERIOD_MS;
-
-    if ((uint32_t)(now - battery_last_tx_ms) >= period_ms) {
+    if ((uint32_t)(now - battery_last_tx_ms) >=
+        BATTERY_TELEMETRY_PERIOD_MS) {
         battery_tx_pending = true;
     }
 
-    if (!battery_tx_pending || radio_power_state != RADIO_AWAKE) {
+    if (!battery_sample_valid || !battery_tx_pending ||
+        radio_power_state != RADIO_AWAKE) {
         return;
     }
 
@@ -2340,8 +2396,8 @@ static void worker_core1_main(void)
     while (true) {
         usb_host_event_task();
         consumer_task();
-        battery_task();
         spi_service_task();
+        battery_task();
 #if SPI_LINK_TEST_MODE
         spi_link_test_task();
 #endif
