@@ -109,11 +109,14 @@
 // --- Battery (read locally, RP2040 is the sole "brain" for this) --------
 #define PIN_BATT_ADC      28   // GP28 = ADC2. Battery divider tap goes here.
 #define BATT_ADC_INPUT    2    // adc_select_input() channel matching GP28
-#define BATT_ADC_CAL_FULL_SCALE_MV 3077u
+#define BATT_ADC_CAL_FULL_SCALE_MV 3300u
 #define BATT_DIVIDER_NUMERATOR     3015u
 #define BATT_DIVIDER_DENOMINATOR   1000u
 #define BATT_MIN_MV        3430  // 1S empty: 3.43V
-#define BATT_MAX_MV        4180  // 1S gauge full; chemistry limit remains 4.20V
+#define BATT_MAX_MV        4110  // 1S gauge full under the keyboard's normal load
+#define BATT_FULL_EXIT_MV  4080  // hysteresis: avoid Full/Idle flicker
+#define BATT_TREND_STEP_MV 2
+#define BATT_CHARGE_TREND_COUNT 6
 #define BATT_CHECK_MS      1000
 #define BATT_BOOT_SHOW_MS  5000
 #define BATT_EVENT_SHOW_MS 5000
@@ -1577,7 +1580,6 @@ static enum battery_led_state battery_led_state = BATT_LED_BOOT;
 static uint32_t battery_state_started_ms;
 static uint32_t battery_filtered_mv;
 static uint32_t battery_previous_sample_mv;
-static uint32_t battery_baseline_mv;
 static int8_t   battery_trend_counter;
 static uint8_t battery_pct;
 static bool battery_charge_detected_during_boot;
@@ -1595,21 +1597,16 @@ static void battery_adc_init(void)
 static uint32_t battery_read_mv(void)
 {
     adc_select_input(BATT_ADC_INPUT);
-    uint32_t raw_sum = 0;
-
-    for (uint8_t i = 0; i < 16; ++i) {
-        raw_sum += adc_read();
-    }
-
-    uint32_t const raw_average = raw_sum / 16;
+    uint32_t const raw_sample = adc_read();
 
     /* Hardware calibration measured on this board/battery:
-     *   battery = 4.185 V, GP28 = 1.388 V, raw ~= 1848
-     *   effective ADC full scale = 3.077 V
+     *   battery = 4.185 V, GP28 = 1.388 V
      *   divider multiplier = 4.185 / 1.388 = 3.01513
-     * Keep the entire conversion in one 64-bit expression so an intermediate
-     * rounded pin voltage cannot add several millivolts at the battery. */
-    uint64_t const numerator = (uint64_t)raw_average *
+     * The 200k/100k divider has ~66.7k source impedance. Do one conversion
+     * per one-second sample; the existing IIR filter supplies smoothing
+     * without 16 back-to-back ADC acquisitions loading the tap downward.
+     * Keep conversion in one 64-bit expression to avoid intermediate loss. */
+    uint64_t const numerator = (uint64_t)raw_sample *
         BATT_ADC_CAL_FULL_SCALE_MV * BATT_DIVIDER_NUMERATOR;
     uint32_t const denominator = 4095u * BATT_DIVIDER_DENOMINATOR;
     return (uint32_t)((numerator + denominator / 2u) / denominator);
@@ -1677,7 +1674,6 @@ static void battery_start_display(void)
 
     battery_filtered_mv = initial_mv;
     battery_previous_sample_mv = initial_mv;
-    battery_baseline_mv = initial_mv;
     battery_trend_counter = 0;
     battery_pct = battery_pct_for_mv(initial_mv);
     battery_state_started_ms = board_millis();
@@ -1703,48 +1699,43 @@ static void battery_sample_task(uint32_t now)
     battery_filtered_mv = (battery_filtered_mv * 3 + sample_mv) / 4;
     battery_pct = battery_pct_for_mv(battery_filtered_mv);
 
-    if (battery_baseline_mv == 0) {
-        battery_baseline_mv = battery_filtered_mv;
-    }
+    int32_t const sample_delta = (int32_t)battery_filtered_mv -
+                                 (int32_t)battery_previous_sample_mv;
+    battery_previous_sample_mv = battery_filtered_mv;
 
-    int32_t const diff_from_baseline = (int32_t)battery_filtered_mv - (int32_t)battery_baseline_mv;
-
-    /* If voltage is rising above baseline by >= 8mV, increment charging trend counter */
-    if (diff_from_baseline >= 8) {
-        if (battery_trend_counter < 10) battery_trend_counter += 2;
-        /* Pull baseline up smoothly as charging voltage climbs */
-        battery_baseline_mv = (battery_baseline_mv * 7 + battery_filtered_mv) / 8;
-    } else if (diff_from_baseline <= -25) {
-        /* Voltage dropped below baseline (unplugged or discharge) */
-        if (battery_trend_counter > -10) battery_trend_counter -= 3;
-        battery_baseline_mv = (battery_baseline_mv * 3 + battery_filtered_mv) / 4;
+    /* Charging is a sustained positive slope, never merely a high voltage.
+     * This rejects ADC noise and a resting/full battery with no charger. */
+    if (sample_delta >= BATT_TREND_STEP_MV) {
+        if (battery_trend_counter < 10) battery_trend_counter++;
+    } else if (sample_delta <= -BATT_TREND_STEP_MV) {
+        if (battery_trend_counter > -10) battery_trend_counter -= 2;
     } else {
-        /* Minor drift: slowly decay trend towards neutral */
         if (battery_trend_counter > 0) battery_trend_counter--;
         else if (battery_trend_counter < 0) battery_trend_counter++;
     }
 
-    /* Charging detection for 1S (3.7V Li-ion parallel):
-     * 1. Positive trend counter (voltage actively rising over time, e.g. 3.972V -> 3.992V -> 3.997V)
-     * 2. OR high plateau voltage (>= 3950 mV and stable / not dropping)
-     * 3. OR direct full charge (>= 4180 mV)
-     */
-    bool const is_charging_or_full = (battery_trend_counter > 0) ||
-                                     (battery_filtered_mv >= 3950 && diff_from_baseline >= -10) ||
-                                     (battery_filtered_mv >= 4180);
+    bool const is_full = battery_filtered_mv >= BATT_MAX_MV ||
+        (battery_led_state == BATT_LED_FULL &&
+         battery_filtered_mv >= BATT_FULL_EXIT_MV);
+    bool const is_charging = !is_full &&
+        battery_trend_counter >= BATT_CHARGE_TREND_COUNT;
 
-    if (is_charging_or_full) {
+    if (is_full || is_charging) {
         battery_material_step = true;
         if (battery_led_state == BATT_LED_BOOT) {
             battery_charge_detected_during_boot = true;
         } else {
-            battery_led_state = (battery_pct >= 100 || battery_filtered_mv >= 4180) ?
+            enum battery_led_state const next_state = is_full ?
                 BATT_LED_FULL : BATT_LED_CHARGING;
-            battery_state_started_ms = now;
+            if (battery_led_state != next_state) {
+                battery_led_state = next_state;
+                battery_state_started_ms = now;
+            }
         }
     } else {
-        /* Transition from charging to unplugged */
-        if (battery_led_state == BATT_LED_CHARGING || battery_led_state == BATT_LED_FULL) {
+        if ((battery_led_state == BATT_LED_CHARGING ||
+             battery_led_state == BATT_LED_FULL) &&
+            sample_delta <= -BATT_TREND_STEP_MV) {
             battery_material_step = true;
             battery_led_state = BATT_LED_UNPLUG_SHOW;
             battery_state_started_ms = now;
