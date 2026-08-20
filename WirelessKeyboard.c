@@ -122,6 +122,10 @@
 #define BATT_LED_UPDATE_MS  20
 #define BATT_PIN_EVENT_DELTA_MV 15
 #define BATT_EVENT_DELTA_MV (BATT_PIN_EVENT_DELTA_MV * BATT_DIVIDER_RATIO)
+#define BATT_CHARGE_TREND_ENTER 4
+#define BATT_UNPLUG_TREND_ENTER (-4)
+#define BATT_UNPLUG_DROP_MV 25
+#define BATT_FULL_EXIT_MV 4140
 
 // --- RGB LED, driven locally by RP2040 PWM on GP21, GP20, GP19 (Catod Comun) -----
 #define PIN_LED_R         21
@@ -1722,6 +1726,17 @@ static void battery_start_display(void)
 #endif
 }
 
+static void battery_set_led_state(enum battery_led_state next_state,
+                                  uint32_t now)
+{
+    if (battery_led_state == next_state) {
+        return;
+    }
+    battery_led_state = next_state;
+    battery_state_started_ms = now;
+    battery_material_step = true;
+}
+
 static void battery_sample_task(uint32_t now)
 {
     if (now - battery_last_check_ms < BATT_CHECK_MS) return;
@@ -1741,7 +1756,9 @@ static void battery_sample_task(uint32_t now)
         battery_material_step = true;
         return;
     }
+    uint32_t const previous_filtered_mv = battery_filtered_mv;
     battery_filtered_mv = (battery_filtered_mv * 3 + sample_mv) / 4;
+    battery_previous_sample_mv = previous_filtered_mv;
     battery_pct = battery_pct_for_mv(battery_filtered_mv);
 
     if (battery_baseline_mv == 0) {
@@ -1765,31 +1782,44 @@ static void battery_sample_task(uint32_t now)
         else if (battery_trend_counter < 0) battery_trend_counter++;
     }
 
-    /* Charging detection for 1S (3.7V Li-ion parallel):
-     * 1. Positive trend counter (voltage actively rising over time, e.g. 3.972V -> 3.992V -> 3.997V)
-     * 2. OR high plateau voltage (>= 3950 mV and stable / not dropping)
-     * 3. OR direct full charge (>= 4180 mV)
-     */
-    bool const is_charging_or_full = (battery_trend_counter > 0) ||
-                                     (battery_filtered_mv >= 3950 && diff_from_baseline >= -10) ||
-                                     (battery_filtered_mv >= 4180);
+    /* A high but stable 1S voltage is state-of-charge, not proof that a
+     * charger is connected. Enter Charging only after two sustained rising
+     * observations (counter >= 4); Full remains a strict voltage threshold. */
+    bool const unplug_drop = diff_from_baseline <= -BATT_UNPLUG_DROP_MV ||
+        battery_trend_counter <= BATT_UNPLUG_TREND_ENTER;
+    bool const is_full = battery_filtered_mv >= BATT_MAX_MV ||
+        (battery_led_state == BATT_LED_FULL &&
+         battery_filtered_mv >= BATT_FULL_EXIT_MV && !unplug_drop);
+    bool const is_charging = !is_full &&
+        (battery_trend_counter >= BATT_CHARGE_TREND_ENTER ||
+         (battery_led_state == BATT_LED_CHARGING &&
+          battery_trend_counter > 0));
 
-    if (is_charging_or_full) {
-        battery_material_step = true;
-        if (battery_led_state == BATT_LED_BOOT) {
-            battery_charge_detected_during_boot = true;
-        } else {
-            battery_led_state = (battery_pct >= 100 || battery_filtered_mv >= 4180) ?
-                BATT_LED_FULL : BATT_LED_CHARGING;
-            battery_state_started_ms = now;
-        }
-    } else {
-        /* Transition from charging to unplugged */
-        if (battery_led_state == BATT_LED_CHARGING || battery_led_state == BATT_LED_FULL) {
-            battery_material_step = true;
-            battery_led_state = BATT_LED_UNPLUG_SHOW;
-            battery_state_started_ms = now;
-        }
+    if (battery_led_state == BATT_LED_BOOT) {
+        battery_charge_detected_during_boot = is_full || is_charging;
+        return;
+    }
+
+    if (is_full) {
+        battery_set_led_state(BATT_LED_FULL, now);
+        return;
+    }
+    if (is_charging) {
+        battery_set_led_state(BATT_LED_CHARGING, now);
+        return;
+    }
+
+    if ((battery_led_state == BATT_LED_CHARGING ||
+         battery_led_state == BATT_LED_FULL) && unplug_drop) {
+        battery_set_led_state(BATT_LED_UNPLUG_SHOW, now);
+        return;
+    }
+
+    /* With no sustained rise and no real unplug drop, a stable battery is
+     * simply Idle. Do not keep a false Charging animation at 3.95-4.17 V. */
+    if (battery_led_state == BATT_LED_CHARGING ||
+        battery_led_state == BATT_LED_FULL) {
+        battery_set_led_state(BATT_LED_IDLE, now);
     }
 }
 
