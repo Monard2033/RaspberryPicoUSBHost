@@ -109,16 +109,19 @@
 // --- Battery (read locally, RP2040 is the sole "brain" for this) --------
 #define PIN_BATT_ADC      28   // GP28 = ADC2. Battery divider tap goes here.
 #define BATT_ADC_INPUT    2    // adc_select_input() channel matching GP28
-#define BATT_DIVIDER_RATIO 3   // Vbat--200k--node--100k--GND: node=Vbat/3
+#define BATT_ADC_CAL_FULL_SCALE_MV 3077u
+#define BATT_DIVIDER_NUMERATOR     3015u
+#define BATT_DIVIDER_DENOMINATOR   1000u
 #define BATT_MIN_MV        3430  // 1S empty: 3.43V
-#define BATT_MAX_MV        4200  // 1S full:  4.20V
+#define BATT_MAX_MV        4180  // 1S gauge full; chemistry limit remains 4.20V
 #define BATT_CHECK_MS      1000
 #define BATT_BOOT_SHOW_MS  5000
 #define BATT_EVENT_SHOW_MS 5000
 #define BATT_PULSE_WINDOW_MS 2000
 #define BATT_PULSE_PERIOD_MS 1000
 #define BATT_PIN_EVENT_DELTA_MV 15
-#define BATT_EVENT_DELTA_MV (BATT_PIN_EVENT_DELTA_MV * BATT_DIVIDER_RATIO)
+#define BATT_EVENT_DELTA_MV \
+    ((BATT_PIN_EVENT_DELTA_MV * BATT_DIVIDER_NUMERATOR + 500u) / 1000u)
 
 // --- RGB LED, driven locally by RP2040 PWM on GP21, GP20, GP19 (Catod Comun) -----
 #define PIN_LED_R         21
@@ -1599,8 +1602,17 @@ static uint32_t battery_read_mv(void)
     }
 
     uint32_t const raw_average = raw_sum / 16;
-    uint32_t const pin_mv = raw_average * 3300 / 4095;
-    return pin_mv * BATT_DIVIDER_RATIO;
+
+    /* Hardware calibration measured on this board/battery:
+     *   battery = 4.185 V, GP28 = 1.388 V, raw ~= 1848
+     *   effective ADC full scale = 3.077 V
+     *   divider multiplier = 4.185 / 1.388 = 3.01513
+     * Keep the entire conversion in one 64-bit expression so an intermediate
+     * rounded pin voltage cannot add several millivolts at the battery. */
+    uint64_t const numerator = (uint64_t)raw_average *
+        BATT_ADC_CAL_FULL_SCALE_MV * BATT_DIVIDER_NUMERATOR;
+    uint32_t const denominator = 4095u * BATT_DIVIDER_DENOMINATOR;
+    return (uint32_t)((numerator + denominator / 2u) / denominator);
 }
 
 static uint8_t battery_pct_for_mv(uint32_t batt_mv)
