@@ -50,6 +50,7 @@
 #define LINK_TYPE_DFU_STATUS    0x13
 #define LINK_CONTROL_SYSTEM_OFF 0x01
 #define LINK_CONTROL_POLL_ACK   0x02
+#define LINK_CONTROL_SPI_POLL   0x03
 #define LINK_ACK_MAGIC           0x5A
 #define LINK_ACK_TYPE_LOCK_STATE 0x01
 #define LINK_ACK_TYPE_DFU       0x02
@@ -317,6 +318,7 @@ static uint8_t spi_input_queue_count;
 static bool radio_sleep_indicator_active;
 static uint32_t radio_sleep_indicator_started_ms;
 static uint8_t spi_sequence;
+static uint8_t spi_control_sequence;
 static struct link_input_frame spi_retry_frame;
 static bool spi_retry_pending;
 static uint32_t spi_retry_after_us;
@@ -734,28 +736,29 @@ static void __unused spi_send_control_command(uint8_t command)
         .magic = LINK_MAGIC,
         .version = LINK_VERSION,
         .type = LINK_TYPE_CONTROL,
-        .sequence = spi_sequence++,
+        .sequence = spi_control_sequence++,
         .data = { command, 0, 0, 0, 0, 0, 0, 0 },
     };
 
     spi_write_frame(&frame);
+    spi_last_tx_us = time_us_32();
 }
 
-static void __unused spi_ack_poll_task(void)
+static void spi_ack_poll_task(void)
 {
-    /* Temporarily commented out for experiment: test typing without type=3 polling packets */
-    /*
     uint32_t const now = board_millis();
 
     if (radio_power_state != RADIO_AWAKE || spi_retry_pending ||
         spi_input_queue_count != 0 || battery_spi_pending ||
+        (uint32_t)(now - radio_last_activity_ms) <
+            BATTERY_HID_QUIET_GUARD_MS ||
         (uint32_t)(now - spi_last_ack_poll_ms) < SPI_ACK_POLL_MS) {
         return;
     }
 
     spi_last_ack_poll_ms = now;
-    spi_send_control_command(LINK_CONTROL_POLL_ACK);
-    */
+    /* Clock the cached reverse ESB ACK without forwarding a radio frame. */
+    spi_send_control_command(LINK_CONTROL_SPI_POLL);
 }
 
 static bool keyboard_report_is_released(void)
@@ -2335,7 +2338,9 @@ static void worker_core1_main(void)
     while (true) {
         usb_host_event_task();
         consumer_task();
+        radio_power_task();
         battery_task();
+        spi_ack_poll_task();
         spi_service_task();
 #if SPI_LINK_TEST_MODE
         spi_link_test_task();
