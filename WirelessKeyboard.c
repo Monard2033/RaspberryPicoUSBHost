@@ -578,12 +578,6 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
         return;
     }
 
-    if (ack.type == LINK_ACK_TYPE_LOCK_STATE && (ack.data[1] & 0x02u)) {
-        battery_last_check_ms = 0;
-        battery_tx_pending = true;
-        battery_last_tx_ms = 0;
-    }
-
     if (ack.type != LINK_ACK_TYPE_LOCK_STATE ||
         (ack.data[1] & 0x01u) == 0) {
         return;
