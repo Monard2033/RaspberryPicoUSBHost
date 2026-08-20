@@ -751,7 +751,7 @@ static void __unused spi_send_control_command(uint8_t command)
     spi_last_tx_us = time_us_32();
 }
 
-static void spi_ack_poll_task(void)
+static void __unused spi_ack_poll_task(void)
 {
     uint32_t const now = board_millis();
 
@@ -2344,7 +2344,6 @@ static void worker_core1_main(void)
         consumer_task();
         radio_power_task();
         battery_task();
-        spi_ack_poll_task();
         spi_service_task();
 #if SPI_LINK_TEST_MODE
         spi_link_test_task();
