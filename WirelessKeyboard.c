@@ -121,8 +121,9 @@
 #define BATT_BOOT_SHOW_MS  5000
 #define BATT_EVENT_SHOW_MS 5000
 #define BATT_PULSE_WINDOW_MS 2000
-#define BATT_PULSE_PERIOD_MS 5000
+#define BATT_PULSE_PERIOD_MS 1500
 #define BATT_LED_UPDATE_MS  20
+#define BATT_POST_BOOT_SLOPE_GUARD_MS 3000
 #define BATT_PIN_EVENT_DELTA_MV 15
 #define BATT_EVENT_DELTA_MV (BATT_PIN_EVENT_DELTA_MV * BATT_DIVIDER_RATIO)
 #define BATT_CHARGE_TREND_ENTER 4
@@ -1620,6 +1621,7 @@ enum battery_led_state {
 
 static enum battery_led_state battery_led_state = BATT_LED_BOOT;
 static uint32_t battery_state_started_ms;
+static uint32_t battery_slope_enable_after_ms;
 static uint32_t battery_filtered_mv;
 static uint32_t battery_previous_sample_mv;
 static uint32_t battery_baseline_mv;
@@ -1789,15 +1791,24 @@ static void battery_sample_task(uint32_t now)
         battery_material_step = true;
         return;
     }
+    /* During Boot, use the current hardware-filtered ADC sample directly.
+     * Carrying the IIR up from a low power-on sample would leave a long
+     * software ramp after Boot and falsely look like Charging. */
+    if (battery_led_state == BATT_LED_BOOT) {
+        battery_previous_sample_mv = battery_filtered_mv;
+        battery_filtered_mv = sample_mv;
+        battery_pct = battery_pct_for_mv(sample_mv);
+        battery_baseline_mv = sample_mv;
+        battery_trend_counter = 0;
+        return;
+    }
+
     uint32_t const previous_filtered_mv = battery_filtered_mv;
     battery_filtered_mv = (battery_filtered_mv * 3 + sample_mv) / 4;
     battery_previous_sample_mv = previous_filtered_mv;
     battery_pct = battery_pct_for_mv(battery_filtered_mv);
 
-    /* The GP28 capacitor charges from zero after power-up. During Boot,
-     * update voltage/percentage but continuously rebuild the baseline and
-     * suppress slope detection, so RC settling cannot look like Charging. */
-    if (battery_led_state == BATT_LED_BOOT) {
+    if ((int32_t)(now - battery_slope_enable_after_ms) < 0) {
         battery_baseline_mv = battery_filtered_mv;
         battery_trend_counter = 0;
         return;
@@ -1929,6 +1940,8 @@ static void battery_task(void)
                             battery_filtered_mv >= BATT_MAX_MV ?
                             BATT_LED_FULL : BATT_LED_IDLE;
         battery_state_started_ms = now;
+        battery_slope_enable_after_ms = now +
+                                        BATT_POST_BOOT_SLOPE_GUARD_MS;
     } else if (battery_led_state == BATT_LED_UNPLUG_SHOW &&
                now - battery_state_started_ms >= BATT_EVENT_SHOW_MS) {
         battery_led_state = BATT_LED_IDLE;
