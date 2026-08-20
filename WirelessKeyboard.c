@@ -462,6 +462,9 @@ static void dfu_send_status(uint8_t status, uint8_t progress, uint16_t offset_di
 
 static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
 {
+    /* 0. Stop Core 1 completely to prevent XIP instruction fetch collisions */
+    multicore_reset_core1();
+
     uint8_t ram_page[FLASH_PAGE_SIZE]; /* Must reside in SRAM */
     uint32_t const aligned_size = (size + FLASH_SECTOR_SIZE - 1u) & ~(FLASH_SECTOR_SIZE - 1u);
     uint32_t const ints = save_and_disable_interrupts();
