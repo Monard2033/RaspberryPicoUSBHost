@@ -119,10 +119,10 @@
 #define BATT_PIN_EVENT_DELTA_MV 15
 #define BATT_EVENT_DELTA_MV (BATT_PIN_EVENT_DELTA_MV * BATT_DIVIDER_RATIO)
 
-// --- RGB LED, driven locally by RP2040 PWM on GP10, GP11, GP12 (Catod Comun) -----
-#define PIN_LED_R         10
-#define PIN_LED_G         11
-#define PIN_LED_B         12
+// --- RGB LED, driven locally by RP2040 PWM on GP21, GP20, GP19 (Catod Comun) -----
+#define PIN_LED_R         21
+#define PIN_LED_G         20
+#define PIN_LED_B         19
 #define LED_PWM_WRAP      255   // 8-bit duty resolution
 #define LED_COMMON_ANODE  0     // 0 = common cathode to GND, 1 = common anode to 3V3
 
