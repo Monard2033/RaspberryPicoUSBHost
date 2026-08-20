@@ -109,8 +109,8 @@
 #define PIN_BATT_ADC      28   // GP28 = ADC2. Battery divider tap goes here.
 #define BATT_ADC_INPUT    2    // adc_select_input() channel matching GP28
 #define BATT_DIVIDER_RATIO 3   // Vbat--200k--node--100k--GND: node=Vbat/3
-#define BATT_MIN_MV        3430
-#define BATT_MAX_MV        4200
+#define BATT_MIN_MV        6000  // 2S empty: 6.00V (2.00V at pin)
+#define BATT_MAX_MV        8400  // 2S full:  8.40V (2.80V at pin)
 #define BATT_CHECK_MS      1000
 #define BATT_BOOT_SHOW_MS  5000
 #define BATT_EVENT_SHOW_MS 5000
@@ -1698,12 +1698,12 @@ static void battery_sample_task(uint32_t now)
 
     int32_t const diff_from_baseline = (int32_t)battery_filtered_mv - (int32_t)battery_baseline_mv;
 
-    /* If voltage is rising above baseline by >= 8mV, increment charging trend counter */
-    if (diff_from_baseline >= 8) {
+    /* If voltage is rising above baseline by >= 25mV (equivalent to ~8mV at pin), increment trend */
+    if (diff_from_baseline >= 25) {
         if (battery_trend_counter < 10) battery_trend_counter += 2;
         /* Pull baseline up smoothly as charging voltage climbs */
         battery_baseline_mv = (battery_baseline_mv * 7 + battery_filtered_mv) / 8;
-    } else if (diff_from_baseline <= -25) {
+    } else if (diff_from_baseline <= -60) {
         /* Voltage dropped below baseline (unplugged or discharge) */
         if (battery_trend_counter > -10) battery_trend_counter -= 3;
         battery_baseline_mv = (battery_baseline_mv * 3 + battery_filtered_mv) / 4;
@@ -1713,21 +1713,21 @@ static void battery_sample_task(uint32_t now)
         else if (battery_trend_counter < 0) battery_trend_counter++;
     }
 
-    /* Charging detection:
-     * 1. Positive trend counter (voltage actively rising over time)
-     * 2. OR high plateau voltage (>= 3950 mV and stable / not dropping)
-     * 3. OR direct full charge (>= 4180 mV)
+    /* Charging detection for 2S battery pack:
+     * 1. Positive trend counter (voltage actively climbing over time)
+     * 2. OR high plateau voltage (>= 7800 mV and stable / not dropping)
+     * 3. OR direct full charge (>= 8350 mV)
      */
     bool const is_charging_or_full = (battery_trend_counter > 0) ||
-                                     (battery_filtered_mv >= 3950 && diff_from_baseline >= -10) ||
-                                     (battery_filtered_mv >= 4180);
+                                     (battery_filtered_mv >= 7800 && diff_from_baseline >= -20) ||
+                                     (battery_filtered_mv >= 8350);
 
     if (is_charging_or_full) {
         battery_material_step = true;
         if (battery_led_state == BATT_LED_BOOT) {
             battery_charge_detected_during_boot = true;
         } else {
-            battery_led_state = (battery_pct >= 100 || battery_filtered_mv >= 4180) ?
+            battery_led_state = (battery_pct >= 100 || battery_filtered_mv >= 8350) ?
                 BATT_LED_FULL : BATT_LED_CHARGING;
             battery_state_started_ms = now;
         }
