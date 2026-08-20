@@ -560,18 +560,18 @@ static void dfu_process_command(struct link_ack_frame const *ack)
     }
 }
 
-static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
+static bool spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
 {
     struct link_ack_frame ack;
 
     memcpy(&ack, rx, sizeof(ack));
     if (ack.magic != LINK_ACK_MAGIC || ack.version != LINK_VERSION) {
-        return;
+        return false;
     }
 
     if (ack.type == LINK_ACK_TYPE_DFU) {
         dfu_process_command(&ack);
-        return;
+        return true;
     }
 
     if (ack.type == LINK_ACK_TYPE_LOCK_STATE && (ack.data[1] & 0x02u)) {
@@ -582,13 +582,13 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
 
     if (ack.type != LINK_ACK_TYPE_LOCK_STATE ||
         (ack.data[1] & 0x01u) == 0) {
-        return;
+        return true;
     }
 
     if (remote_keyboard_led_valid &&
         ack.data[2] == remote_keyboard_led_epoch &&
         !spi_sequence_is_newer(ack.sequence, remote_keyboard_led_sequence)) {
-        return;
+        return true;
     }
 
     if (!remote_keyboard_led_valid ||
@@ -612,9 +612,10 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
         last_logged_led = ack.data[0];
     }
 #endif
+    return true;
 }
 
-static void spi_write_frame(struct link_input_frame const *frame)
+static bool spi_write_frame(struct link_input_frame const *frame)
 {
     uint8_t rx[LINK_FRAME_LEN] = { 0 };
 #if HOT_PATH_DEBUG
@@ -623,13 +624,14 @@ static void spi_write_frame(struct link_input_frame const *frame)
 
     gpio_put(PIN_SPI_CSN, 0);
     sleep_us(1);
-    spi_write_read_blocking(SPI_PORT, (uint8_t const *)frame, rx,
-                            sizeof(*frame));
+    int const transferred = spi_write_read_blocking(
+        SPI_PORT, (uint8_t const *)frame, rx, sizeof(*frame));
     sleep_us(1);
     gpio_put(PIN_SPI_CSN, 1);
 
     total_spi_frames_sent++;
-    spi_process_ack(rx);
+    bool const accepted = transferred == (int)sizeof(*frame) &&
+                          spi_process_ack(rx);
 #if HID_DIAGNOSTIC_LOG
     printf("[SPI TX #%lu] type=%u seq=%u data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
            (unsigned long)total_spi_frames_sent,
@@ -644,6 +646,7 @@ static void spi_write_frame(struct link_input_frame const *frame)
            frame->data[0], frame->data[1], frame->data[2], frame->data[3],
            frame->data[4], frame->data[5], frame->data[6], frame->data[7]);
 #endif
+    return accepted;
 }
 
 static bool spi_queue_input(uint8_t type, const uint8_t data[KBD_REPORT_LEN])
@@ -686,18 +689,17 @@ static void spi_service_task(void)
             return;
         }
 
-        spi_retry_pending = false;
-        spi_write_frame(&spi_retry_frame);
+        bool const accepted = spi_write_frame(&spi_retry_frame);
         spi_last_tx_us = time_us_32();
+        if (accepted) {
+            spi_retry_pending = false;
+        } else {
+            spi_retry_after_us = spi_last_tx_us + SPI_REARM_GUARD_US;
+        }
         return;
     }
 
     if (radio_power_state != RADIO_AWAKE) return;
-
-    /* Enforce 150us guard time so nRF52840 SPIS EasyDMA has time to re-arm between frames */
-    if ((uint32_t)(time_us_32() - spi_last_tx_us) < 150u) {
-        return;
-    }
 
     if (!pending_radio_queue_pop(spi_input_queue, &spi_input_queue_head,
                                  &spi_input_queue_count,
@@ -716,12 +718,14 @@ static void spi_service_task(void)
                   pending.data[3], pending.data[4], pending.data[5],
                   pending.data[6], pending.data[7] },
     };
-    spi_write_frame(&spi_retry_frame);
+    bool const accepted = spi_write_frame(&spi_retry_frame);
     spi_last_tx_us = time_us_32();
 
-    /* Redundant retry only for Consumer Control edges (volume/media release) */
-    if (pending.type == LINK_TYPE_CONSUMER) {
-        spi_retry_after_us = time_us_32() + SPI_REARM_GUARD_US;
+    /* A valid MISO ACK proves that SPIS/EasyDMA was armed for this exact
+     * transaction. If it was not armed, retain the same frame and sequence
+     * and retry only on core 1; never lose or reorder a key/release edge. */
+    if (!accepted) {
+        spi_retry_after_us = spi_last_tx_us + SPI_REARM_GUARD_US;
         spi_retry_pending = true;
     } else {
         spi_retry_pending = false;
@@ -738,7 +742,7 @@ static void __unused spi_send_control_command(uint8_t command)
         .data = { command, 0, 0, 0, 0, 0, 0, 0 },
     };
 
-    spi_write_frame(&frame);
+    (void)spi_write_frame(&frame);
 }
 
 static void __unused spi_ack_poll_task(void)
