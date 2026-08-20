@@ -721,9 +721,11 @@ static void spi_service_task(void)
     spi_write_frame(&spi_retry_frame);
     spi_last_tx_us = time_us_32();
 
-    /* Preserve the stable Consumer duplicate used for media-key releases.
-     * Keyboard frames are sent once; SPIS is already IRQ-rearmed. */
-    if (pending.type == LINK_TYPE_CONSUMER) {
+    /* One local SPI safety copy closes the short SPIS rearm window. It keeps
+     * the same sequence and is removed by the Transmitter before ESB, so the
+     * Receiver still sees exactly one ordered keyboard/Consumer transition. */
+    if (pending.type == LINK_TYPE_KEYBOARD ||
+        pending.type == LINK_TYPE_CONSUMER) {
         spi_retry_after_us = time_us_32() + SPI_REARM_GUARD_US;
         spi_retry_pending = true;
     } else {
