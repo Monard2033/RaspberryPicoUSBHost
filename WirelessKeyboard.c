@@ -109,12 +109,13 @@
 // --- Battery (read locally, RP2040 is the sole "brain" for this) --------
 #define PIN_BATT_ADC      28   // GP28 = ADC2. Battery divider tap goes here.
 #define BATT_ADC_INPUT    2    // adc_select_input() channel matching GP28
-#define BATT_ADC_CAL_FULL_SCALE_MV 3300u
+#define BATT_ADC_CAL_FULL_SCALE_MV 3260u  // measured ADC_AVDD/VREF
 #define BATT_DIVIDER_NUMERATOR     3015u
 #define BATT_DIVIDER_DENOMINATOR   1000u
-#define BATT_MIN_MV        3430  // 1S empty: 3.43V
-#define BATT_MAX_MV        4110  // 1S gauge full under the keyboard's normal load
-#define BATT_FULL_EXIT_MV  4080  // hysteresis: avoid Full/Idle flicker
+#define BATT_HARD_MIN_MV   3000  // lower operating limit supplied for this 1S pack
+#define BATT_MIN_MV        3100  // 0% warning/cutoff margin
+#define BATT_MAX_MV        4180  // measured full-charge voltage
+#define BATT_FULL_EXIT_MV  4150  // 30mV hysteresis: avoid Full/Idle flicker
 #define BATT_TREND_STEP_MV 2
 #define BATT_CHARGE_TREND_COUNT 6
 #define BATT_CHECK_MS      1000
