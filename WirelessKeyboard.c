@@ -50,6 +50,7 @@
 #define LINK_TYPE_DFU_STATUS    0x13
 #define LINK_CONTROL_SYSTEM_OFF 0x01
 #define LINK_CONTROL_POLL_ACK   0x02
+#define LINK_CONTROL_SESSION_RESET 0x03
 #define LINK_ACK_MAGIC           0x5A
 #define LINK_ACK_TYPE_LOCK_STATE 0x01
 #define LINK_ACK_TYPE_DFU       0x02
@@ -728,7 +729,8 @@ static void spi_service_task(void)
      * Receiver still sees exactly one ordered keyboard/Consumer transition. */
     if (pending.type == LINK_TYPE_KEYBOARD ||
         pending.type == LINK_TYPE_CONSUMER ||
-        pending.type == LINK_TYPE_BATTERY) {
+        pending.type == LINK_TYPE_BATTERY ||
+        pending.type == LINK_TYPE_CONTROL) {
         spi_retry_after_us = time_us_32() + SPI_REARM_GUARD_US;
         spi_retry_pending = true;
     } else {
@@ -2471,6 +2473,12 @@ int main(void)
     battery_start_display();
 
     radio_last_activity_ms = board_millis();
+    /* Receiver remains enumerated while RP2040 may reboot independently.
+     * Reset its per-session sequence/cache state before any captured input. */
+    uint8_t const session_reset[KBD_REPORT_LEN] = {
+        LINK_CONTROL_SESSION_RESET, 0, 0, 0, 0, 0, 0, 0
+    };
+    (void)spi_queue_input(LINK_TYPE_CONTROL, session_reset);
     multicore_reset_core1();
     multicore_launch_core1(worker_core1_main);
     printf("[INIT] SPI/battery/RGB worker initialized on core 1\n");
