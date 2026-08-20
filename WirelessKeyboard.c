@@ -664,6 +664,8 @@ static bool spi_send_keyboard_transition(
     return spi_queue_input(LINK_TYPE_KEYBOARD, data);
 }
 
+static uint32_t spi_last_tx_us = 0;
+
 static void spi_service_task(void)
 {
     struct pending_radio_input pending;
@@ -676,10 +678,16 @@ static void spi_service_task(void)
 
         spi_retry_pending = false;
         spi_write_frame(&spi_retry_frame);
+        spi_last_tx_us = time_us_32();
         return;
     }
 
     if (radio_power_state != RADIO_AWAKE) return;
+
+    /* Enforce 150us guard time so nRF52840 SPIS EasyDMA has time to re-arm between frames */
+    if ((uint32_t)(time_us_32() - spi_last_tx_us) < 150u) {
+        return;
+    }
 
     if (!pending_radio_queue_pop(spi_input_queue, &spi_input_queue_head,
                                  &spi_input_queue_count,
@@ -699,7 +707,15 @@ static void spi_service_task(void)
                   pending.data[6], pending.data[7] },
     };
     spi_write_frame(&spi_retry_frame);
-    spi_retry_pending = false;
+    spi_last_tx_us = time_us_32();
+
+    /* Redundant retry only for Consumer Control edges (volume/media release) */
+    if (pending.type == LINK_TYPE_CONSUMER) {
+        spi_retry_after_us = time_us_32() + SPI_REARM_GUARD_US;
+        spi_retry_pending = true;
+    } else {
+        spi_retry_pending = false;
+    }
 }
 
 static void __unused spi_send_control_command(uint8_t command)
