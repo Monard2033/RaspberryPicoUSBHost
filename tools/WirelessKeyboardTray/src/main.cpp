@@ -788,41 +788,16 @@ DWORD WINAPI WorkerMain(void *)
             continue;
         }
 
-        BatterySnapshot snapshot{};
         if (waitResult == WAIT_OBJECT_0 + 1) {
             // User clicked Refresh now: trigger immediate on-demand battery poll
-            BatterySnapshot const beforeRefresh = ReadBattery(battery);
             std::array<uint8_t, kBatteryReportLength> pollReq{};
             pollReq[0] = kBatteryReportId;
             pollReq[1] = 0x01;
-            if (!HidD_SetFeature(battery, pollReq.data(),
-                                 static_cast<ULONG>(pollReq.size()))) {
-                snapshot = beforeRefresh;
-                snapshot.availability = Availability::ReadError;
-                snapshot.error = GetLastError();
-            } else {
-                snapshot = beforeRefresh;
-                for (int attempt = 0; attempt < 40; ++attempt) {
-                    Sleep(50);
-                    BatterySnapshot const candidate = ReadBattery(battery);
-                    snapshot = candidate;
-                    bool const telemetryAdvanced =
-                        candidate.sequence != beforeRefresh.sequence ||
-                        candidate.ageSeconds < beforeRefresh.ageSeconds;
-                    bool const telemetryBecameAvailable =
-                        (beforeRefresh.flags & 0x01U) == 0 &&
-                        (candidate.flags & 0x01U) != 0;
-                    if (candidate.availability != Availability::ReadError &&
-                        (candidate.flags & 0x01U) != 0 &&
-                        (telemetryAdvanced || telemetryBecameAvailable)) {
-                        break;
-                    }
-                }
-            }
-        } else {
-            snapshot = ReadBattery(battery);
+            HidD_SetFeature(battery, pollReq.data(), static_cast<ULONG>(pollReq.size()));
+            Sleep(150);
         }
 
+        BatterySnapshot const snapshot = ReadBattery(battery);
         PostSnapshot(snapshot);
         if (snapshot.availability == Availability::ReadError) {
             CloseHandle(battery);
