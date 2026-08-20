@@ -1760,13 +1760,25 @@ static uint8_t battery_link_state(void)
 
 static void battery_telemetry_task(uint32_t now)
 {
-    if ((uint32_t)(now - battery_last_tx_ms) >=
-        BATTERY_TELEMETRY_PERIOD_MS) {
+    uint32_t const period_ms = (battery_led_state == BATT_LED_CHARGING ||
+                                battery_led_state == BATT_LED_FULL) ? 5000u : BATTERY_TELEMETRY_PERIOD_MS;
+
+    if ((uint32_t)(now - battery_last_tx_ms) >= period_ms) {
         battery_tx_pending = true;
     }
 
-    if (!battery_tx_pending || radio_power_state != RADIO_AWAKE ||
-        (uint32_t)(now - radio_last_activity_ms) <
+    if (!battery_tx_pending) {
+        return;
+    }
+
+    if (radio_power_state != RADIO_AWAKE) {
+        if (!radio_wake_requested) {
+            radio_wake_requested = true;
+        }
+        return;
+    }
+
+    if ((uint32_t)(now - radio_last_activity_ms) <
             BATTERY_HID_QUIET_GUARD_MS ||
         radio_wake_queue_count != 0 || spi_input_queue_count != 0 ||
         spi_retry_pending || battery_spi_pending ||
