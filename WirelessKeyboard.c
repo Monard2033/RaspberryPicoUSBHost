@@ -349,9 +349,9 @@ static uint32_t total_spi_frames_sent      = 0;
 static uint32_t total_output_reports_sent  = 0;
 
 enum { BLINK_NOT_MOUNTED = 250, BLINK_MOUNTED = 1000, BLINK_SUSPENDED = 2500 };
-static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
-static uint8_t pending_descriptor_dev_addr;
-static uint32_t descriptor_dump_after_ms;
+static volatile uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
+static volatile uint8_t pending_descriptor_dev_addr;
+static volatile uint32_t descriptor_dump_after_ms;
 
 /*--------------------------------------------------------------------+
  *  SPI master bridge to the nRF52840 (SPI slave). The fixed 12-byte frame
@@ -741,7 +741,7 @@ static void __unused spi_send_control_command(uint8_t command)
     spi_write_frame(&frame);
 }
 
-static void spi_ack_poll_task(void)
+static void __unused spi_ack_poll_task(void)
 {
     /* Temporarily commented out for experiment: test typing without type=3 polling packets */
     /*
@@ -816,7 +816,7 @@ static void radio_start_wake(void)
     radio_transition_after_ms = board_millis() + RADIO_BOOT_WAIT_MS;
 }
 
-static void radio_power_task(void)
+static void __unused radio_power_task(void)
 {
     uint32_t const now = board_millis();
 
@@ -2270,9 +2270,9 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
     hid_receive_arm_or_defer(dev_addr, instance);
 }
 
-/* Core 0 consumes complete reports in arrival order.  The only work in the
- * PIO-USB callback is descriptor decoding, copying eight bytes and immediately
- * arming the next IN transfer. */
+/* Core 1 consumes complete reports in arrival order. The only work on Core 0
+ * in the PIO-USB callback is descriptor decoding, copying eight bytes and
+ * immediately arming the next IN transfer. */
 static void usb_host_event_task(void)
 {
     struct usb_host_event event;
@@ -2327,25 +2327,20 @@ static void usb_host_event_task(void)
     }
 }
 
-static void usb_host_core1_main(void)
+static void worker_core1_main(void)
 {
-    /* PIO-USB polls at USB bit timing.  Keep this task on the otherwise idle
-     * core so SPI retries, ADC/RGB updates and radio wakeups cannot defer an
-     * EP 0x81 re-arm during a multi-key transition. */
-    pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
-    pio_cfg.pin_dp = USB_HOST_DP_PIN;
-    tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION,
-                  &pio_cfg);
-    tuh_hid_set_default_protocol(HID_PROTOCOL_BOOT);
-    tuh_init(BOARD_TUH_RHPORT);
-
+    /* Core 1 owns every operation downstream of USB capture: ordered event
+     * consumption, SPI transmission, ADC/charging state and RGB handling.
+     * It never calls TinyUSB/PIO-USB APIs. */
     while (true) {
-        tuh_task();
-        hid_receive_rearm_task();
-        keyboard_halt_recovery_task();
-        keyboard_hid_stall_recovery_task();
-        keyboard_led_task();
-        usb_descriptor_dump_task();
+        usb_host_event_task();
+        consumer_task();
+        battery_task();
+        spi_service_task();
+#if SPI_LINK_TEST_MODE
+        spi_link_test_task();
+#endif
+        status_task();
     }
 }
 
@@ -2387,28 +2382,34 @@ int main(void)
     battery_adc_init();
     watchdog_enable(RP2040_WATCHDOG_TIMEOUT_MS, true);
 
-    multicore_reset_core1();
-    multicore_launch_core1(usb_host_core1_main);
-    printf("[INIT] TinyUSB host stack initialized on core 1\n");
-
     printf("[INIT] Starting 5-second battery display...\n");
     battery_start_display();
 
-    printf("[INIT] Ready. Waiting for keyboard on D+/D-...\n\n");
     radio_last_activity_ms = board_millis();
+    multicore_reset_core1();
+    multicore_launch_core1(worker_core1_main);
+    printf("[INIT] SPI/battery/RGB worker initialized on core 1\n");
+
+    /* Core 0 is dedicated to PIO-USB/TinyUSB host timing and immediate
+     * endpoint re-arm. No SPI, ADC, radio or battery work runs here. */
+    pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+    pio_cfg.pin_dp = USB_HOST_DP_PIN;
+    tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION,
+                  &pio_cfg);
+    tuh_hid_set_default_protocol(HID_PROTOCOL_BOOT);
+    tuh_init(BOARD_TUH_RHPORT);
+    printf("[INIT] TinyUSB/PIO-USB host initialized on core 0\n");
+
+    printf("[INIT] Ready. Waiting for keyboard on D+/D-...\n\n");
 
     while (1) {
         watchdog_update();
-        usb_host_event_task();
-        consumer_task();
-        radio_power_task();
-        battery_task();
-        spi_ack_poll_task();
-        spi_service_task();
-#if SPI_LINK_TEST_MODE
-        spi_link_test_task();
-#endif
+        tuh_task();
+        hid_receive_rearm_task();
+        keyboard_halt_recovery_task();
+        keyboard_hid_stall_recovery_task();
+        keyboard_led_task();
+        usb_descriptor_dump_task();
         led_blinking_task();
-        status_task();
     }
 }
