@@ -74,7 +74,7 @@
 #define SPI_INPUT_QUEUE_DEPTH 128u
 #define RADIO_SLEEP_BLINK_COUNT 4u
 #define RADIO_SLEEP_BLINK_HALF_PERIOD_MS 100u
-#define SPI_REARM_GUARD_US 250u
+#define SPI_REARM_GUARD_US 75u
 #define SPI_ACK_POLL_MS 100u
 #define KEYBOARD_HID_STALL_RECOVERY_MS 250u
 #define SONIX_KEYBOARD_EP_IN 0x81u
@@ -121,7 +121,7 @@
 #define BATT_BOOT_SHOW_MS  5000
 #define BATT_EVENT_SHOW_MS 5000
 #define BATT_PULSE_WINDOW_MS 2000
-#define BATT_PULSE_PERIOD_MS 1500
+#define BATT_PULSE_PERIOD_MS 4500
 #define BATT_LED_UPDATE_MS  20
 #define BATT_POST_BOOT_SLOPE_GUARD_MS 3000
 #define BATT_PIN_EVENT_DELTA_MV 15
@@ -1461,13 +1461,13 @@ static void filter_null_movement(const uint8_t input[KBD_REPORT_LEN],
     bool const w_now = report_has_key(input, HID_KEY_W);
     bool const s_now = report_has_key(input, HID_KEY_S);
     bool const a_before = previous_physical_valid &&
-                          report_has_key(previous_physical_report, HID_KEY_A);
+                            report_has_key(previous_physical_report, HID_KEY_A);
     bool const d_before = previous_physical_valid &&
-                          report_has_key(previous_physical_report, HID_KEY_D);
+                            report_has_key(previous_physical_report, HID_KEY_D);
     bool const w_before = previous_physical_valid &&
-                          report_has_key(previous_physical_report, HID_KEY_W);
+                            report_has_key(previous_physical_report, HID_KEY_W);
     bool const s_before = previous_physical_valid &&
-                          report_has_key(previous_physical_report, HID_KEY_S);
+                            report_has_key(previous_physical_report, HID_KEY_S);
 
     active_ad_key = select_last_input_key(a_now, d_now,
                                          a_now && !a_before,
@@ -1566,7 +1566,6 @@ static void led_pwm_init(void)
     pwm_set_enabled(slice_g, true);
     pwm_set_enabled(slice_b, true);
 
-    printf("[LED] PWM init OK: R=GP%d G=GP%d B=GP%d\n", PIN_LED_R, PIN_LED_G, PIN_LED_B);
 }
 
 static uint8_t led_pwm_level(uint8_t brightness)
@@ -1603,7 +1602,7 @@ static struct rgb_color battery_color_for_pct(uint8_t pct)
 {
     if (pct >= 75) return (struct rgb_color) { 0, 255, 0 };   // green
     if (pct >= 50) return (struct rgb_color) { 255, 255, 0 }; // yellow
-    if (pct >= 25) return (struct rgb_color) { 255, 80, 0 };  // orange
+    if (pct >= 25) return (struct rgb_color) { 255, 75, 0 };  // orange
     return (struct rgb_color) { 255, 0, 0 };                  // red
 }
 
