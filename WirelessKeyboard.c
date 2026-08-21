@@ -234,6 +234,13 @@ static struct hid_instance_state hid_instances[CFG_TUH_HID];
 static uint16_t previous_consumer_usage;
 static bool previous_consumer_valid;
 
+/* Timestamp of the last non-zero consumer usage.  Used by consumer_task as a
+ * safety-release timeout so a lost consumer release (sticky key) does not
+ * leave a usage permanently pressed.  Set before the dedup check so held keys
+ * that re-send the same usage keep the timeout armed. */
+static uint32_t consumer_press_ms;
+static uint32_t const CONSUMER_SAFETY_RELEASE_MS = 2000;
+
 enum radio_power_state {
     RADIO_AWAKE,
     RADIO_POWERING_OFF,
@@ -1261,6 +1268,9 @@ static uint16_t decode_consumer_usage(struct hid_instance_state const *state,
 
 static void forward_consumer_usage(uint16_t usage)
 {
+    if (usage != 0) {
+        consumer_press_ms = board_millis();
+    }
     if (previous_consumer_valid && usage == previous_consumer_usage) return;
     uint8_t data[KBD_REPORT_LEN] = {
         (uint8_t)usage, (uint8_t)(usage >> 8), 0, 0, 0, 0, 0, 0
@@ -1276,6 +1286,11 @@ static void forward_consumer_usage(uint16_t usage)
 
 static void consumer_task(void)
 {
+    if (previous_consumer_valid && previous_consumer_usage != 0 &&
+        (uint32_t)(board_millis() - consumer_press_ms) >=
+            CONSUMER_SAFETY_RELEASE_MS) {
+        forward_consumer_usage(0);
+    }
 }
 
 static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN]);
@@ -1560,11 +1575,6 @@ static void filter_null_movement(const uint8_t input[KBD_REPORT_LEN],
 static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN])
 {
     uint8_t output[KBD_REPORT_LEN];
-
-    /* If Fn was released and keyboard transitioned back to normal keys, release any active consumer usage */
-    if (previous_consumer_valid && previous_consumer_usage != 0) {
-        forward_consumer_usage(0);
-    }
 
     keyboard_led_toggle_on_press(input);
     filter_null_movement(input, output);
