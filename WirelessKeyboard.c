@@ -116,7 +116,7 @@
 #define BATT_VALID_MIN_MV  2800  // Reject impossible/corrupt 1S telemetry.
 #define BATT_VALID_MAX_MV  4300
 #define BATT_MIN_MV        3050  // User-selected 1S empty reference.
-#define BATT_MAX_MV        4180  // Measured full-charge reference.
+#define BATT_MAX_MV        4110  // Observed full-charge reference for this pack.
 #define BATT_CHECK_MS      1000
 #define BATT_BOOT_SHOW_MS  5000
 #define BATT_EVENT_SHOW_MS 5000
@@ -129,7 +129,7 @@
 #define BATT_CHARGE_TREND_ENTER 4
 #define BATT_UNPLUG_TREND_ENTER (-4)
 #define BATT_UNPLUG_DROP_MV 25
-#define BATT_FULL_EXIT_MV 4140
+#define BATT_FULL_EXIT_MV 4070
 
 // --- RGB LED, driven locally by RP2040 PWM on GP21, GP20, GP19 (Catod Comun) -----
 #define PIN_LED_R         21
@@ -333,6 +333,11 @@ static uint8_t spi_sequence;
 static struct link_input_frame spi_retry_frame;
 static bool spi_retry_pending;
 static uint32_t spi_retry_after_us;
+static uint8_t spi_retry_copies_remaining;
+static uint8_t last_transport_keyboard[KBD_REPORT_LEN];
+static bool last_transport_keyboard_valid;
+static uint16_t last_transport_consumer_usage;
+static bool last_transport_consumer_valid;
 static struct pending_radio_input battery_spi_pending_frame;
 static bool battery_spi_pending;
 static uint32_t __unused spi_last_ack_poll_ms;
@@ -681,6 +686,31 @@ static bool spi_send_keyboard_transition(
     return spi_queue_input(LINK_TYPE_KEYBOARD, data);
 }
 
+static bool keyboard_transport_has_key(
+    const uint8_t report[KBD_REPORT_LEN], uint8_t key)
+{
+    for (uint8_t i = 2; i < KBD_REPORT_LEN; ++i) {
+        if (report[i] == key) return true;
+    }
+    return false;
+}
+
+static bool keyboard_transition_releases_state(
+    const uint8_t previous[KBD_REPORT_LEN],
+    const uint8_t current[KBD_REPORT_LEN])
+{
+    if ((previous[0] & (uint8_t)~current[0]) != 0U) {
+        return true;
+    }
+    for (uint8_t i = 2; i < KBD_REPORT_LEN; ++i) {
+        uint8_t const key = previous[i];
+        if (key != 0U && !keyboard_transport_has_key(current, key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static uint32_t spi_last_tx_us = 0;
 
 static void spi_service_task(void)
@@ -694,9 +724,16 @@ static void spi_service_task(void)
             return;
         }
 
-        spi_retry_pending = false;
         spi_write_frame(&spi_retry_frame);
         spi_last_tx_us = time_us_32();
+        if (spi_retry_copies_remaining > 1U) {
+            spi_retry_copies_remaining--;
+            spi_retry_after_us = spi_last_tx_us + SPI_REARM_GUARD_US;
+            spi_retry_pending = true;
+        } else {
+            spi_retry_copies_remaining = 0U;
+            spi_retry_pending = false;
+        }
         return;
     }
 
@@ -730,16 +767,36 @@ static void spi_service_task(void)
     spi_write_frame(&spi_retry_frame);
     spi_last_tx_us = time_us_32();
 
-    /* One local SPI safety copy closes the short SPIS rearm window. It keeps
-     * the same sequence and is removed by the Transmitter before ESB, so the
-     * Receiver still sees exactly one ordered keyboard/Consumer transition. */
+    bool release_edge = false;
+    if (pending.type == LINK_TYPE_KEYBOARD) {
+        release_edge = last_transport_keyboard_valid &&
+            keyboard_transition_releases_state(last_transport_keyboard,
+                                                pending.data);
+        memcpy(last_transport_keyboard, pending.data, KBD_REPORT_LEN);
+        last_transport_keyboard_valid = true;
+    } else if (pending.type == LINK_TYPE_CONSUMER) {
+        uint16_t const usage = (uint16_t)pending.data[0] |
+                               ((uint16_t)pending.data[1] << 8);
+        release_edge = last_transport_consumer_valid &&
+                       last_transport_consumer_usage != 0U &&
+                       usage != last_transport_consumer_usage;
+        last_transport_consumer_usage = usage;
+        last_transport_consumer_valid = true;
+    }
+
+    /* Every typed frame gets one local SPI safety copy. A transition that
+     * releases any key/modifier/Consumer usage gets two safety copies (three
+     * total attempts). Transmitter deduplicates the identical sequence before
+     * ESB, so Receiver/Windows still see exactly one ordered transition. */
     if (pending.type == LINK_TYPE_KEYBOARD ||
         pending.type == LINK_TYPE_CONSUMER ||
         pending.type == LINK_TYPE_BATTERY ||
         pending.type == LINK_TYPE_CONTROL) {
-        spi_retry_after_us = time_us_32() + SPI_REARM_GUARD_US;
+        spi_retry_copies_remaining = release_edge ? 2U : 1U;
+        spi_retry_after_us = spi_last_tx_us + SPI_REARM_GUARD_US;
         spi_retry_pending = true;
     } else {
+        spi_retry_copies_remaining = 0U;
         spi_retry_pending = false;
     }
 }
