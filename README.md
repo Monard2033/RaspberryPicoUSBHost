@@ -331,12 +331,17 @@ the 1 kHz release.
 ### Release matched protocol `0x03` artifacts
 
 The current RP2040 release artifact is
-`04C9D86D201694BB84208984A7D06ED691B25C8C80F5FE377FD050D703B94B30`.
+`7D4DF6A848C5AF0B004DA9C714328EC59F1E3E48549F6873B28FD83713D65B7B`.
 It adds universal keyboard report decoding (supporting standard 6KRO 8-byte,
 9-byte Report-ID, and NKRO bitmaps from 10 to 64 bytes), eliminates rigid
 8-byte length filtering, configures default BOOT protocol for boot keyboards
 while keeping Consumer Control in Report protocol, and provides nonblocking
-endpoint recovery. The Transmitter and Receiver artifacts remain:
+endpoint recovery. It also runs the low-power Stage 1 clock plan: 96 MHz
+system clock (the lowest valid for PIO-USB's 96 MHz receive sampler) with
+WFI/WFE idle gating on both cores; typed-input validation on hardware shows
+no typing-speed or consumer/keyboard regression versus the 120 MHz image.
+Restore 120 MHz with `RP2040_SYS_CLOCK_KHZ=120000` at configure time. The
+Transmitter and Receiver artifacts remain:
 
 - Transmitter `firmware/transmitter.uf2`:
   `551751E5353223CFDB7CF2456723514039473C2D11304410888080C6B2FAF89D`
