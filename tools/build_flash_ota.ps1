@@ -16,7 +16,10 @@ $toolDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $source = Join-Path $toolDirectory 'flash_ota.cpp'
 $output = Join-Path $toolDirectory 'flash_ota.exe'
 
-& $compilerPath -std=c++17 -O2 -Wall -Wextra -Werror `
+# Static linking: the tool must run anywhere ("zero dependencies") and the
+# dynamically linked MinGW build segfaulted at startup on machines whose
+# PATH resolves a different runtime than the compiler used.
+& $compilerPath -std=c++17 -O2 -Wall -Wextra -Werror -static -static-libgcc -static-libstdc++ `
     $source -o $output -lsetupapi -lhid
 if ($LASTEXITCODE -ne 0) {
     throw "flash_ota.exe build failed with exit code $LASTEXITCODE"
