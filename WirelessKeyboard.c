@@ -150,7 +150,7 @@
 #define BATT_VALID_MIN_MV  2800  // Reject impossible/corrupt 1S telemetry.
 #define BATT_VALID_MAX_MV  4300
 #define BATT_MIN_MV        3050  // User-selected 1S empty reference.
-#define BATT_MAX_MV        4161  // Measured absolute full-charge voltage of this pack (3:1 divider).
+#define BATT_MAX_MV        4140  // Measured absolute full-charge voltage of this pack (3:1 divider).
 #define BATT_CHECK_MS      1000
 #define BATT_BOOT_SHOW_MS  5000
 #define BATT_EVENT_SHOW_MS 5000
