@@ -4,18 +4,33 @@ This document tracks the implementation status and future roadmap for Over-The-A
 
 ---
 
-## 1. RP2040 Host Wireless OTA DFU (Status: COMPLETED & VERIFIED)
+## 1. RP2040 Host Wireless OTA DFU (Status: COMPLETED — strict Etapa A port 2026-08-22)
 
 - [x] **HID Feature Report ID 4 (`HID_REPORT_ID_DFU`)**: Vendor feature collection added to USB descriptor on Receiver Dongle.
 - [x] **Bidirectional ESB Streaming**: Reverse ACK payload streaming between Receiver and Transmitter.
 - [x] **SPI Bridge**: Transmitter forwards DFU control & chunk frames to RP2040 and returns status telemetry.
 - [x] **Dual-Bank 4MB Flash Partitioning**: Configured on WeAct RP2040 Winbond Flash:
   - **Slot A (Active)**: `0x10000000` (2 MB capacity)
-  - **Slot B (Staging)**: `0x10200000` (`FLASH_STAGING_OFFSET = 2048 KB`, 2 MB capacity)
-- [x] **Checksum Verification**: Hardware CRC32 verification over entire downloaded image in Slot B.
+  - **Slot B (Staging)**: `0x10200000` (`FLASH_STAGING_OFFSET = 2048 KB`, 1.9 MB capacity)
+  - **WKOT metadata page**: last 4 kB (`OTA_METADATA_OFFSET`), CRC-protected install record.
+- [x] **Strict acknowledged session protocol (link 0x03)**: START/QUERY/CRC/DATA/FINISH/ACTIVATE/ABORT commands, each carrying a session id and command token; replies echo both. The Receiver re-queues a PC command until a DFU_STATUS proves the RP2040 consumed it end-to-end; a redelivered command replays its stored reply instead of double-applying.
+- [x] **Full 32-bit CRC32 verification** (replaces the earlier 24-bit truncated compare) **plus on-device vector validation**: the staged image's stack pointer must be in SRAM and its Thumb reset handler inside the active slot before ACTIVATE is possible. Target/protocol/board lock on START, CRC and package header (`WKRPOTA1`, board `0x2040`).
+- [x] **Watchdog-safe flash windows**: staging erase chunked per 4 kB sector inside `flash_safe_execute` with the watchdog fed between chunks; streaming programs one 256-byte page per window; the final slot swap runs on core 0 after resetting core 1 in the documented direction (`dfu_apply_and_reboot`, never returns).
+- [x] **OTA radio discovery**: DFU traffic refreshes radio activity, and while the radio is in System OFF the RP2040 issues 30 s wake requests so `flash_ota` can start a session against a sleeping keyboard; `spi_ack_poll_task` pumps reverse ACKs at 1 ms during sessions (1 s idle, 20 ms input quiet guard, separate control sequence namespace).
+- [x] **Target-locked packages & native tool**: `tools/make_ota_package.py` builds `.wkota` packages (header + payload CRC32, vector validation); `tools/flash_ota.exe` (rebuilt via `tools/build_flash_ota.ps1`) drives the strict flow and confirms the exact package CRC32 through the post-reboot BOOT_OK metadata self-report.
 - [x] **RAM Flash Swap & Watchdog Reboot**: Resident `dfu_apply_and_reboot()` in RAM erases Slot A, copies verified binary from Slot B into Slot A, and resets RP2040.
-- [x] **Native Windows Flashing Utility**: `tools/flash_ota.exe` (compiled C++, zero dependencies) with real-time progress bar.
 - [x] **Null Movement & Zero Duplicate Fix**: Snap Tap (SOCD Last Win) and 500ms keepalive deduplication integrated.
+
+**Matched set**: flash the Receiver from
+`Receiver` repo branch `codex/rp2040-ota-strict-port` (commit `9e4164f`+,
+`firmware/receiver.hex` SHA-256 `2A96E2D6...F2C09E`) together with the
+RP2040 image; the Transmitter is unchanged (link protocol stays 0x03).
+Hardware acceptance of the strict flow is still required.
+
+**Deferred (Etapa B, from the strict branch)**: bootloader + relocated app
+layout (`ota_bootloader.c`, `linker/ota_*`) so a power loss during ACTIVATE
+is recoverable by the bootloader retrying the staging copy; two-step factory
+migration for existing devices.
 
 ---
 

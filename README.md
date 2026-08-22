@@ -172,7 +172,7 @@ the nRF52840 transmitter over SPI.
 
 See [OTA DFU Roadmap & TODO](file:///c:/Users/Monard/Raspberry/WirelessKeyboard/docs/OTA_DFU_TODO.md) for full technical specifications.
 
-- [x] **RP2040 Host Wireless OTA DFU**: Dual-Bank 4MB Winbond Flash partitioning (2MB Slot A + 2MB Slot B Staging), CRC32 verification, RAM-resident `dfu_apply_and_reboot()`, and standalone native Windows tool `tools/flash_ota.exe` (C++).
+- [x] **RP2040 Host Wireless OTA DFU**: Dual-Bank 4MB Winbond Flash partitioning (2MB Slot A + 2MB Slot B Staging), CRC32 verification, RAM-resident `dfu_apply_and_reboot()`, and standalone native Windows tool `tools/flash_ota.exe` (C++). Since 2026-08-22 the strict session protocol from `codex/rp2040-ota-strict` is ported onto link protocol 0x03: session/command-token acknowledged commands (START/QUERY/CRC/DATA/FINISH/ACTIVATE/ABORT), full 32-bit CRC32 plus on-device vector validation and target/board lock, watchdog-safe per-sector staging erase, WKOT install-metadata BOOT_OK self-report, OTA radio discovery while the nRF sleeps, and target-locked `.wkota` packages (`tools/make_ota_package.py`). The Receiver must be flashed from its `codex/rp2040-ota-strict-port` branch (end-to-end DFU command acknowledgement, 8-byte status Feature report); the Transmitter is unchanged.
 - [ ] **nRF52840 Transmitter Wireless OTA DFU via Receiver**: Research and verify feasibility of flashing the Transmitter module wirelessly over the 2.4GHz ESB radio link from the Receiver Dongle.
   - Investigate nRF52840 1MB flash layout (MCUboot Dual-Bank vs custom RAM ESB DFU writer) compatible with the onboard Adafruit UF2 bootloader.
   - Extend DFU header with target selector (RP2040 vs Transmitter).
