@@ -55,7 +55,9 @@ the nRF52840 transmitter over SPI.
   while nRF52840 stops released-state keepalives and enters System
   OFF after five minutes without changed HID input. CSN/P0.22 wakes it and the
   RP2040 retransmits keyboard and Consumer state after the boot guard time.
-  Hardware sleep-current and wake-latency validation remains required.
+  Wake from System OFF with the first keypress is hardware-validated at
+  96 MHz (functional, under 1 s to first delivered input, acceptable for
+  this build); only the sleep-current measurement itself remains open.
 - Sticky Consumer-release and modifier-order hardening is implemented across
   the matched set. RP2040 captures changed USB reports immediately, places them
   in a bounded FIFO, and schedules an exact-sequence duplicate after a 250 us
