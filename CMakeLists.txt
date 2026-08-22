@@ -79,6 +79,7 @@ target_link_libraries(WirelessKeyboard
     hardware_adc
     hardware_pwm
     hardware_flash
+    pico_flash
     hardware_sync
 )
 
@@ -152,6 +153,9 @@ target_link_libraries(WirelessKeyboardRam
     hardware_spi
     hardware_adc
     hardware_pwm
+    hardware_flash
+    pico_flash
+    hardware_sync
 )
 target_include_directories(WirelessKeyboardRam PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}

@@ -10,11 +10,13 @@
 #include "hardware/pwm.h"
 #include "hardware/flash.h"
 #include "hardware/watchdog.h"
+#include "pico/flash.h"
 #include "bsp/board_api.h"
 #include "tusb.h"
 #include "host/usbh.h"
 #include "pio_usb.h"
 #include "pio_usb_ll.h"
+#include "ota_layout.h"
 
 #ifndef RUNTIME_LOGGING
 #define RUNTIME_LOGGING 0
@@ -56,6 +58,10 @@
 #define LINK_TYPE_DFU_DATA      0x11
 #define LINK_TYPE_DFU_FINISH    0x12
 #define LINK_TYPE_DFU_STATUS    0x13
+#define LINK_TYPE_DFU_CRC       0x14
+#define LINK_TYPE_DFU_ACTIVATE  0x15
+#define LINK_TYPE_DFU_ABORT     0x16
+#define LINK_TYPE_DFU_QUERY     0x17
 #define LINK_CONTROL_SYSTEM_OFF 0x01
 #define LINK_CONTROL_POLL_ACK   0x02
 #define LINK_CONTROL_SESSION_RESET 0x03
@@ -72,7 +78,14 @@
 #define DFU_STATUS_ERR_SIZE     0x03u
 #define DFU_STATUS_ERR_CRC      0x04u
 #define DFU_STATUS_ERR_FLASH    0x05u
-#define DFU_STATUS_SUCCESS      0x06u
+#define DFU_STATUS_VERIFIED     0x06u
+#define DFU_STATUS_ERR_TARGET   0x07u
+#define DFU_STATUS_ERR_PROTOCOL 0x08u
+#define DFU_STATUS_ERR_SESSION  0x09u
+#define DFU_STATUS_ERR_STATE    0x0Au
+#define DFU_STATUS_APPLYING     0x0Bu
+#define DFU_STATUS_BOOT_OK      0x0Cu
+#define DFU_STATUS_ABORTED      0x0Du
 #ifndef RADIO_INACTIVITY_MS
 #define RADIO_INACTIVITY_MS (5u * 60u * 1000u)
 #endif
@@ -84,6 +97,11 @@
 #define RADIO_SLEEP_BLINK_HALF_PERIOD_MS 100u
 #define SPI_REARM_GUARD_US 75u
 #define SPI_ACK_POLL_MS 100u
+#define SPI_ACK_POLL_IDLE_MS 1000u
+#define SPI_ACK_POLL_DFU_MS  1u
+#define SPI_ACK_POLL_QUIET_MS 20u
+#define OTA_RADIO_DISCOVERY_MS 30000u
+#define DFU_APPLY_DELAY_MS 1500u
 #define KEYBOARD_HID_STALL_RECOVERY_MS 250u
 #define SONIX_KEYBOARD_EP_IN 0x81u
 #define PIO_USB_ROOT_INDEX 0u
@@ -366,7 +384,7 @@ static uint16_t last_transport_consumer_usage;
 static bool last_transport_consumer_valid;
 static struct pending_radio_input battery_spi_pending_frame;
 static bool battery_spi_pending;
-static uint32_t __unused spi_last_ack_poll_ms;
+static uint32_t spi_last_ack_poll_ms;
 
 static uint8_t remote_keyboard_led_state;
 static uint8_t remote_keyboard_led_sequence;
@@ -455,56 +473,216 @@ static bool pending_radio_queue_pop(struct pending_radio_input *queue,
     return true;
 }
 
-static uint32_t dfu_total_size = 0;
-static uint32_t dfu_expected_crc32 = 0;
-static uint32_t dfu_bytes_written = 0;
+/* Strict OTA DFU session state (ported from codex/rp2040-ota-strict, link
+ * protocol 0x03).  Every PC command carries a session id (data[1]) and the
+ * reverse-ACK frame sequence as a command token; every reply echoes both so
+ * the tool can match responses to commands.  Flash writes run in bounded
+ * flash_safe_execute windows: staging erase is chunked per 4 kB sector with
+ * the watchdog fed between chunks, streaming programs one 256-byte page at a
+ * time, and the final slot swap runs on core 0 after core 1 has been reset,
+ * so the apply path never executes from flash while SSI is in command mode. */
+static uint32_t dfu_total_size;
+static uint32_t dfu_expected_crc32;
+static uint32_t dfu_bytes_accepted;
+static uint32_t dfu_bytes_committed;
 static uint8_t dfu_page_buffer[FLASH_PAGE_SIZE];
-static uint16_t dfu_page_buffer_len = 0;
-static uint8_t dfu_last_seq = 0xFF;
+static uint16_t dfu_page_buffer_len;
+static uint8_t dfu_session;
+static uint8_t dfu_last_command_token;
+static uint8_t dfu_last_command;
+static uint8_t dfu_last_status;
+static uint8_t dfu_last_detail;
+static uint32_t dfu_last_status_value;
+static bool dfu_session_active;
+static bool dfu_crc_received;
+static bool dfu_image_verified;
+static bool dfu_last_command_valid;
+static bool dfu_apply_pending;
+static uint32_t dfu_apply_after_ms;
+static volatile bool dfu_apply_requested;
+static volatile uint32_t dfu_apply_size;
+static uint8_t dfu_boot_report_count;
+static uint32_t dfu_boot_report_after_ms;
+static uint32_t ota_last_radio_discovery_ms;
+static uint8_t spi_control_sequence;
 
-static uint32_t calculate_crc32(const uint8_t *data, size_t length)
+enum dfu_flash_operation_type {
+    DFU_FLASH_ERASE,
+    DFU_FLASH_PROGRAM,
+};
+
+struct dfu_flash_operation {
+    enum dfu_flash_operation_type type;
+    uint32_t offset;
+    uint32_t size;
+    const uint8_t *data;
+};
+
+static void __no_inline_not_in_flash_func(dfu_flash_callback)(void *context)
 {
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < length; ++i) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; ++j) {
-            if (crc & 1) {
-                crc = (crc >> 1) ^ 0xEDB88320u;
-            } else {
-                crc = (crc >> 1);
-            }
+    struct dfu_flash_operation const *const operation = context;
+
+    if (operation->type == DFU_FLASH_ERASE) {
+        flash_range_erase(operation->offset, operation->size);
+    } else {
+        flash_range_program(operation->offset, operation->data,
+                            operation->size);
+    }
+}
+
+static bool dfu_flash_erase(uint32_t offset, uint32_t size)
+{
+    struct dfu_flash_operation operation = {
+        .type = DFU_FLASH_ERASE,
+        .offset = offset,
+        .size = size,
+        .data = NULL,
+    };
+    return flash_safe_execute(dfu_flash_callback, &operation, 1000u) ==
+           PICO_OK;
+}
+
+static bool dfu_flash_program(uint32_t offset, const uint8_t *data,
+                              uint32_t size)
+{
+    struct dfu_flash_operation operation = {
+        .type = DFU_FLASH_PROGRAM,
+        .offset = offset,
+        .size = size,
+        .data = data,
+    };
+    return flash_safe_execute(dfu_flash_callback, &operation, 1000u) ==
+           PICO_OK;
+}
+
+/* Erase staging one 4 kB sector per flash window so the 1 s watchdog can be
+ * fed between sectors.  A single worst-case sector erase stays far below the
+ * watchdog timeout, unlike the previous one-window whole-image erase. */
+static bool dfu_flash_erase_staging(uint32_t size)
+{
+    uint32_t const aligned_size = (size + FLASH_SECTOR_SIZE - 1u) &
+                                  ~(FLASH_SECTOR_SIZE - 1u);
+
+    for (uint32_t offset = 0; offset < aligned_size;
+         offset += FLASH_SECTOR_SIZE) {
+        watchdog_update();
+        if (!dfu_flash_erase(FLASH_STAGING_OFFSET + offset,
+                             FLASH_SECTOR_SIZE)) {
+            return false;
         }
     }
-    return ~crc;
-}
-
-static void dfu_flash_erase_staging(uint32_t size)
-{
-    uint32_t const aligned_size = (size + FLASH_SECTOR_SIZE - 1u) & ~(FLASH_SECTOR_SIZE - 1u);
-    uint32_t const ints = save_and_disable_interrupts();
-    flash_range_erase(FLASH_STAGING_OFFSET, aligned_size);
-    restore_interrupts(ints);
-}
-
-static void dfu_flash_program_page(uint32_t offset, const uint8_t *data)
-{
-    uint32_t const ints = save_and_disable_interrupts();
-    flash_range_program(FLASH_STAGING_OFFSET + offset, data, FLASH_PAGE_SIZE);
-    restore_interrupts(ints);
+    return true;
 }
 
 static bool spi_queue_input(uint8_t type, const uint8_t data[KBD_REPORT_LEN]);
 
-static void dfu_send_status(uint8_t status, uint8_t progress, uint16_t offset_div_4)
+static void dfu_send_status(uint8_t status, uint8_t session,
+                            uint8_t command_token, uint8_t detail,
+                            uint32_t value)
 {
-    uint8_t data[KBD_REPORT_LEN] = { 0 };
-    data[0] = status;
-    data[1] = progress;
-    data[2] = (uint8_t)offset_div_4;
-    data[3] = (uint8_t)(offset_div_4 >> 8);
-    spi_queue_input(LINK_TYPE_DFU_STATUS, data);
+    uint8_t data[KBD_REPORT_LEN] = {
+        status,
+        session,
+        command_token,
+        detail,
+        (uint8_t)value,
+        (uint8_t)(value >> 8),
+        (uint8_t)(value >> 16),
+        (uint8_t)(value >> 24),
+    };
+    (void)spi_queue_input(LINK_TYPE_DFU_STATUS, data);
 }
 
+static void dfu_reply(uint8_t status, uint8_t detail, uint32_t value)
+{
+    dfu_last_status = status;
+    dfu_last_detail = detail;
+    dfu_last_status_value = value;
+    dfu_send_status(status, dfu_session, dfu_last_command_token, detail,
+                    value);
+}
+
+static void dfu_repeat_last_reply(void)
+{
+    dfu_send_status(dfu_last_status, dfu_session, dfu_last_command_token,
+                    dfu_last_detail, dfu_last_status_value);
+}
+
+static void dfu_reset_session(void)
+{
+    dfu_total_size = 0;
+    dfu_expected_crc32 = 0;
+    dfu_bytes_accepted = 0;
+    dfu_bytes_committed = 0;
+    dfu_page_buffer_len = 0;
+    dfu_session_active = false;
+    dfu_crc_received = false;
+    dfu_image_verified = false;
+}
+
+static bool dfu_flush_page(void)
+{
+    if (dfu_page_buffer_len == 0u) return true;
+
+    for (uint16_t i = dfu_page_buffer_len; i < FLASH_PAGE_SIZE; ++i) {
+        dfu_page_buffer[i] = 0xFFu;
+    }
+    if (!dfu_flash_program(FLASH_STAGING_OFFSET + dfu_bytes_committed,
+                           dfu_page_buffer, FLASH_PAGE_SIZE)) {
+        return false;
+    }
+    dfu_bytes_committed += dfu_page_buffer_len;
+    dfu_page_buffer_len = 0;
+    return true;
+}
+
+/* Without the Etapa B bootloader, ACTIVATE itself records what was applied:
+ * the page is unused by the current single-app layout, survives the reboot,
+ * and gives QUERY/BOOT_OK a real, CRC-protected answer. */
+static bool dfu_write_install_metadata(void)
+{
+    struct ota_install_metadata metadata;
+    uint8_t *raw = (uint8_t *)&metadata;
+
+    for (size_t i = 0; i < sizeof(metadata); ++i) raw[i] = 0xFFu;
+    metadata.magic = OTA_METADATA_MAGIC;
+    metadata.format = OTA_METADATA_FORMAT;
+    metadata.target = OTA_TARGET_RP2040;
+    metadata.protocol = OTA_PROTOCOL_VERSION;
+    metadata.board_id = OTA_BOARD_WEACT_RP2040_4MB;
+    metadata.session = dfu_session;
+    metadata.command_token = dfu_last_command_token;
+    metadata.image_size = dfu_total_size;
+    metadata.image_crc32 = dfu_expected_crc32;
+    metadata.immutable_crc32 = ota_metadata_immutable_crc(&metadata);
+    metadata.state = OTA_METADATA_STATE_INSTALLED;
+
+    return dfu_flash_erase(OTA_METADATA_OFFSET, FLASH_SECTOR_SIZE) &&
+           dfu_flash_program(OTA_METADATA_OFFSET,
+                             (const uint8_t *)&metadata, FLASH_PAGE_SIZE);
+}
+
+/* The staged image is a complete flash image (boot2 at 0, ARM vectors at
+ * 0x100).  Reject anything that is not a plausible application for this
+ * board even when its CRC matches, so a wrong-device or wrong-slot package
+ * can never overwrite the running application. */
+static bool dfu_staged_image_vectors_valid(void)
+{
+    const uint32_t *const vectors =
+        (const uint32_t *)(XIP_BASE + FLASH_STAGING_OFFSET + 0x100u);
+    uint32_t const stack_pointer = vectors[0];
+    uint32_t const reset_handler = vectors[1];
+
+    return stack_pointer >= SRAM_BASE && stack_pointer <= SRAM_END &&
+           (reset_handler & 1u) != 0u &&
+           (reset_handler & ~1u) >= XIP_BASE + 0x100u &&
+           (reset_handler & ~1u) < XIP_BASE + FLASH_STAGING_OFFSET;
+}
+
+/* Called from the core 0 main loop once core 1 has requested the swap, so
+ * multicore_reset_core1() runs in its documented core 0 direction and only
+ * one core exists from here on.  The watchdog is fed inside the loop because
+ * a full image swap can exceed one watchdog period. */
 static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
 {
     /* 0. Stop Core 1 completely to prevent XIP instruction fetch collisions */
@@ -524,6 +702,7 @@ static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
         for (uint16_t i = 0; i < FLASH_PAGE_SIZE; ++i) {
             ram_page[i] = src_xip[i];
         }
+        watchdog_update();
         flash_range_program(offset, ram_page, FLASH_PAGE_SIZE);
     }
 
@@ -536,72 +715,223 @@ static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
 
 static void dfu_process_command(struct link_ack_frame const *ack)
 {
-    uint8_t const cmd = ack->data[0];
+    uint8_t const command = ack->data[0];
+    uint8_t const command_session = ack->data[1];
 
-    if (cmd == LINK_TYPE_DFU_START) {
-        dfu_total_size = (uint32_t)ack->data[1] |
-                         ((uint32_t)ack->data[2] << 8) |
-                         ((uint32_t)ack->data[3] << 16) |
-                         ((uint32_t)ack->data[4] << 24);
-        dfu_expected_crc32 = (uint32_t)ack->data[5] |
-                            ((uint32_t)ack->data[6] << 8) |
-                            ((uint32_t)ack->data[7] << 16);
-        if (dfu_total_size == 0 || dfu_total_size > FLASH_STAGING_MAX_SIZE) {
-            dfu_send_status(DFU_STATUS_ERR_SIZE, 0, 0);
-            return;
-        }
-        dfu_flash_erase_staging(dfu_total_size);
-        dfu_bytes_written = 0;
-        dfu_page_buffer_len = 0;
-        dfu_last_seq = ack->sequence;
-        dfu_send_status(DFU_STATUS_OK, 0, 0);
+    /* Any DFU traffic keeps the radio awake; a five-minute mid-session
+     * System OFF would otherwise kill the update silently. */
+    radio_last_activity_ms = board_millis();
+
+    /* The reverse ACK path can redeliver one command while its reply is
+     * still queued.  Replay the stored reply instead of double-applying. */
+    if (dfu_last_command_valid &&
+        ack->sequence == dfu_last_command_token &&
+        command == dfu_last_command && command_session == dfu_session) {
+        dfu_repeat_last_reply();
         return;
     }
 
-    if (cmd == LINK_TYPE_DFU_DATA) {
-        if (ack->sequence == dfu_last_seq) {
-            uint8_t const prog = (uint8_t)((dfu_bytes_written * 100u) / (dfu_total_size ? dfu_total_size : 1u));
-            dfu_send_status(DFU_STATUS_OK, prog, (uint16_t)(dfu_bytes_written / 4u));
+    dfu_last_command_valid = true;
+    dfu_last_command_token = ack->sequence;
+    dfu_last_command = command;
+
+    if (command == LINK_TYPE_DFU_START) {
+        uint8_t const target = ack->data[2];
+        uint8_t const protocol = ack->data[3];
+        uint32_t const image_size = (uint32_t)ack->data[4] |
+            ((uint32_t)ack->data[5] << 8) |
+            ((uint32_t)ack->data[6] << 16) |
+            ((uint32_t)ack->data[7] << 24);
+
+        dfu_session = command_session;
+        if (target != OTA_TARGET_RP2040) {
+            dfu_reply(DFU_STATUS_ERR_TARGET, target, 0);
             return;
         }
-        dfu_last_seq = ack->sequence;
+        if (protocol != OTA_PROTOCOL_VERSION) {
+            dfu_reply(DFU_STATUS_ERR_PROTOCOL, protocol, 0);
+            return;
+        }
+        if (image_size <= 0x100u + 8u ||
+            image_size > FLASH_STAGING_MAX_SIZE) {
+            dfu_reply(DFU_STATUS_ERR_SIZE, 0, image_size);
+            return;
+        }
 
-        for (int i = 2; i < 8; ++i) {
-            if (dfu_bytes_written + dfu_page_buffer_len < dfu_total_size) {
-                dfu_page_buffer[dfu_page_buffer_len++] = ack->data[i];
-                if (dfu_page_buffer_len == FLASH_PAGE_SIZE) {
-                    dfu_flash_program_page(dfu_bytes_written, dfu_page_buffer);
-                    dfu_bytes_written += FLASH_PAGE_SIZE;
-                    dfu_page_buffer_len = 0;
+        dfu_reset_session();
+        dfu_session = command_session;
+        dfu_total_size = image_size;
+        if (!dfu_flash_erase_staging(image_size)) {
+            dfu_reply(DFU_STATUS_ERR_FLASH, 1u, 0);
+            return;
+        }
+        dfu_session_active = true;
+        dfu_reply(DFU_STATUS_OK, 0, 0);
+        return;
+    }
+
+    if (command == LINK_TYPE_DFU_QUERY) {
+        const struct ota_install_metadata *const metadata =
+            (const struct ota_install_metadata *)(XIP_BASE +
+                                                  OTA_METADATA_OFFSET);
+        dfu_session = command_session;
+        if (ack->data[2] != OTA_TARGET_RP2040) {
+            dfu_reply(DFU_STATUS_ERR_TARGET, ack->data[2], 0);
+        } else if (ack->data[3] != OTA_PROTOCOL_VERSION) {
+            dfu_reply(DFU_STATUS_ERR_PROTOCOL, ack->data[3], 0);
+        } else if (ota_metadata_is_valid(metadata) &&
+                   metadata->state == OTA_METADATA_STATE_INSTALLED) {
+            dfu_reply(DFU_STATUS_BOOT_OK, 0, metadata->image_crc32);
+        } else {
+            dfu_reply(DFU_STATUS_IDLE, 0, 0);
+        }
+        return;
+    }
+
+    if (!dfu_session_active || command_session != dfu_session) {
+        dfu_session = command_session;
+        dfu_reply(DFU_STATUS_ERR_SESSION, 0, 0);
+        return;
+    }
+
+    if (command == LINK_TYPE_DFU_CRC) {
+        uint16_t const board_id = (uint16_t)ack->data[6] |
+            ((uint16_t)ack->data[7] << 8);
+        if (board_id != OTA_BOARD_WEACT_RP2040_4MB) {
+            dfu_reply(DFU_STATUS_ERR_TARGET, 0, board_id);
+            return;
+        }
+        if (dfu_bytes_accepted != 0u) {
+            dfu_reply(DFU_STATUS_ERR_STATE, 1u, dfu_bytes_accepted);
+            return;
+        }
+        dfu_expected_crc32 = (uint32_t)ack->data[2] |
+            ((uint32_t)ack->data[3] << 8) |
+            ((uint32_t)ack->data[4] << 16) |
+            ((uint32_t)ack->data[5] << 24);
+        dfu_crc_received = true;
+        dfu_reply(DFU_STATUS_OK, 0, 0);
+        return;
+    }
+
+    if (command == LINK_TYPE_DFU_DATA) {
+        if (!dfu_crc_received || dfu_image_verified) {
+            dfu_reply(DFU_STATUS_ERR_STATE, 2u, dfu_bytes_accepted);
+            return;
+        }
+        for (uint8_t i = 2u; i < 8u &&
+             dfu_bytes_accepted < dfu_total_size; ++i) {
+            dfu_page_buffer[dfu_page_buffer_len++] = ack->data[i];
+            ++dfu_bytes_accepted;
+            if (dfu_page_buffer_len == FLASH_PAGE_SIZE) {
+                if (!dfu_flash_program(
+                        FLASH_STAGING_OFFSET + dfu_bytes_committed,
+                        dfu_page_buffer, FLASH_PAGE_SIZE)) {
+                    dfu_reply(DFU_STATUS_ERR_FLASH, 2u,
+                              dfu_bytes_accepted);
+                    return;
                 }
+                dfu_bytes_committed += FLASH_PAGE_SIZE;
+                dfu_page_buffer_len = 0;
             }
         }
-
-        uint8_t const prog = (uint8_t)((dfu_bytes_written * 100u) / (dfu_total_size ? dfu_total_size : 1u));
-        dfu_send_status(DFU_STATUS_OK, prog, (uint16_t)(dfu_bytes_written / 4u));
+        uint8_t const progress =
+            (uint8_t)((dfu_bytes_accepted * 100u) / dfu_total_size);
+        dfu_reply(DFU_STATUS_OK, progress, dfu_bytes_accepted);
         return;
     }
 
-    if (cmd == LINK_TYPE_DFU_FINISH) {
-        if (dfu_page_buffer_len > 0) {
-            memset(&dfu_page_buffer[dfu_page_buffer_len], 0xFF, FLASH_PAGE_SIZE - dfu_page_buffer_len);
-            dfu_flash_program_page(dfu_bytes_written, dfu_page_buffer);
-            dfu_bytes_written += dfu_page_buffer_len;
-            dfu_page_buffer_len = 0;
+    if (command == LINK_TYPE_DFU_FINISH) {
+        if (!dfu_crc_received || dfu_bytes_accepted != dfu_total_size) {
+            dfu_reply(DFU_STATUS_ERR_STATE, 3u, dfu_bytes_accepted);
+            return;
         }
-
-        const uint8_t *staging_flash = (const uint8_t *)(XIP_BASE + FLASH_STAGING_OFFSET);
-        uint32_t const actual_crc = calculate_crc32(staging_flash, dfu_total_size);
-
-        if (dfu_expected_crc32 != 0 && (actual_crc & 0x00FFFFFFu) != (dfu_expected_crc32 & 0x00FFFFFFu)) {
-            dfu_send_status(DFU_STATUS_ERR_CRC, 0, 0);
+        if (!dfu_flush_page()) {
+            dfu_reply(DFU_STATUS_ERR_FLASH, 3u, dfu_bytes_accepted);
+            return;
+        }
+        if (!dfu_staged_image_vectors_valid()) {
+            dfu_reply(DFU_STATUS_ERR_TARGET, 1u, 0);
+            return;
+        }
+        uint32_t const actual_crc = ota_crc32(
+            (const uint8_t *)(XIP_BASE + FLASH_STAGING_OFFSET),
+            dfu_total_size);
+        if (actual_crc != dfu_expected_crc32) {
+            dfu_reply(DFU_STATUS_ERR_CRC, 0, actual_crc);
         } else {
-            dfu_send_status(DFU_STATUS_SUCCESS, 100, (uint16_t)(dfu_total_size / 4u));
-            sleep_ms(250);
-            dfu_apply_and_reboot(dfu_total_size);
+            dfu_image_verified = true;
+            dfu_reply(DFU_STATUS_VERIFIED, 100u, actual_crc);
         }
         return;
     }
+
+    if (command == LINK_TYPE_DFU_ACTIVATE) {
+        if (!dfu_image_verified) {
+            dfu_reply(DFU_STATUS_ERR_STATE, 4u, dfu_bytes_accepted);
+            return;
+        }
+        if (!dfu_write_install_metadata()) {
+            dfu_reply(DFU_STATUS_ERR_FLASH, 4u, 0);
+            return;
+        }
+        dfu_reply(DFU_STATUS_APPLYING, 100u, dfu_expected_crc32);
+        dfu_apply_pending = true;
+        dfu_apply_after_ms = board_millis() + DFU_APPLY_DELAY_MS;
+        return;
+    }
+
+    if (command == LINK_TYPE_DFU_ABORT) {
+        dfu_reset_session();
+        dfu_session = command_session;
+        dfu_apply_pending = false;
+        dfu_reply(DFU_STATUS_ABORTED, 0, 0);
+        return;
+    }
+
+    dfu_reply(DFU_STATUS_ERR_PROTOCOL, command, 0);
+}
+
+/* Core 1 waits until the APPLYING reply has fully drained through SPI/ESB,
+ * then asks core 0 to perform the slot swap (see main loop). */
+static void dfu_apply_task(void)
+{
+    if (!dfu_apply_pending) return;
+    if ((int32_t)(board_millis() - dfu_apply_after_ms) < 0) return;
+    if (spi_retry_pending || spi_input_queue_count != 0 ||
+        battery_spi_pending) {
+        return;
+    }
+
+    dfu_apply_size = dfu_total_size;
+    __dmb();
+    dfu_apply_requested = true;
+    dfu_apply_pending = false;
+}
+
+/* After a successful install the new image confirms itself: the metadata
+ * page written by ACTIVATE still says INSTALLED, so the tool gets its
+ * post-reboot BOOT_OK without any bootloader. */
+static void dfu_boot_report_task(void)
+{
+    if (dfu_boot_report_count >= 20u ||
+        (int32_t)(board_millis() - dfu_boot_report_after_ms) < 0) {
+        return;
+    }
+
+    const struct ota_install_metadata *const metadata =
+        (const struct ota_install_metadata *)(XIP_BASE +
+                                              OTA_METADATA_OFFSET);
+    if (!ota_metadata_is_valid(metadata) ||
+        metadata->state != OTA_METADATA_STATE_INSTALLED) {
+        dfu_boot_report_count = 20u;
+        return;
+    }
+
+    dfu_send_status(DFU_STATUS_BOOT_OK, metadata->session,
+                    metadata->command_token, 0, metadata->image_crc32);
+    ++dfu_boot_report_count;
+    dfu_boot_report_after_ms = board_millis() + 250u;
 }
 
 static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
@@ -827,34 +1157,60 @@ static void spi_service_task(void)
     }
 }
 
-static void __unused spi_send_control_command(uint8_t command)
+static void spi_send_control_command(uint8_t command)
 {
     struct link_input_frame const frame = {
         .magic = LINK_MAGIC,
         .version = LINK_VERSION,
         .type = LINK_TYPE_CONTROL,
-        .sequence = spi_sequence++,
+        /* SPI-only control traffic is not visible to the Receiver's per-type
+         * input sequence tracking, but keep it out of the Keyboard/Consumer
+         * sequence namespace anyway so hidden polls can never make a later
+         * key transition look like an old packet. */
+        .sequence = spi_control_sequence++,
         .data = { command, 0, 0, 0, 0, 0, 0, 0 },
     };
 
     spi_write_frame(&frame);
+    /* A control transaction uses the same SPIS EasyDMA endpoint as input:
+     * preserve the inter-frame gap before a key transition can be sent. */
+    spi_last_tx_us = time_us_32();
 }
 
-static void __unused spi_ack_poll_task(void)
+/* Reverse-ACK pump.  During an OTA session the PC's DFU commands travel as
+ * ESB ACK payloads and need regular SPI transactions to be delivered; 1 kHz
+ * input alone cannot guarantee that.  Idle polling stays far from the input
+ * hot path (never within SPI_ACK_POLL_QUIET_MS of real input, never while
+ * input work is queued) and doubles as LED-state refresh.  While the radio
+ * is in System OFF, periodic wake requests let an OTA session start without
+ * a physical keypress (OTA discovery). */
+static void spi_ack_poll_task(void)
 {
-    /* Temporarily commented out for experiment: test typing without type=3 polling packets */
-    /*
     uint32_t const now = board_millis();
+
+    if (radio_power_state == RADIO_SYSTEM_OFF) {
+        if ((uint32_t)(now - ota_last_radio_discovery_ms) >=
+            OTA_RADIO_DISCOVERY_MS) {
+            ota_last_radio_discovery_ms = now;
+            radio_wake_requested = true;
+        }
+        return;
+    }
+
+    uint32_t const interval = dfu_session_active ?
+        SPI_ACK_POLL_DFU_MS : SPI_ACK_POLL_IDLE_MS;
 
     if (radio_power_state != RADIO_AWAKE || spi_retry_pending ||
         spi_input_queue_count != 0 || battery_spi_pending ||
-        (uint32_t)(now - spi_last_ack_poll_ms) < SPI_ACK_POLL_MS) {
+        (!dfu_session_active &&
+         (uint32_t)(now - radio_last_activity_ms) < SPI_ACK_POLL_QUIET_MS) ||
+        (uint32_t)(now - spi_last_ack_poll_ms) < interval ||
+        (uint32_t)(time_us_32() - spi_last_tx_us) < 150u) {
         return;
     }
 
     spi_last_ack_poll_ms = now;
     spi_send_control_command(LINK_CONTROL_POLL_ACK);
-    */
 }
 
 static bool keyboard_report_is_released(void)
@@ -2612,6 +2968,9 @@ static void worker_core1_main(void)
 #if SPI_LINK_TEST_MODE
         spi_link_test_task();
 #endif
+        spi_ack_poll_task();
+        dfu_apply_task();
+        dfu_boot_report_task();
         status_task();
         worker_core1_idle_wait();
     }
@@ -2682,6 +3041,14 @@ int main(void)
     printf("[INIT] Ready. Waiting for keyboard on D+/D-...\n\n");
 
     while (1) {
+        /* Core 1 hands the verified slot swap to core 0: this is the only
+         * context where multicore_reset_core1() is used in its documented
+         * direction before dfu_apply_and_reboot takes the whole chip. */
+        if (dfu_apply_requested) {
+            dfu_apply_requested = false;
+            dfu_apply_and_reboot(dfu_apply_size);
+        }
+
         watchdog_update();
         tuh_task();
         hid_receive_rearm_task();
