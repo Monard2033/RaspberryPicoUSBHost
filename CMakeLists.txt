@@ -49,6 +49,7 @@ target_compile_definitions(WirelessKeyboard PRIVATE
     CFG_TUH_HID_KEYBOARD=1
     CFG_TUD_ENABLED=0
     PIO_USB_USE_TINYUSB
+    WIRELESS_KEYBOARD_OTA_SUPPORT=1
 )
 
 if(POWER_SAVING_DIAGNOSTIC_IDLE_MS)
@@ -130,6 +131,63 @@ else()
         COMMENT "Updating firmware/WirelessKeyboard.uf2 and _OTA.bin (Python not found: regenerate .wkota manually)"
     )
 endif()
+
+# === Safe variant: identical input pipeline, strict OTA DFU receiver fully
+# compiled out (WIRELESS_KEYBOARD_OTA_SUPPORT=0). Immune to flash_ota.exe;
+# build on demand with: cmake --build build --target WirelessKeyboardSafe
+add_executable(WirelessKeyboardSafe EXCLUDE_FROM_ALL
+    WirelessKeyboard.c
+)
+
+pico_set_program_name(WirelessKeyboardSafe "WirelessKeyboardSafe")
+pico_set_program_version(WirelessKeyboardSafe "0.2")
+
+pico_enable_stdio_usb(WirelessKeyboardSafe 0)
+pico_enable_stdio_uart(WirelessKeyboardSafe ${WIRELESS_KEYBOARD_UART_DIAGNOSTIC})
+
+target_compile_definitions(WirelessKeyboardSafe PRIVATE
+    CFG_TUH_ENABLED=1
+    CFG_TUH_RPI_PIO_USB=1
+    CFG_TUH_HID=4
+    CFG_TUH_HID_KEYBOARD=1
+    CFG_TUD_ENABLED=0
+    PIO_USB_USE_TINYUSB
+    WIRELESS_KEYBOARD_OTA_SUPPORT=0
+)
+
+target_link_libraries(WirelessKeyboardSafe
+    pico_stdlib
+    pico_multicore
+    tinyusb_host
+    tinyusb_board
+    pico_pio_usb
+    hardware_pio
+    hardware_dma
+    hardware_spi
+    hardware_adc
+    hardware_pwm
+    hardware_flash
+    pico_flash
+    hardware_sync
+)
+
+target_include_directories(WirelessKeyboardSafe PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}
+    ${PICO_SDK_PATH}/lib/tinyusb/src
+)
+
+target_sources(WirelessKeyboardSafe PRIVATE
+    ${PICO_SDK_PATH}/lib/tinyusb/src/portable/raspberrypi/pio_usb/hcd_pio_usb.c
+)
+
+pico_add_extra_outputs(WirelessKeyboardSafe)
+
+add_custom_command(TARGET WirelessKeyboardSafe POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_BINARY_DIR}/WirelessKeyboardSafe.uf2"
+            "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboardSafe.uf2"
+    COMMENT "Updating firmware/WirelessKeyboardSafe.uf2 (no-OTA safe image)"
+)
 
 # RAM-only utility used to diagnose a QSPI flash that refuses UF2/OpenOCD
 # erase operations. It intentionally erases/programs TEST_FLASH_OFFSET.

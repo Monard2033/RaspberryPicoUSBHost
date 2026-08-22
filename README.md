@@ -317,6 +317,7 @@ updated over the air *and* reverted by cable. File names describe the
 | `firmware/WirelessKeyboard.uf2` | Current build — BOOTSEL cable image (flash or revert from any state) |
 | `firmware/WirelessKeyboard_OTA.bin` | Raw flash payload, input for `tools/make_ota_package.py` |
 | `firmware/WirelessKeyboard_OTA.wkota` | Strict OTA package consumed by `tools/flash_ota.exe` (auto-regenerated at build) |
+| `firmware/WirelessKeyboardSafe.uf2` | No-OTA safe image: identical input pipeline, DFU receiver fully compiled out (`WIRELESS_KEYBOARD_OTA_SUPPORT=0`) — immune to `flash_ota.exe`. Build on demand: `cmake --build build --target WirelessKeyboardSafe` |
 | `firmware/good/<timestamp>_<sha>/` | **Validated snapshots ("Latest Good")** with `BUILD_INFO.txt` (SHA-256, commit, notes, revert instructions) |
 | `firmware/good/LATEST.txt` | Pointer answering "which build is the Latest Good" |
 

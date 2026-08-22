@@ -34,6 +34,14 @@
 #define printf(...) do { } while (0)
 #endif
 
+/* Strict OTA DFU receiver. The WirelessKeyboardSafe CMake target compiles
+ * this file with the value 0: no DFU state machine, no flash writers, and
+ * no reaction to any DFU ack payload — absolute immunity to a stray
+ * flash_ota.exe. The main target keeps 1 (dormant unless addressed). */
+#ifndef WIRELESS_KEYBOARD_OTA_SUPPORT
+#define WIRELESS_KEYBOARD_OTA_SUPPORT 1
+#endif
+
 /*--------------------------------------------------------------------+
  *  Pin assignments
  *--------------------------------------------------------------------*/
@@ -374,6 +382,7 @@ static uint8_t spi_input_queue_count;
 static bool radio_sleep_indicator_active;
 static uint32_t radio_sleep_indicator_started_ms;
 static uint8_t spi_sequence;
+static uint8_t spi_control_sequence;
 static struct link_input_frame spi_retry_frame;
 static bool spi_retry_pending;
 static uint32_t spi_retry_after_us;
@@ -473,6 +482,7 @@ static bool pending_radio_queue_pop(struct pending_radio_input *queue,
     return true;
 }
 
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
 /* Strict OTA DFU session state (ported from codex/rp2040-ota-strict, link
  * protocol 0x03).  Every PC command carries a session id (data[1]) and the
  * reverse-ACK frame sequence as a command token; every reply echoes both so
@@ -504,7 +514,6 @@ static volatile uint32_t dfu_apply_size;
 static uint8_t dfu_boot_report_count;
 static uint32_t dfu_boot_report_after_ms;
 static uint32_t ota_last_radio_discovery_ms;
-static uint8_t spi_control_sequence;
 
 enum dfu_flash_operation_type {
     DFU_FLASH_ERASE,
@@ -933,6 +942,7 @@ static void dfu_boot_report_task(void)
     ++dfu_boot_report_count;
     dfu_boot_report_after_ms = board_millis() + 250u;
 }
+#endif /* WIRELESS_KEYBOARD_OTA_SUPPORT */
 
 static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
 {
@@ -943,10 +953,12 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
         return;
     }
 
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
     if (ack.type == LINK_ACK_TYPE_DFU) {
         dfu_process_command(&ack);
         return;
     }
+#endif
 
     if (ack.type != LINK_ACK_TYPE_LOCK_STATE ||
         (ack.data[1] & 0x01u) == 0) {
@@ -1188,6 +1200,7 @@ static void spi_ack_poll_task(void)
 {
     uint32_t const now = board_millis();
 
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
     if (radio_power_state == RADIO_SYSTEM_OFF) {
         if ((uint32_t)(now - ota_last_radio_discovery_ms) >=
             OTA_RADIO_DISCOVERY_MS) {
@@ -1199,11 +1212,18 @@ static void spi_ack_poll_task(void)
 
     uint32_t const interval = dfu_session_active ?
         SPI_ACK_POLL_DFU_MS : SPI_ACK_POLL_IDLE_MS;
+#else
+    /* No OTA receiver compiled in: no session can exist and no discovery
+     * wake is ever needed; only the idle LED-state refresh poll remains. */
+    uint32_t const interval = SPI_ACK_POLL_IDLE_MS;
+#endif
 
     if (radio_power_state != RADIO_AWAKE || spi_retry_pending ||
         spi_input_queue_count != 0 || battery_spi_pending ||
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
         (!dfu_session_active &&
          (uint32_t)(now - radio_last_activity_ms) < SPI_ACK_POLL_QUIET_MS) ||
+#endif
         (uint32_t)(now - spi_last_ack_poll_ms) < interval ||
         (uint32_t)(time_us_32() - spi_last_tx_us) < 150u) {
         return;
@@ -2969,8 +2989,10 @@ static void worker_core1_main(void)
         spi_link_test_task();
 #endif
         spi_ack_poll_task();
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
         dfu_apply_task();
         dfu_boot_report_task();
+#endif
         status_task();
         worker_core1_idle_wait();
     }
@@ -3041,6 +3063,7 @@ int main(void)
     printf("[INIT] Ready. Waiting for keyboard on D+/D-...\n\n");
 
     while (1) {
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
         /* Core 1 hands the verified slot swap to core 0: this is the only
          * context where multicore_reset_core1() is used in its documented
          * direction before dfu_apply_and_reboot takes the whole chip. */
@@ -3048,6 +3071,7 @@ int main(void)
             dfu_apply_requested = false;
             dfu_apply_and_reboot(dfu_apply_size);
         }
+#endif
 
         watchdog_update();
         tuh_task();
