@@ -1,0 +1,13 @@
+﻿Latest Good snapshot
+Date     : 20260822_1803
+Git ref  : codex/rp2040-low-power-stage1
+Commit   : d48cfae  Record hardware wake-from-idle validation at 96 MHz
+Note     : Validated on hardware: typing speed, consumer, keyboard, idle 5min -> System OFF wake <=1s (96 MHz + WFI/WFE). Pre-strict-DFU protocol: OTA revert NOT possible, cable only.
+
+Files:
+WirelessKeyboard.uf2  SHA-256 7D4DF6A848C5AF0B004DA9C714328EC59F1E3E48549F6873B28FD83713D65B7B
+WirelessKeyboard_OTA.bin  SHA-256 38BD0CCA4186B732AEFEC1AF9094900FBBD52C552F242F063877E0EC51E177AB
+
+Revert by cable : BOOTSEL-flash WirelessKeyboard.uf2 (works from any state).
+Revert over air : tools\flash_ota.exe only against strict-OTA builds;
+                  builds without the strict DFU protocol must be cable-flashed.

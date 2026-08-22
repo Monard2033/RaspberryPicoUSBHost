@@ -95,22 +95,41 @@ target_sources(WirelessKeyboard PRIVATE
 
 pico_add_extra_outputs(WirelessKeyboard)
 
-# Keep the manually flashable image synchronized with every successful build.
-# This produces both WirelessKeyboard_OTA.uf2 and WirelessKeyboard_OTA.bin.
-add_custom_command(TARGET WirelessKeyboard POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory
-            "${CMAKE_CURRENT_LIST_DIR}/firmware"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_BINARY_DIR}/WirelessKeyboard.uf2"
-            "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard.uf2"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_BINARY_DIR}/WirelessKeyboard.uf2"
-            "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard_OTA.uf2"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_BINARY_DIR}/WirelessKeyboard.bin"
-            "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard_OTA.bin"
-    COMMENT "Updating firmware/WirelessKeyboard.uf2, WirelessKeyboard_OTA.uf2 and WirelessKeyboard_OTA.bin"
-)
+# Artifact roles (do not duplicate the same image under multiple names):
+#   firmware/WirelessKeyboard.uf2      - current build, BOOTSEL cable image
+#   firmware/WirelessKeyboard_OTA.bin  - raw OTA payload (make_ota_package input)
+#   firmware/WirelessKeyboard_OTA.wkota - strict OTA package for flash_ota.exe
+# Validated snapshots are managed by tools/save_good_build.ps1 (firmware/good).
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_custom_command(TARGET WirelessKeyboard POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+                "${CMAKE_CURRENT_LIST_DIR}/firmware"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_BINARY_DIR}/WirelessKeyboard.uf2"
+                "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard.uf2"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_BINARY_DIR}/WirelessKeyboard.bin"
+                "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard_OTA.bin"
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_LIST_DIR}/tools/make_ota_package.py"
+                --input "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard_OTA.bin"
+                --output "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard_OTA.wkota"
+        COMMENT "Updating firmware/WirelessKeyboard.uf2 and the OTA package set (_OTA.bin/.wkota)"
+    )
+else()
+    add_custom_command(TARGET WirelessKeyboard POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+                "${CMAKE_CURRENT_LIST_DIR}/firmware"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_BINARY_DIR}/WirelessKeyboard.uf2"
+                "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard.uf2"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_BINARY_DIR}/WirelessKeyboard.bin"
+                "${CMAKE_CURRENT_LIST_DIR}/firmware/WirelessKeyboard_OTA.bin"
+        COMMENT "Updating firmware/WirelessKeyboard.uf2 and _OTA.bin (Python not found: regenerate .wkota manually)"
+    )
+endif()
 
 # RAM-only utility used to diagnose a QSPI flash that refuses UF2/OpenOCD
 # erase operations. It intentionally erases/programs TEST_FLASH_OFFSET.

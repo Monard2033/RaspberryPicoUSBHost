@@ -305,13 +305,32 @@ Do not connect a Li-ion/LiPo battery directly to GP28. The documented
   Receiver caches it in vendor HID report ID `3`; telemetry never wakes radio
   System OFF or resets the five-minute inactivity deadline.
 
-## Firmware
+## Firmware artifacts and their roles
 
-The build copies the current UF2 to:
+There is exactly **one firmware image per build**; every build contains the
+( dormant unless addressed ) strict OTA receiver, so any build can be
+updated over the air *and* reverted by cable. File names describe the
+**delivery format**, not different code:
 
-```text
-firmware/WirelessKeyboard.uf2
+| File | Role |
+| --- | --- |
+| `firmware/WirelessKeyboard.uf2` | Current build — BOOTSEL cable image (flash or revert from any state) |
+| `firmware/WirelessKeyboard_OTA.bin` | Raw flash payload, input for `tools/make_ota_package.py` |
+| `firmware/WirelessKeyboard_OTA.wkota` | Strict OTA package consumed by `tools/flash_ota.exe` (auto-regenerated at build) |
+| `firmware/good/<timestamp>_<sha>/` | **Validated snapshots ("Latest Good")** with `BUILD_INFO.txt` (SHA-256, commit, notes, revert instructions) |
+| `firmware/good/LATEST.txt` | Pointer answering "which build is the Latest Good" |
+
+After hardware-validating a build, snapshot it:
+
+```powershell
+tools\save_good_build.ps1                                     # current build
+tools\save_good_build.ps1 -Ref codex/rp2040-low-power-stage1 -Note "why it is good"
 ```
+
+Reverting to a good build: BOOTSEL-flash its `WirelessKeyboard.uf2` (always
+works). Reverting over the air with `flash_ota.exe` only works once the
+running firmware speaks the strict DFU protocol; pre-strict builds
+(before 2026-08-22) are cable-only.
 
 ### Optional UART diagnostic build
 
