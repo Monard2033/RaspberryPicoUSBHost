@@ -20,6 +20,14 @@
 #define RUNTIME_LOGGING 0
 #endif
 
+/* PIO-USB's full-speed receiver (usb_rx.pio) samples at 96 MHz, so clk_sys
+ * must stay >= 96 MHz for a valid SM divider. 96 MHz is the lowest safe
+ * setting; override with -DRP2040_SYS_CLOCK_KHZ=120000 to restore the
+ * original clock. Must remain a multiple of 12 MHz for the TX program. */
+#ifndef RP2040_SYS_CLOCK_KHZ
+#define RP2040_SYS_CLOCK_KHZ 96000u
+#endif
+
 #if !RUNTIME_LOGGING
 #define printf(...) do { } while (0)
 #endif
@@ -315,6 +323,9 @@ static bool usb_host_event_push(uint8_t type, uint8_t dev_addr,
     else memset(event->data, 0, KBD_REPORT_LEN);
     __dmb();
     usb_host_event_head = next;
+    /* Wake core 1 immediately if it is idle-napping; without this, USB input
+     * would wait for its bounded timer nap to expire. */
+    __sev();
     return true;
 }
 
@@ -2566,6 +2577,27 @@ static void usb_host_event_task(void)
     }
 }
 
+/* Core 1 spins while work is pending; otherwise it naps with WFE so the clock
+ * tree gates the CPU. Core 0 raises SEV on every queued USB event (see
+ * usb_host_event_push), so input latency is unaffected. The 1 ms cap bounds
+ * battery/LED/power-state cadence, and a pending SPI safety copy schedules an
+ * exact timer wake so its 75 us re-arm guard is never overslept. */
+static void worker_core1_idle_wait(void)
+{
+    if (usb_host_event_head != usb_host_event_tail ||
+        spi_input_queue_count != 0 || radio_wake_queue_count != 0 ||
+        battery_spi_pending || consumer_retry_pending) {
+        return;
+    }
+
+    if (spi_retry_pending) {
+        sleep_until(from_us_since_boot(spi_retry_after_us));
+        return;
+    }
+
+    sleep_until(make_timeout_time_ms(1));
+}
+
 static void worker_core1_main(void)
 {
     /* Core 1 owns every operation downstream of USB capture: ordered event
@@ -2581,6 +2613,7 @@ static void worker_core1_main(void)
         spi_link_test_task();
 #endif
         status_task();
+        worker_core1_idle_wait();
     }
 }
 
@@ -2603,7 +2636,7 @@ static void led_blinking_task(void)
  *--------------------------------------------------------------------*/
 int main(void)
 {
-    set_sys_clock_khz(120000, true);
+    set_sys_clock_khz(RP2040_SYS_CLOCK_KHZ, true);
 
     board_init();
 #if RUNTIME_LOGGING
@@ -2657,5 +2690,9 @@ int main(void)
         keyboard_led_task();
         usb_descriptor_dump_task();
         led_blinking_task();
+        /* PIO-USB's repeating 1 ms SOF timer (plus every transaction IRQ)
+         * wakes WFI, so polling tasks keep their cadence while the CPU gates
+         * between interrupts instead of spinning. */
+        __wfi();
     }
 }

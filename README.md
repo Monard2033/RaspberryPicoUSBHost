@@ -49,8 +49,10 @@ the nRF52840 transmitter over SPI.
   Receiver; the RGB animation and ADC sampling remain local to RP2040.
 - RGB uses red `GP21`, green `GP20`, blue `GP19`; this pin-only adjustment was
   isolated in commit `ea4827d` before the low-power implementation.
-- Low-power Stage 1 is implemented. RP2040 remains at 120 MHz to service the
-  PIO-USB host, while nRF52840 stops released-state keepalives and enters System
+- Low-power Stage 1 is implemented. RP2040 runs at 96 MHz (the lowest safe
+  clock for PIO-USB's 96 MHz full-speed receive sampler; override with
+  `RP2040_SYS_CLOCK_KHZ=120000`) and gates both cores with WFI/WFE idle waits,
+  while nRF52840 stops released-state keepalives and enters System
   OFF after five minutes without changed HID input. CSN/P0.22 wakes it and the
   RP2040 retransmits keyboard and Consumer state after the boot guard time.
   Hardware sleep-current and wake-latency validation remains required.
