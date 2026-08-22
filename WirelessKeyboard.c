@@ -39,7 +39,7 @@
  * no reaction to any DFU ack payload — absolute immunity to a stray
  * flash_ota.exe. The main target keeps 1 (dormant unless addressed). */
 #ifndef WIRELESS_KEYBOARD_OTA_SUPPORT
-#define WIRELESS_KEYBOARD_OTA_SUPPORT 1
+#define WIRELESS_KEYBOARD_OTA_SUPPORT 0
 #endif
 
 /*--------------------------------------------------------------------+
