@@ -103,7 +103,7 @@
 #define SPI_INPUT_QUEUE_DEPTH 128u
 #define RADIO_SLEEP_BLINK_COUNT 4u
 #define RADIO_SLEEP_BLINK_HALF_PERIOD_MS 100u
-#define SPI_REARM_GUARD_US 75u
+#define SPI_REARM_GUARD_US 250u
 #define SPI_ACK_POLL_MS 100u
 #define SPI_ACK_POLL_IDLE_MS 1000u
 #define SPI_ACK_POLL_DFU_MS  1u
@@ -947,6 +947,20 @@ static void dfu_boot_report_task(void)
 }
 #endif /* WIRELESS_KEYBOARD_OTA_SUPPORT */
 
+#if HID_DIAGNOSTIC_LOG
+/* Temporary OTA reverse-path diagnostic (diagnostic builds only):
+ * color 1 = blue flash -> a fresh lock-state ACK arrived over MISO,
+ * color 2 = red flash  -> any DFU ACK arrived over MISO.
+ * Rendered by battery_update_led as a 300 ms LED flash. */
+static uint8_t ota_diag_blink_color;
+static uint32_t ota_diag_blink_until_ms;
+static void ota_diag_blink(uint8_t color)
+{
+    ota_diag_blink_color = color;
+    ota_diag_blink_until_ms = board_millis() + 300u;
+}
+#endif
+
 static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
 {
     struct link_ack_frame ack;
@@ -958,6 +972,9 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
 
 #if WIRELESS_KEYBOARD_OTA_SUPPORT
     if (ack.type == LINK_ACK_TYPE_DFU) {
+#if HID_DIAGNOSTIC_LOG
+        ota_diag_blink(2u);
+#endif
         dfu_process_command(&ack);
         return;
     }
@@ -983,6 +1000,9 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
     remote_keyboard_led_valid = true;
     remote_keyboard_led_state = ack.data[0] &
         (HID_LED_NUM_LOCK | HID_LED_CAPS_LOCK | HID_LED_SCROLL_LOCK);
+#if HID_DIAGNOSTIC_LOG
+    ota_diag_blink(1u);
+#endif
 
     if (keyboard_led_state != remote_keyboard_led_state) {
         keyboard_led_state = remote_keyboard_led_state;
@@ -1012,6 +1032,21 @@ static void spi_write_frame(struct link_input_frame const *frame)
     gpio_put(PIN_SPI_CSN, 1);
 
     total_spi_frames_sent++;
+#if HID_DIAGNOSTIC_LOG
+    /* Raw MISO witness: what did the Transmitter actually clock out?
+     * Prints only when the leading bytes change, so the volume stays
+     * bounded. 5A 03 xx = an ACK frame (xx: 00 initial, 01 LED, 02 DFU);
+     * 00 .. = nothing armed on the slave (ORC) or dead MISO. */
+    static uint8_t miso_witness[3];
+    if (rx[0] != miso_witness[0] || rx[1] != miso_witness[1] ||
+        rx[2] != miso_witness[2]) {
+        miso_witness[0] = rx[0];
+        miso_witness[1] = rx[1];
+        miso_witness[2] = rx[2];
+        printf("[MISO] %02x %02x %02x %02x %02x %02x\n",
+               rx[0], rx[1], rx[2], rx[3], rx[4], rx[5]);
+    }
+#endif
     spi_process_ack(rx);
 #if HID_DIAGNOSTIC_LOG
     printf("[SPI TX #%lu] type=%u seq=%u data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
@@ -1114,7 +1149,7 @@ static void spi_service_task(void)
     /* EasyDMA is now rearmed in the Transmitter SPIS IRQ. Keep a bounded
      * inter-frame gap only for queued bursts; normal 1 kHz input already has
      * a full millisecond between physical reports. */
-    if ((uint32_t)(time_us_32() - spi_last_tx_us) < 150u) {
+    if ((uint32_t)(time_us_32() - spi_last_tx_us) < 250u) {
         return;
     }
 
@@ -1228,7 +1263,7 @@ static void spi_ack_poll_task(void)
          (uint32_t)(now - radio_last_activity_ms) < SPI_ACK_POLL_QUIET_MS) ||
 #endif
         (uint32_t)(now - spi_last_ack_poll_ms) < interval ||
-        (uint32_t)(time_us_32() - spi_last_tx_us) < 150u) {
+        (uint32_t)(time_us_32() - spi_last_tx_us) < 250u) {
         return;
     }
 
@@ -2176,6 +2211,20 @@ static bool battery_visual_update_deferred(void)
 
 static void battery_update_led(uint32_t now)
 {
+#if HID_DIAGNOSTIC_LOG
+    /* Temporary OTA reverse-path diagnostic flash (see ota_diag_blink). */
+    if (ota_diag_blink_color != 0u) {
+        if ((int32_t)(ota_diag_blink_until_ms - now) > 0) {
+            led_apply(ota_diag_blink_color == 1u
+                          ? (struct rgb_color){ 0, 0, 255 }
+                          : (struct rgb_color){ 255, 0, 0 });
+            return;
+        }
+        ota_diag_blink_color = 0u;
+        led_off();
+    }
+#endif
+
     static uint32_t last_led_update_ms = 0;
     if (battery_visual_update_deferred() ||
         (uint32_t)(now - last_led_update_ms) < BATT_LED_UPDATE_MS) {
