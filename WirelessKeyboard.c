@@ -150,7 +150,7 @@
 #define BATT_VALID_MIN_MV  2800  // Reject impossible/corrupt 1S telemetry.
 #define BATT_VALID_MAX_MV  4300
 #define BATT_MIN_MV        3050  // User-selected 1S empty reference.
-#define BATT_MAX_MV        4110  // Observed full-charge reference for this pack.
+#define BATT_MAX_MV        4161  // Measured absolute full-charge voltage of this pack (3:1 divider).
 #define BATT_CHECK_MS      1000
 #define BATT_BOOT_SHOW_MS  5000
 #define BATT_EVENT_SHOW_MS 5000
@@ -163,7 +163,10 @@
 #define BATT_CHARGE_TREND_ENTER 4
 #define BATT_UNPLUG_TREND_ENTER (-4)
 #define BATT_UNPLUG_DROP_MV 25
-#define BATT_FULL_EXIT_MV 4070
+/* Hysteresis ~41 mV below the full-charge reference, matching the band the
+ * previous 4110/4070 pair used, so FULL exits after unplug at the same
+ * relative depth of surface-charge sag. */
+#define BATT_FULL_EXIT_MV 4120
 
 // --- RGB LED, driven locally by RP2040 PWM on GP21, GP20, GP19 (Catod Comun) -----
 #define PIN_LED_R         21
