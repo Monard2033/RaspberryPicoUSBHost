@@ -241,6 +241,14 @@ static bool previous_consumer_valid;
 static uint32_t consumer_press_ms;
 static uint32_t const CONSUMER_SAFETY_RELEASE_MS = 2000;
 
+/* When spi_queue_input rejects a consumer frame (queue full), the usage is
+ * stashed here and retried on every consumer_task iteration.  The retry always
+ * tracks the *latest* usage so press->release ordering is preserved even
+ * across multiple queue-overflow events.  consumer_task checks this before the
+ * safety-release timeout so queued releases (usage=0) take priority. */
+static bool consumer_retry_pending;
+static uint16_t consumer_retry_usage;
+
 enum radio_power_state {
     RADIO_AWAKE,
     RADIO_POWERING_OFF,
@@ -1276,9 +1284,19 @@ static void forward_consumer_usage(uint16_t usage)
         (uint8_t)usage, (uint8_t)(usage >> 8), 0, 0, 0, 0, 0, 0
     };
     radio_note_activity();
-    if (!spi_queue_input(LINK_TYPE_CONSUMER, data)) return;
-    previous_consumer_usage = usage;
-    previous_consumer_valid = true;
+    if (!spi_queue_input(LINK_TYPE_CONSUMER, data)) {
+        /* SPI queue full: stash the latest usage for retry in consumer_task
+         * and invalidate dedup state so the next press of the same key is not
+         * silently blocked.  Always overwrite consumer_retry_usage with the
+         * most recent value so a release (0) replaces a stale press. */
+        consumer_retry_usage = usage;
+        consumer_retry_pending = true;
+        previous_consumer_valid = false;
+        return;
+    }
+    previous_consumer_usage  = usage;
+    previous_consumer_valid  = true;
+    consumer_retry_pending   = false;
 #if CONSUMER_DEBUG
     printf("[CONSUMER] usage=0x%04x\n", usage);
 #endif
@@ -1286,6 +1304,28 @@ static void forward_consumer_usage(uint16_t usage)
 
 static void consumer_task(void)
 {
+    /* Retry a consumer frame that was rejected by a full SPI queue.  The
+     * caller invokes spi_service_task later in the same loop iteration, so
+     * the queue drains between retries. */
+    if (consumer_retry_pending) {
+        uint8_t data[KBD_REPORT_LEN] = {
+            (uint8_t)consumer_retry_usage,
+            (uint8_t)(consumer_retry_usage >> 8),
+            0, 0, 0, 0, 0, 0
+        };
+        radio_note_activity();
+        if (spi_queue_input(LINK_TYPE_CONSUMER, data)) {
+            previous_consumer_usage  = consumer_retry_usage;
+            previous_consumer_valid  = true;
+            /* Refresh the press timestamp so a retry that arrives after a
+             * long stall does not immediately trigger the safety release. */
+            if (consumer_retry_usage != 0) {
+                consumer_press_ms = board_millis();
+            }
+            consumer_retry_pending = false;
+        }
+    }
+
     if (previous_consumer_valid && previous_consumer_usage != 0 &&
         (uint32_t)(board_millis() - consumer_press_ms) >=
             CONSUMER_SAFETY_RELEASE_MS) {
