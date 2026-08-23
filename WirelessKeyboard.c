@@ -1173,38 +1173,18 @@ static void spi_service_task(void)
     spi_write_frame(&spi_retry_frame);
     spi_last_tx_us = time_us_32();
 
-    bool release_edge = false;
     if (pending.type == LINK_TYPE_KEYBOARD) {
-        release_edge = last_transport_keyboard_valid &&
-            keyboard_transition_releases_state(last_transport_keyboard,
-                                                pending.data);
         memcpy(last_transport_keyboard, pending.data, KBD_REPORT_LEN);
         last_transport_keyboard_valid = true;
     } else if (pending.type == LINK_TYPE_CONSUMER) {
         uint16_t const usage = (uint16_t)pending.data[0] |
                                ((uint16_t)pending.data[1] << 8);
-        release_edge = last_transport_consumer_valid &&
-                       last_transport_consumer_usage != 0U &&
-                       usage != last_transport_consumer_usage;
         last_transport_consumer_usage = usage;
         last_transport_consumer_valid = true;
     }
 
-    /* Every typed frame gets one local SPI safety copy. A transition that
-     * releases any key/modifier/Consumer usage gets two safety copies (three
-     * total attempts). Transmitter deduplicates the identical sequence before
-     * ESB, so Receiver/Windows still see exactly one ordered transition. */
-    if (pending.type == LINK_TYPE_KEYBOARD ||
-        pending.type == LINK_TYPE_CONSUMER ||
-        pending.type == LINK_TYPE_BATTERY ||
-        pending.type == LINK_TYPE_CONTROL) {
-        spi_retry_copies_remaining = release_edge ? 2U : 1U;
-        spi_retry_after_us = spi_last_tx_us + SPI_REARM_GUARD_US;
-        spi_retry_pending = true;
-    } else {
-        spi_retry_copies_remaining = 0U;
-        spi_retry_pending = false;
-    }
+    spi_retry_copies_remaining = 0U;
+    spi_retry_pending = false;
 }
 
 static void spi_send_control_command(uint8_t command)
