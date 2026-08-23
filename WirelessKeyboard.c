@@ -114,7 +114,7 @@
 #define SONIX_KEYBOARD_EP_IN 0x81u
 #define PIO_USB_ROOT_INDEX 0u
 #define RP2040_WATCHDOG_TIMEOUT_MS 1000u
-#define BATTERY_TELEMETRY_PERIOD_MS 30000u
+#define BATTERY_TELEMETRY_PERIOD_MS 5000u
 #define BATTERY_HID_QUIET_GUARD_MS 50u
 #define MAX_HID_REPORTS   8
 #define MAX_CONSUMER_FIELDS 16
@@ -2275,8 +2275,8 @@ static void battery_start_display(void)
     battery_state_started_ms = board_millis();
     battery_last_check_ms = battery_state_started_ms;
     battery_led_state = BATT_LED_BOOT;
-    battery_last_tx_ms = battery_state_started_ms;
-    battery_tx_pending = false;
+    battery_last_tx_ms = 0;
+    battery_tx_pending = true;
     battery_spi_pending = false;
     battery_update_led(battery_state_started_ms);
 
