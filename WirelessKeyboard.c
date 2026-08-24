@@ -103,7 +103,7 @@
 #define SPI_INPUT_QUEUE_DEPTH 128u
 #define RADIO_SLEEP_BLINK_COUNT 4u
 #define RADIO_SLEEP_BLINK_HALF_PERIOD_MS 100u
-#define SPI_REARM_GUARD_US 250u
+#define SPI_REARM_GUARD_US 500u
 #define SPI_ACK_POLL_MS 100u
 #define SPI_ACK_POLL_IDLE_MS 1000u
 #define SPI_ACK_POLL_DFU_MS  1u
@@ -1023,10 +1023,10 @@ static void spi_write_frame(struct link_input_frame const *frame)
 #endif
 
     gpio_put(PIN_SPI_CSN, 0);
-    sleep_us(1);
+    sleep_us(2);
     spi_write_read_blocking(SPI_PORT, (uint8_t const *)frame, rx,
                             sizeof(*frame));
-    sleep_us(1);
+    sleep_us(2);
     gpio_put(PIN_SPI_CSN, 1);
 
     total_spi_frames_sent++;
@@ -1144,10 +1144,9 @@ static void spi_service_task(void)
     if (radio_power_state != RADIO_AWAKE &&
         radio_power_state != RADIO_POWERING_OFF) return;
 
-    /* EasyDMA is now rearmed in the Transmitter SPIS IRQ. Keep a bounded
-     * inter-frame gap only for queued bursts; normal 1 kHz input already has
-     * a full millisecond between physical reports. */
-    if ((uint32_t)(time_us_32() - spi_last_tx_us) < 250u) {
+    /* Keep a bounded inter-frame gap for queued bursts so the slave RTOS
+     * thread has time to re-arm EasyDMA for the next transfer. */
+    if ((uint32_t)(time_us_32() - spi_last_tx_us) < SPI_REARM_GUARD_US) {
         return;
     }
 
