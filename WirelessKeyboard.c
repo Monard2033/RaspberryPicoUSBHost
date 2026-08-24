@@ -114,7 +114,7 @@
 #define SONIX_KEYBOARD_EP_IN 0x81u
 #define PIO_USB_ROOT_INDEX 0u
 #define RP2040_WATCHDOG_TIMEOUT_MS 1000u
-#define BATTERY_TELEMETRY_PERIOD_MS 5000u
+#define BATTERY_TELEMETRY_PERIOD_MS 20000u
 #define BATTERY_HID_QUIET_GUARD_MS 50u
 #define MAX_HID_REPORTS   8
 #define MAX_CONSUMER_FIELDS 16
@@ -145,12 +145,12 @@
 // --- Battery (read locally, RP2040 is the sole "brain" for this) --------
 #define PIN_BATT_ADC      28   // GP28 = ADC2. Battery divider tap goes here.
 #define BATT_ADC_INPUT    2    // adc_select_input() channel matching GP28
-#define BATT_DIVIDER_RATIO 3   // Vbat--200k--node--100k--GND: node=Vbat/3
-#define BATT_ADC_VREF_MV   3260  // Measured ADC AVDD/VREF on this board.
+#define BATT_ADC_SCALE_NUM 9836u // Calibrated: 3984 mV physical = 1320 mV on GP28 (Vref=3.268V)
+#define BATT_ADC_SCALE_DEN 4095u
 #define BATT_VALID_MIN_MV  2800  // Reject impossible/corrupt 1S telemetry.
 #define BATT_VALID_MAX_MV  4300
 #define BATT_MIN_MV        3050  // User-selected 1S empty reference.
-#define BATT_MAX_MV        4140  // Measured absolute full-charge voltage of this pack (3:1 divider).
+#define BATT_MAX_MV        4150  // Measured absolute full-charge voltage of this pack.
 #define BATT_CHECK_MS      1000
 #define BATT_BOOT_SHOW_MS  5000
 #define BATT_EVENT_SHOW_MS 5000
@@ -159,7 +159,7 @@
 #define BATT_LED_UPDATE_MS  20
 #define BATT_POST_BOOT_SLOPE_GUARD_MS 3000
 #define BATT_PIN_EVENT_DELTA_MV 15
-#define BATT_EVENT_DELTA_MV (BATT_PIN_EVENT_DELTA_MV * BATT_DIVIDER_RATIO)
+#define BATT_EVENT_DELTA_MV 45
 #define BATT_CHARGE_TREND_ENTER 4
 #define BATT_UNPLUG_TREND_ENTER (-4)
 #define BATT_UNPLUG_DROP_MV 25
@@ -2157,15 +2157,14 @@ static uint32_t battery_read_mv(void)
     uint32_t raw_sum = 0;
 
     /* Discard the first conversion after selecting the high-impedance divider
-     * channel, then average sixteen conversions without blocking sleeps. */
+     * channel, then average 64 conversions for ultra-low noise and maximum ENOB. */
     (void)adc_read();
-    for (uint8_t i = 0; i < 16; ++i) {
+    for (uint8_t i = 0; i < 64; ++i) {
         raw_sum += adc_read();
     }
 
-    uint32_t const raw_average = raw_sum / 16;
-    uint32_t const pin_mv = raw_average * BATT_ADC_VREF_MV / 4095u;
-    uint32_t const battery_mv = pin_mv * BATT_DIVIDER_RATIO;
+    uint32_t const raw_average = (raw_sum + 32u) / 64u;
+    uint32_t const battery_mv = (raw_average * BATT_ADC_SCALE_NUM + (BATT_ADC_SCALE_DEN / 2u)) / BATT_ADC_SCALE_DEN;
     if (battery_mv < BATT_VALID_MIN_MV ||
         battery_mv > BATT_VALID_MAX_MV) {
         battery_invalid_sample_count++;
@@ -2275,8 +2274,8 @@ static void battery_start_display(void)
     battery_state_started_ms = board_millis();
     battery_last_check_ms = battery_state_started_ms;
     battery_led_state = BATT_LED_BOOT;
-    battery_last_tx_ms = 0;
-    battery_tx_pending = true;
+    battery_last_tx_ms = battery_state_started_ms;
+    battery_tx_pending = false;
     battery_spi_pending = false;
     battery_update_led(battery_state_started_ms);
 
@@ -2465,6 +2464,7 @@ static void battery_task(void)
         battery_state_started_ms = now;
         battery_slope_enable_after_ms = now +
                                         BATT_POST_BOOT_SLOPE_GUARD_MS;
+        battery_tx_pending = true;
     } else if (battery_led_state == BATT_LED_UNPLUG_SHOW &&
                now - battery_state_started_ms >= BATT_EVENT_SHOW_MS) {
         battery_led_state = BATT_LED_IDLE;
