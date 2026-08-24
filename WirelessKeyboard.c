@@ -10,18 +10,36 @@
 #include "hardware/pwm.h"
 #include "hardware/flash.h"
 #include "hardware/watchdog.h"
+#include "pico/flash.h"
 #include "bsp/board_api.h"
 #include "tusb.h"
 #include "host/usbh.h"
 #include "pio_usb.h"
 #include "pio_usb_ll.h"
+#include "ota_layout.h"
 
 #ifndef RUNTIME_LOGGING
 #define RUNTIME_LOGGING 0
 #endif
 
+/* PIO-USB's full-speed receiver (usb_rx.pio) samples at 96 MHz, so clk_sys
+ * must stay >= 96 MHz for a valid SM divider. 96 MHz is the lowest safe
+ * setting; override with -DRP2040_SYS_CLOCK_KHZ=120000 to restore the
+ * original clock. Must remain a multiple of 12 MHz for the TX program. */
+#ifndef RP2040_SYS_CLOCK_KHZ
+#define RP2040_SYS_CLOCK_KHZ 96000u
+#endif
+
 #if !RUNTIME_LOGGING
 #define printf(...) do { } while (0)
+#endif
+
+/* Strict OTA DFU receiver. The WirelessKeyboardSafe CMake target compiles
+ * this file with the value 0: no DFU state machine, no flash writers, and
+ * no reaction to any DFU ack payload — absolute immunity to a stray
+ * flash_ota.exe. The main target keeps 1 (dormant unless addressed). */
+#ifndef WIRELESS_KEYBOARD_OTA_SUPPORT
+#define WIRELESS_KEYBOARD_OTA_SUPPORT 0
 #endif
 
 /*--------------------------------------------------------------------+
@@ -48,8 +66,13 @@
 #define LINK_TYPE_DFU_DATA      0x11
 #define LINK_TYPE_DFU_FINISH    0x12
 #define LINK_TYPE_DFU_STATUS    0x13
+#define LINK_TYPE_DFU_CRC       0x14
+#define LINK_TYPE_DFU_ACTIVATE  0x15
+#define LINK_TYPE_DFU_ABORT     0x16
+#define LINK_TYPE_DFU_QUERY     0x17
 #define LINK_CONTROL_SYSTEM_OFF 0x01
 #define LINK_CONTROL_POLL_ACK   0x02
+#define LINK_CONTROL_SESSION_RESET 0x03
 #define LINK_ACK_MAGIC           0x5A
 #define LINK_ACK_TYPE_LOCK_STATE 0x01
 #define LINK_ACK_TYPE_DFU       0x02
@@ -63,21 +86,35 @@
 #define DFU_STATUS_ERR_SIZE     0x03u
 #define DFU_STATUS_ERR_CRC      0x04u
 #define DFU_STATUS_ERR_FLASH    0x05u
-#define DFU_STATUS_SUCCESS      0x06u
+#define DFU_STATUS_VERIFIED     0x06u
+#define DFU_STATUS_ERR_TARGET   0x07u
+#define DFU_STATUS_ERR_PROTOCOL 0x08u
+#define DFU_STATUS_ERR_SESSION  0x09u
+#define DFU_STATUS_ERR_STATE    0x0Au
+#define DFU_STATUS_APPLYING     0x0Bu
+#define DFU_STATUS_BOOT_OK      0x0Cu
+#define DFU_STATUS_ABORTED      0x0Du
+#ifndef RADIO_INACTIVITY_MS
 #define RADIO_INACTIVITY_MS (5u * 60u * 1000u)
+#endif
 #define RADIO_OFF_SETTLE_MS 10u
-#define RADIO_BOOT_WAIT_MS  75u
+#define RADIO_BOOT_WAIT_MS  250u
 #define RADIO_WAKE_QUEUE_DEPTH 128u
 #define SPI_INPUT_QUEUE_DEPTH 128u
 #define RADIO_SLEEP_BLINK_COUNT 4u
 #define RADIO_SLEEP_BLINK_HALF_PERIOD_MS 100u
-#define SPI_REARM_GUARD_US 250u
+#define SPI_REARM_GUARD_US 500u
 #define SPI_ACK_POLL_MS 100u
+#define SPI_ACK_POLL_IDLE_MS 1000u
+#define SPI_ACK_POLL_DFU_MS  1u
+#define SPI_ACK_POLL_QUIET_MS 20u
+#define OTA_RADIO_DISCOVERY_MS 30000u
+#define DFU_APPLY_DELAY_MS 1500u
 #define KEYBOARD_HID_STALL_RECOVERY_MS 250u
 #define SONIX_KEYBOARD_EP_IN 0x81u
 #define PIO_USB_ROOT_INDEX 0u
 #define RP2040_WATCHDOG_TIMEOUT_MS 1000u
-#define BATTERY_TELEMETRY_PERIOD_MS 30000u
+#define BATTERY_TELEMETRY_PERIOD_MS 20000u
 #define BATTERY_HID_QUIET_GUARD_MS 50u
 #define MAX_HID_REPORTS   8
 #define MAX_CONSUMER_FIELDS 16
@@ -108,18 +145,28 @@
 // --- Battery (read locally, RP2040 is the sole "brain" for this) --------
 #define PIN_BATT_ADC      28   // GP28 = ADC2. Battery divider tap goes here.
 #define BATT_ADC_INPUT    2    // adc_select_input() channel matching GP28
-#define BATT_DIVIDER_RATIO 3   // Vbat--200k--node--100k--GND: node=Vbat/3
-#define BATT_MIN_MV        3430
-#define BATT_MAX_MV        4200
+#define BATT_ADC_SCALE_NUM 9836u // Calibrated: 3984 mV physical = 1320 mV on GP28 (Vref=3.268V)
+#define BATT_ADC_SCALE_DEN 4095u
+#define BATT_VALID_MIN_MV  2800  // Reject impossible/corrupt 1S telemetry.
+#define BATT_VALID_MAX_MV  4300
+#define BATT_MIN_MV        3050  // User-selected 1S empty reference.
+#define BATT_MAX_MV        4150  // Measured absolute full-charge voltage of this pack.
 #define BATT_CHECK_MS      1000
-#define BATT_BOOT_SHOW_MS  5000
-#define BATT_EVENT_SHOW_MS 5000
+#define BATT_BOOT_SHOW_MS  8000
+#define BATT_EVENT_SHOW_MS 8000
 #define BATT_PULSE_WINDOW_MS 2000
-#define BATT_PULSE_PERIOD_MS 1000
-#define BATT_PIN_EVENT_DELTA_MV 50
-#define BATT_EVENT_DELTA_MV (BATT_PIN_EVENT_DELTA_MV * BATT_DIVIDER_RATIO)
+#define BATT_PULSE_PERIOD_MS 4500
+#define BATT_LED_UPDATE_MS  20
+#define BATT_POST_BOOT_SLOPE_GUARD_MS 3000
+#define BATT_CV_THRESHOLD_MV     4100  // Above 4.10V (~90-95%), TP4056 enters CV mode
+#define BATT_CHARGE_STEP_MV        10  // Sudden rise >= 10mV in 15s confirms plug-in
+#define BATT_CHARGE_SLOPE_MV        4  // Sustained rise >= 4mV in 15s confirms CC charging
+#define BATT_CHARGE_TREND_ENTER     3  // 3 confirmations (~3s) to enter CHARGING
+#define BATT_UNPLUG_DROP_MV        12  // Drop >= 12mV from charge peak confirms charger disconnected
+#define BATT_FULL_EXIT_MV        4120  // Voltage threshold to exit FULL after unplug
+#define BATT_HISTORY_LEN           16  // 16 samples = 15-second rolling window at 1Hz
 
-// --- RGB LED, driven locally by RP2040 PWM, 3 consecutive free pins -----
+// --- RGB LED, driven locally by RP2040 PWM on GP21, GP20, GP19 (Catod Comun) -----
 #define PIN_LED_R         21
 #define PIN_LED_G         20
 #define PIN_LED_B         19
@@ -222,8 +269,24 @@ static struct hid_instance_state hid_instances[CFG_TUH_HID];
 static uint16_t previous_consumer_usage;
 static bool previous_consumer_valid;
 
+/* Timestamp of the last non-zero consumer usage.  Used by consumer_task as a
+ * safety-release timeout so a lost consumer release (sticky key) does not
+ * leave a usage permanently pressed.  Set before the dedup check so held keys
+ * that re-send the same usage keep the timeout armed. */
+static uint32_t consumer_press_ms;
+static uint32_t const CONSUMER_SAFETY_RELEASE_MS = 2000;
+
+/* When spi_queue_input rejects a consumer frame (queue full), the usage is
+ * stashed here and retried on every consumer_task iteration.  The retry always
+ * tracks the *latest* usage so press->release ordering is preserved even
+ * across multiple queue-overflow events.  consumer_task checks this before the
+ * safety-release timeout so queued releases (usage=0) take priority. */
+static bool consumer_retry_pending;
+static uint16_t consumer_retry_usage;
+
 enum radio_power_state {
     RADIO_AWAKE,
+    RADIO_POWERING_OFF,
     RADIO_SYSTEM_OFF,
     RADIO_WAKING,
 };
@@ -287,6 +350,9 @@ static bool usb_host_event_push(uint8_t type, uint8_t dev_addr,
     else memset(event->data, 0, KBD_REPORT_LEN);
     __dmb();
     usb_host_event_head = next;
+    /* Wake core 1 immediately if it is idle-napping; without this, USB input
+     * would wait for its bounded timer nap to expire. */
+    __sev();
     return true;
 }
 
@@ -317,12 +383,18 @@ static uint8_t spi_input_queue_count;
 static bool radio_sleep_indicator_active;
 static uint32_t radio_sleep_indicator_started_ms;
 static uint8_t spi_sequence;
+static uint8_t spi_control_sequence;
 static struct link_input_frame spi_retry_frame;
 static bool spi_retry_pending;
 static uint32_t spi_retry_after_us;
+static uint8_t spi_retry_copies_remaining;
+static uint8_t last_transport_keyboard[KBD_REPORT_LEN];
+static bool last_transport_keyboard_valid;
+static uint16_t last_transport_consumer_usage;
+static bool last_transport_consumer_valid;
 static struct pending_radio_input battery_spi_pending_frame;
 static bool battery_spi_pending;
-static uint32_t __unused spi_last_ack_poll_ms;
+static uint32_t spi_last_ack_poll_ms;
 
 static uint8_t remote_keyboard_led_state;
 static uint8_t remote_keyboard_led_sequence;
@@ -341,6 +413,7 @@ static volatile uint32_t keyboard_led_retry_after_ms;
 static bool              battery_tx_pending;
 static bool              battery_material_step;
 static uint32_t          battery_last_tx_ms;
+static uint32_t          battery_last_check_ms;
 static uint8_t           battery_sequence;
 
 static uint32_t total_hid_reports_received = 0;
@@ -348,9 +421,9 @@ static uint32_t total_spi_frames_sent      = 0;
 static uint32_t total_output_reports_sent  = 0;
 
 enum { BLINK_NOT_MOUNTED = 250, BLINK_MOUNTED = 1000, BLINK_SUSPENDED = 2500 };
-static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
-static uint8_t pending_descriptor_dev_addr;
-static uint32_t descriptor_dump_after_ms;
+static volatile uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
+static volatile uint8_t pending_descriptor_dev_addr;
+static volatile uint32_t descriptor_dump_after_ms;
 
 /*--------------------------------------------------------------------+
  *  SPI master bridge to the nRF52840 (SPI slave). The fixed 12-byte frame
@@ -410,58 +483,222 @@ static bool pending_radio_queue_pop(struct pending_radio_input *queue,
     return true;
 }
 
-static uint32_t dfu_total_size = 0;
-static uint32_t dfu_expected_crc32 = 0;
-static uint32_t dfu_bytes_written = 0;
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
+/* Strict OTA DFU session state (ported from codex/rp2040-ota-strict, link
+ * protocol 0x03).  Every PC command carries a session id (data[1]) and the
+ * reverse-ACK frame sequence as a command token; every reply echoes both so
+ * the tool can match responses to commands.  Flash writes run in bounded
+ * flash_safe_execute windows: staging erase is chunked per 4 kB sector with
+ * the watchdog fed between chunks, streaming programs one 256-byte page at a
+ * time, and the final slot swap runs on core 0 after core 1 has been reset,
+ * so the apply path never executes from flash while SSI is in command mode. */
+static uint32_t dfu_total_size;
+static uint32_t dfu_expected_crc32;
+static uint32_t dfu_bytes_accepted;
+static uint32_t dfu_bytes_committed;
 static uint8_t dfu_page_buffer[FLASH_PAGE_SIZE];
-static uint16_t dfu_page_buffer_len = 0;
-static uint8_t dfu_last_seq = 0xFF;
+static uint16_t dfu_page_buffer_len;
+static uint8_t dfu_session;
+static uint8_t dfu_last_command_token;
+static uint8_t dfu_last_command;
+static uint8_t dfu_last_status;
+static uint8_t dfu_last_detail;
+static uint32_t dfu_last_status_value;
+static bool dfu_session_active;
+static bool dfu_crc_received;
+static bool dfu_image_verified;
+static bool dfu_last_command_valid;
+static bool dfu_apply_pending;
+static uint32_t dfu_apply_after_ms;
+static volatile bool dfu_apply_requested;
+static volatile uint32_t dfu_apply_size;
+static uint8_t dfu_boot_report_count;
+static uint32_t dfu_boot_report_after_ms;
+static uint32_t ota_last_radio_discovery_ms;
 
-static uint32_t calculate_crc32(const uint8_t *data, size_t length)
+enum dfu_flash_operation_type {
+    DFU_FLASH_ERASE,
+    DFU_FLASH_PROGRAM,
+};
+
+struct dfu_flash_operation {
+    enum dfu_flash_operation_type type;
+    uint32_t offset;
+    uint32_t size;
+    const uint8_t *data;
+};
+
+static void __no_inline_not_in_flash_func(dfu_flash_callback)(void *context)
 {
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < length; ++i) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; ++j) {
-            if (crc & 1) {
-                crc = (crc >> 1) ^ 0xEDB88320u;
-            } else {
-                crc = (crc >> 1);
-            }
+    struct dfu_flash_operation const *const operation = context;
+
+    if (operation->type == DFU_FLASH_ERASE) {
+        flash_range_erase(operation->offset, operation->size);
+    } else {
+        flash_range_program(operation->offset, operation->data,
+                            operation->size);
+    }
+}
+
+static bool dfu_flash_erase(uint32_t offset, uint32_t size)
+{
+    struct dfu_flash_operation operation = {
+        .type = DFU_FLASH_ERASE,
+        .offset = offset,
+        .size = size,
+        .data = NULL,
+    };
+    return flash_safe_execute(dfu_flash_callback, &operation, 1000u) ==
+           PICO_OK;
+}
+
+static bool dfu_flash_program(uint32_t offset, const uint8_t *data,
+                              uint32_t size)
+{
+    struct dfu_flash_operation operation = {
+        .type = DFU_FLASH_PROGRAM,
+        .offset = offset,
+        .size = size,
+        .data = data,
+    };
+    return flash_safe_execute(dfu_flash_callback, &operation, 1000u) ==
+           PICO_OK;
+}
+
+/* Erase staging one 4 kB sector per flash window so the 1 s watchdog can be
+ * fed between sectors.  A single worst-case sector erase stays far below the
+ * watchdog timeout, unlike the previous one-window whole-image erase. */
+static bool dfu_flash_erase_staging(uint32_t size)
+{
+    uint32_t const aligned_size = (size + FLASH_SECTOR_SIZE - 1u) &
+                                  ~(FLASH_SECTOR_SIZE - 1u);
+
+    for (uint32_t offset = 0; offset < aligned_size;
+         offset += FLASH_SECTOR_SIZE) {
+        watchdog_update();
+        if (!dfu_flash_erase(FLASH_STAGING_OFFSET + offset,
+                             FLASH_SECTOR_SIZE)) {
+            return false;
         }
     }
-    return ~crc;
-}
-
-static void dfu_flash_erase_staging(uint32_t size)
-{
-    uint32_t const aligned_size = (size + FLASH_SECTOR_SIZE - 1u) & ~(FLASH_SECTOR_SIZE - 1u);
-    uint32_t const ints = save_and_disable_interrupts();
-    flash_range_erase(FLASH_STAGING_OFFSET, aligned_size);
-    restore_interrupts(ints);
-}
-
-static void dfu_flash_program_page(uint32_t offset, const uint8_t *data)
-{
-    uint32_t const ints = save_and_disable_interrupts();
-    flash_range_program(FLASH_STAGING_OFFSET + offset, data, FLASH_PAGE_SIZE);
-    restore_interrupts(ints);
+    return true;
 }
 
 static bool spi_queue_input(uint8_t type, const uint8_t data[KBD_REPORT_LEN]);
 
-static void dfu_send_status(uint8_t status, uint8_t progress, uint16_t offset_div_4)
+static void dfu_send_status(uint8_t status, uint8_t session,
+                            uint8_t command_token, uint8_t detail,
+                            uint32_t value)
 {
-    uint8_t data[KBD_REPORT_LEN] = { 0 };
-    data[0] = status;
-    data[1] = progress;
-    data[2] = (uint8_t)offset_div_4;
-    data[3] = (uint8_t)(offset_div_4 >> 8);
-    spi_queue_input(LINK_TYPE_DFU_STATUS, data);
+    uint8_t data[KBD_REPORT_LEN] = {
+        status,
+        session,
+        command_token,
+        detail,
+        (uint8_t)value,
+        (uint8_t)(value >> 8),
+        (uint8_t)(value >> 16),
+        (uint8_t)(value >> 24),
+    };
+    (void)spi_queue_input(LINK_TYPE_DFU_STATUS, data);
 }
 
+static void dfu_reply(uint8_t status, uint8_t detail, uint32_t value)
+{
+    dfu_last_status = status;
+    dfu_last_detail = detail;
+    dfu_last_status_value = value;
+    dfu_send_status(status, dfu_session, dfu_last_command_token, detail,
+                    value);
+}
+
+static void dfu_repeat_last_reply(void)
+{
+    dfu_send_status(dfu_last_status, dfu_session, dfu_last_command_token,
+                    dfu_last_detail, dfu_last_status_value);
+}
+
+static void dfu_reset_session(void)
+{
+    dfu_total_size = 0;
+    dfu_expected_crc32 = 0;
+    dfu_bytes_accepted = 0;
+    dfu_bytes_committed = 0;
+    dfu_page_buffer_len = 0;
+    dfu_session_active = false;
+    dfu_crc_received = false;
+    dfu_image_verified = false;
+}
+
+static bool dfu_flush_page(void)
+{
+    if (dfu_page_buffer_len == 0u) return true;
+
+    for (uint16_t i = dfu_page_buffer_len; i < FLASH_PAGE_SIZE; ++i) {
+        dfu_page_buffer[i] = 0xFFu;
+    }
+    if (!dfu_flash_program(FLASH_STAGING_OFFSET + dfu_bytes_committed,
+                           dfu_page_buffer, FLASH_PAGE_SIZE)) {
+        return false;
+    }
+    dfu_bytes_committed += dfu_page_buffer_len;
+    dfu_page_buffer_len = 0;
+    return true;
+}
+
+/* Without the Etapa B bootloader, ACTIVATE itself records what was applied:
+ * the page is unused by the current single-app layout, survives the reboot,
+ * and gives QUERY/BOOT_OK a real, CRC-protected answer. */
+static bool dfu_write_install_metadata(void)
+{
+    struct ota_install_metadata metadata;
+    uint8_t *raw = (uint8_t *)&metadata;
+
+    for (size_t i = 0; i < sizeof(metadata); ++i) raw[i] = 0xFFu;
+    metadata.magic = OTA_METADATA_MAGIC;
+    metadata.format = OTA_METADATA_FORMAT;
+    metadata.target = OTA_TARGET_RP2040;
+    metadata.protocol = OTA_PROTOCOL_VERSION;
+    metadata.board_id = OTA_BOARD_WEACT_RP2040_4MB;
+    metadata.session = dfu_session;
+    metadata.command_token = dfu_last_command_token;
+    metadata.image_size = dfu_total_size;
+    metadata.image_crc32 = dfu_expected_crc32;
+    metadata.immutable_crc32 = ota_metadata_immutable_crc(&metadata);
+    metadata.state = OTA_METADATA_STATE_INSTALLED;
+
+    return dfu_flash_erase(OTA_METADATA_OFFSET, FLASH_SECTOR_SIZE) &&
+           dfu_flash_program(OTA_METADATA_OFFSET,
+                             (const uint8_t *)&metadata, FLASH_PAGE_SIZE);
+}
+
+/* The staged image is a complete flash image (boot2 at 0, ARM vectors at
+ * 0x100).  Reject anything that is not a plausible application for this
+ * board even when its CRC matches, so a wrong-device or wrong-slot package
+ * can never overwrite the running application. */
+static bool dfu_staged_image_vectors_valid(void)
+{
+    const uint32_t *const vectors =
+        (const uint32_t *)(XIP_BASE + FLASH_STAGING_OFFSET + 0x100u);
+    uint32_t const stack_pointer = vectors[0];
+    uint32_t const reset_handler = vectors[1];
+
+    return stack_pointer >= SRAM_BASE && stack_pointer <= SRAM_END &&
+           (reset_handler & 1u) != 0u &&
+           (reset_handler & ~1u) >= XIP_BASE + 0x100u &&
+           (reset_handler & ~1u) < XIP_BASE + FLASH_STAGING_OFFSET;
+}
+
+/* Called from the core 0 main loop once core 1 has requested the swap, so
+ * multicore_reset_core1() runs in its documented core 0 direction and only
+ * one core exists from here on.  The watchdog is fed inside the loop because
+ * a full image swap can exceed one watchdog period. */
 static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
 {
+    /* 0. Stop Core 1 completely to prevent XIP instruction fetch collisions */
+    multicore_reset_core1();
+
+    uint8_t ram_page[FLASH_PAGE_SIZE]; /* Must reside in SRAM */
     uint32_t const aligned_size = (size + FLASH_SECTOR_SIZE - 1u) & ~(FLASH_SECTOR_SIZE - 1u);
     uint32_t const ints = save_and_disable_interrupts();
     (void)ints;
@@ -469,9 +706,15 @@ static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
     /* 1. Erase Slot A (active application starting at offset 0) */
     flash_range_erase(0, aligned_size);
 
-    /* 2. Copy verified new firmware from Staging Slot to Slot A */
-    const uint8_t *src = (const uint8_t *)(XIP_BASE + FLASH_STAGING_OFFSET);
-    flash_range_program(0, src, aligned_size);
+    /* 2. Copy page-by-page from Staging Slot into SRAM, then program into Slot A */
+    for (uint32_t offset = 0; offset < aligned_size; offset += FLASH_PAGE_SIZE) {
+        const uint8_t *src_xip = (const uint8_t *)(XIP_BASE + FLASH_STAGING_OFFSET + offset);
+        for (uint16_t i = 0; i < FLASH_PAGE_SIZE; ++i) {
+            ram_page[i] = src_xip[i];
+        }
+        watchdog_update();
+        flash_range_program(offset, ram_page, FLASH_PAGE_SIZE);
+    }
 
     /* 3. Reboot RP2040 into the newly installed firmware */
     watchdog_reboot(0, 0, 0);
@@ -482,73 +725,239 @@ static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
 
 static void dfu_process_command(struct link_ack_frame const *ack)
 {
-    uint8_t const cmd = ack->data[0];
+    uint8_t const command = ack->data[0];
+    uint8_t const command_session = ack->data[1];
 
-    if (cmd == LINK_TYPE_DFU_START) {
-        dfu_total_size = (uint32_t)ack->data[1] |
-                         ((uint32_t)ack->data[2] << 8) |
-                         ((uint32_t)ack->data[3] << 16) |
-                         ((uint32_t)ack->data[4] << 24);
-        dfu_expected_crc32 = (uint32_t)ack->data[5] |
-                            ((uint32_t)ack->data[6] << 8) |
-                            ((uint32_t)ack->data[7] << 16);
-        if (dfu_total_size == 0 || dfu_total_size > FLASH_STAGING_MAX_SIZE) {
-            dfu_send_status(DFU_STATUS_ERR_SIZE, 0, 0);
-            return;
-        }
-        dfu_flash_erase_staging(dfu_total_size);
-        dfu_bytes_written = 0;
-        dfu_page_buffer_len = 0;
-        dfu_last_seq = ack->sequence;
-        dfu_send_status(DFU_STATUS_OK, 0, 0);
+    /* Any DFU traffic keeps the radio awake; a five-minute mid-session
+     * System OFF would otherwise kill the update silently. */
+    radio_last_activity_ms = board_millis();
+
+    /* The reverse ACK path can redeliver one command while its reply is
+     * still queued.  Replay the stored reply instead of double-applying. */
+    if (dfu_last_command_valid &&
+        ack->sequence == dfu_last_command_token &&
+        command == dfu_last_command && command_session == dfu_session) {
+        dfu_repeat_last_reply();
         return;
     }
 
-    if (cmd == LINK_TYPE_DFU_DATA) {
-        if (ack->sequence == dfu_last_seq) {
-            uint8_t const prog = (uint8_t)((dfu_bytes_written * 100u) / (dfu_total_size ? dfu_total_size : 1u));
-            dfu_send_status(DFU_STATUS_OK, prog, (uint16_t)(dfu_bytes_written / 4u));
+    dfu_last_command_valid = true;
+    dfu_last_command_token = ack->sequence;
+    dfu_last_command = command;
+
+    if (command == LINK_TYPE_DFU_START) {
+        uint8_t const target = ack->data[2];
+        uint8_t const protocol = ack->data[3];
+        uint32_t const image_size = (uint32_t)ack->data[4] |
+            ((uint32_t)ack->data[5] << 8) |
+            ((uint32_t)ack->data[6] << 16) |
+            ((uint32_t)ack->data[7] << 24);
+
+        dfu_session = command_session;
+        if (target != OTA_TARGET_RP2040) {
+            dfu_reply(DFU_STATUS_ERR_TARGET, target, 0);
             return;
         }
-        dfu_last_seq = ack->sequence;
+        if (protocol != OTA_PROTOCOL_VERSION) {
+            dfu_reply(DFU_STATUS_ERR_PROTOCOL, protocol, 0);
+            return;
+        }
+        if (image_size <= 0x100u + 8u ||
+            image_size > FLASH_STAGING_MAX_SIZE) {
+            dfu_reply(DFU_STATUS_ERR_SIZE, 0, image_size);
+            return;
+        }
 
-        for (int i = 2; i < 8; ++i) {
-            if (dfu_bytes_written + dfu_page_buffer_len < dfu_total_size) {
-                dfu_page_buffer[dfu_page_buffer_len++] = ack->data[i];
-                if (dfu_page_buffer_len == FLASH_PAGE_SIZE) {
-                    dfu_flash_program_page(dfu_bytes_written, dfu_page_buffer);
-                    dfu_bytes_written += FLASH_PAGE_SIZE;
-                    dfu_page_buffer_len = 0;
+        dfu_reset_session();
+        dfu_session = command_session;
+        dfu_total_size = image_size;
+        if (!dfu_flash_erase_staging(image_size)) {
+            dfu_reply(DFU_STATUS_ERR_FLASH, 1u, 0);
+            return;
+        }
+        dfu_session_active = true;
+        dfu_reply(DFU_STATUS_OK, 0, 0);
+        return;
+    }
+
+    if (command == LINK_TYPE_DFU_QUERY) {
+        const struct ota_install_metadata *const metadata =
+            (const struct ota_install_metadata *)(XIP_BASE +
+                                                  OTA_METADATA_OFFSET);
+        dfu_session = command_session;
+        if (ack->data[2] != OTA_TARGET_RP2040) {
+            dfu_reply(DFU_STATUS_ERR_TARGET, ack->data[2], 0);
+        } else if (ack->data[3] != OTA_PROTOCOL_VERSION) {
+            dfu_reply(DFU_STATUS_ERR_PROTOCOL, ack->data[3], 0);
+        } else if (ota_metadata_is_valid(metadata) &&
+                   metadata->state == OTA_METADATA_STATE_INSTALLED) {
+            dfu_reply(DFU_STATUS_BOOT_OK, 0, metadata->image_crc32);
+        } else {
+            dfu_reply(DFU_STATUS_IDLE, 0, 0);
+        }
+        return;
+    }
+
+    if (!dfu_session_active || command_session != dfu_session) {
+        dfu_session = command_session;
+        dfu_reply(DFU_STATUS_ERR_SESSION, 0, 0);
+        return;
+    }
+
+    if (command == LINK_TYPE_DFU_CRC) {
+        uint16_t const board_id = (uint16_t)ack->data[6] |
+            ((uint16_t)ack->data[7] << 8);
+        if (board_id != OTA_BOARD_WEACT_RP2040_4MB) {
+            dfu_reply(DFU_STATUS_ERR_TARGET, 0, board_id);
+            return;
+        }
+        if (dfu_bytes_accepted != 0u) {
+            dfu_reply(DFU_STATUS_ERR_STATE, 1u, dfu_bytes_accepted);
+            return;
+        }
+        dfu_expected_crc32 = (uint32_t)ack->data[2] |
+            ((uint32_t)ack->data[3] << 8) |
+            ((uint32_t)ack->data[4] << 16) |
+            ((uint32_t)ack->data[5] << 24);
+        dfu_crc_received = true;
+        dfu_reply(DFU_STATUS_OK, 0, 0);
+        return;
+    }
+
+    if (command == LINK_TYPE_DFU_DATA) {
+        if (!dfu_crc_received || dfu_image_verified) {
+            dfu_reply(DFU_STATUS_ERR_STATE, 2u, dfu_bytes_accepted);
+            return;
+        }
+        for (uint8_t i = 2u; i < 8u &&
+             dfu_bytes_accepted < dfu_total_size; ++i) {
+            dfu_page_buffer[dfu_page_buffer_len++] = ack->data[i];
+            ++dfu_bytes_accepted;
+            if (dfu_page_buffer_len == FLASH_PAGE_SIZE) {
+                if (!dfu_flash_program(
+                        FLASH_STAGING_OFFSET + dfu_bytes_committed,
+                        dfu_page_buffer, FLASH_PAGE_SIZE)) {
+                    dfu_reply(DFU_STATUS_ERR_FLASH, 2u,
+                              dfu_bytes_accepted);
+                    return;
                 }
+                dfu_bytes_committed += FLASH_PAGE_SIZE;
+                dfu_page_buffer_len = 0;
             }
         }
-
-        uint8_t const prog = (uint8_t)((dfu_bytes_written * 100u) / (dfu_total_size ? dfu_total_size : 1u));
-        dfu_send_status(DFU_STATUS_OK, prog, (uint16_t)(dfu_bytes_written / 4u));
+        uint8_t const progress =
+            (uint8_t)((dfu_bytes_accepted * 100u) / dfu_total_size);
+        dfu_reply(DFU_STATUS_OK, progress, dfu_bytes_accepted);
         return;
     }
 
-    if (cmd == LINK_TYPE_DFU_FINISH) {
-        if (dfu_page_buffer_len > 0) {
-            memset(&dfu_page_buffer[dfu_page_buffer_len], 0xFF, FLASH_PAGE_SIZE - dfu_page_buffer_len);
-            dfu_flash_program_page(dfu_bytes_written, dfu_page_buffer);
-            dfu_bytes_written += dfu_page_buffer_len;
-            dfu_page_buffer_len = 0;
+    if (command == LINK_TYPE_DFU_FINISH) {
+        if (!dfu_crc_received || dfu_bytes_accepted != dfu_total_size) {
+            dfu_reply(DFU_STATUS_ERR_STATE, 3u, dfu_bytes_accepted);
+            return;
         }
-
-        const uint8_t *staging_flash = (const uint8_t *)(XIP_BASE + FLASH_STAGING_OFFSET);
-        uint32_t const actual_crc = calculate_crc32(staging_flash, dfu_total_size);
-
-        if (dfu_expected_crc32 != 0 && (actual_crc & 0x00FFFFFFu) != (dfu_expected_crc32 & 0x00FFFFFFu)) {
-            dfu_send_status(DFU_STATUS_ERR_CRC, 0, 0);
+        if (!dfu_flush_page()) {
+            dfu_reply(DFU_STATUS_ERR_FLASH, 3u, dfu_bytes_accepted);
+            return;
+        }
+        if (!dfu_staged_image_vectors_valid()) {
+            dfu_reply(DFU_STATUS_ERR_TARGET, 1u, 0);
+            return;
+        }
+        uint32_t const actual_crc = ota_crc32(
+            (const uint8_t *)(XIP_BASE + FLASH_STAGING_OFFSET),
+            dfu_total_size);
+        if (actual_crc != dfu_expected_crc32) {
+            dfu_reply(DFU_STATUS_ERR_CRC, 0, actual_crc);
         } else {
-            dfu_send_status(DFU_STATUS_SUCCESS, 100, (uint16_t)(dfu_total_size / 4u));
-            sleep_ms(250);
-            dfu_apply_and_reboot(dfu_total_size);
+            dfu_image_verified = true;
+            dfu_reply(DFU_STATUS_VERIFIED, 100u, actual_crc);
         }
         return;
     }
+
+    if (command == LINK_TYPE_DFU_ACTIVATE) {
+        if (!dfu_image_verified) {
+            dfu_reply(DFU_STATUS_ERR_STATE, 4u, dfu_bytes_accepted);
+            return;
+        }
+        if (!dfu_write_install_metadata()) {
+            dfu_reply(DFU_STATUS_ERR_FLASH, 4u, 0);
+            return;
+        }
+        dfu_reply(DFU_STATUS_APPLYING, 100u, dfu_expected_crc32);
+        dfu_apply_pending = true;
+        dfu_apply_after_ms = board_millis() + DFU_APPLY_DELAY_MS;
+        return;
+    }
+
+    if (command == LINK_TYPE_DFU_ABORT) {
+        dfu_reset_session();
+        dfu_session = command_session;
+        dfu_apply_pending = false;
+        dfu_reply(DFU_STATUS_ABORTED, 0, 0);
+        return;
+    }
+
+    dfu_reply(DFU_STATUS_ERR_PROTOCOL, command, 0);
 }
+
+/* Core 1 waits until the APPLYING reply has fully drained through SPI/ESB,
+ * then asks core 0 to perform the slot swap (see main loop). */
+static void dfu_apply_task(void)
+{
+    if (!dfu_apply_pending) return;
+    if ((int32_t)(board_millis() - dfu_apply_after_ms) < 0) return;
+    if (spi_retry_pending || spi_input_queue_count != 0 ||
+        battery_spi_pending) {
+        return;
+    }
+
+    dfu_apply_size = dfu_total_size;
+    __dmb();
+    dfu_apply_requested = true;
+    dfu_apply_pending = false;
+}
+
+/* After a successful install the new image confirms itself: the metadata
+ * page written by ACTIVATE still says INSTALLED, so the tool gets its
+ * post-reboot BOOT_OK without any bootloader. */
+static void dfu_boot_report_task(void)
+{
+    if (dfu_boot_report_count >= 20u ||
+        (int32_t)(board_millis() - dfu_boot_report_after_ms) < 0) {
+        return;
+    }
+
+    const struct ota_install_metadata *const metadata =
+        (const struct ota_install_metadata *)(XIP_BASE +
+                                              OTA_METADATA_OFFSET);
+    if (!ota_metadata_is_valid(metadata) ||
+        metadata->state != OTA_METADATA_STATE_INSTALLED) {
+        dfu_boot_report_count = 20u;
+        return;
+    }
+
+    dfu_send_status(DFU_STATUS_BOOT_OK, metadata->session,
+                    metadata->command_token, 0, metadata->image_crc32);
+    ++dfu_boot_report_count;
+    dfu_boot_report_after_ms = board_millis() + 250u;
+}
+#endif /* WIRELESS_KEYBOARD_OTA_SUPPORT */
+
+#if HID_DIAGNOSTIC_LOG
+/* Temporary OTA reverse-path diagnostic (diagnostic builds only):
+ * color 1 = blue flash -> a fresh lock-state ACK arrived over MISO,
+ * color 2 = red flash  -> any DFU ACK arrived over MISO.
+ * Rendered by battery_update_led as a 300 ms LED flash. */
+static uint8_t ota_diag_blink_color;
+static uint32_t ota_diag_blink_until_ms;
+static void ota_diag_blink(uint8_t color)
+{
+    ota_diag_blink_color = color;
+    ota_diag_blink_until_ms = board_millis() + 300u;
+}
+#endif
 
 static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
 {
@@ -559,10 +968,15 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
         return;
     }
 
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
     if (ack.type == LINK_ACK_TYPE_DFU) {
+#if HID_DIAGNOSTIC_LOG
+        ota_diag_blink(2u);
+#endif
         dfu_process_command(&ack);
         return;
     }
+#endif
 
     if (ack.type != LINK_ACK_TYPE_LOCK_STATE ||
         (ack.data[1] & 0x01u) == 0) {
@@ -584,6 +998,9 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
     remote_keyboard_led_valid = true;
     remote_keyboard_led_state = ack.data[0] &
         (HID_LED_NUM_LOCK | HID_LED_CAPS_LOCK | HID_LED_SCROLL_LOCK);
+#if HID_DIAGNOSTIC_LOG
+    ota_diag_blink(1u);
+#endif
 
     if (keyboard_led_state != remote_keyboard_led_state) {
         keyboard_led_state = remote_keyboard_led_state;
@@ -606,13 +1023,28 @@ static void spi_write_frame(struct link_input_frame const *frame)
 #endif
 
     gpio_put(PIN_SPI_CSN, 0);
-    sleep_us(1);
+    sleep_us(2);
     spi_write_read_blocking(SPI_PORT, (uint8_t const *)frame, rx,
                             sizeof(*frame));
-    sleep_us(1);
+    sleep_us(2);
     gpio_put(PIN_SPI_CSN, 1);
 
     total_spi_frames_sent++;
+#if HID_DIAGNOSTIC_LOG
+    /* Raw MISO witness: what did the Transmitter actually clock out?
+     * Prints only when the leading bytes change, so the volume stays
+     * bounded. 5A 03 xx = an ACK frame (xx: 00 initial, 01 LED, 02 DFU);
+     * 00 .. = nothing armed on the slave (ORC) or dead MISO. */
+    static uint8_t miso_witness[3];
+    if (rx[0] != miso_witness[0] || rx[1] != miso_witness[1] ||
+        rx[2] != miso_witness[2]) {
+        miso_witness[0] = rx[0];
+        miso_witness[1] = rx[1];
+        miso_witness[2] = rx[2];
+        printf("[MISO] %02x %02x %02x %02x %02x %02x\n",
+               rx[0], rx[1], rx[2], rx[3], rx[4], rx[5]);
+    }
+#endif
     spi_process_ack(rx);
 #if HID_DIAGNOSTIC_LOG
     printf("[SPI TX #%lu] type=%u seq=%u data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
@@ -658,22 +1090,65 @@ static bool spi_send_keyboard_transition(
     return spi_queue_input(LINK_TYPE_KEYBOARD, data);
 }
 
+static bool keyboard_transport_has_key(
+    const uint8_t report[KBD_REPORT_LEN], uint8_t key)
+{
+    for (uint8_t i = 2; i < KBD_REPORT_LEN; ++i) {
+        if (report[i] == key) return true;
+    }
+    return false;
+}
+
+static bool keyboard_transition_releases_state(
+    const uint8_t previous[KBD_REPORT_LEN],
+    const uint8_t current[KBD_REPORT_LEN])
+{
+    if ((previous[0] & (uint8_t)~current[0]) != 0U) {
+        return true;
+    }
+    for (uint8_t i = 2; i < KBD_REPORT_LEN; ++i) {
+        uint8_t const key = previous[i];
+        if (key != 0U && !keyboard_transport_has_key(current, key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint32_t spi_last_tx_us = 0;
+
 static void spi_service_task(void)
 {
     struct pending_radio_input pending;
 
     if (spi_retry_pending) {
-        if (radio_power_state != RADIO_AWAKE ||
+        if ((radio_power_state != RADIO_AWAKE &&
+             radio_power_state != RADIO_POWERING_OFF) ||
             (int32_t)(time_us_32() - spi_retry_after_us) < 0) {
             return;
         }
 
-        spi_retry_pending = false;
         spi_write_frame(&spi_retry_frame);
+        spi_last_tx_us = time_us_32();
+        if (spi_retry_copies_remaining > 1U) {
+            spi_retry_copies_remaining--;
+            spi_retry_after_us = spi_last_tx_us + SPI_REARM_GUARD_US;
+            spi_retry_pending = true;
+        } else {
+            spi_retry_copies_remaining = 0U;
+            spi_retry_pending = false;
+        }
         return;
     }
 
-    if (radio_power_state != RADIO_AWAKE) return;
+    if (radio_power_state != RADIO_AWAKE &&
+        radio_power_state != RADIO_POWERING_OFF) return;
+
+    /* Keep a bounded inter-frame gap for queued bursts so the slave RTOS
+     * thread has time to re-arm EasyDMA for the next transfer. */
+    if ((uint32_t)(time_us_32() - spi_last_tx_us) < SPI_REARM_GUARD_US) {
+        return;
+    }
 
     if (!pending_radio_queue_pop(spi_input_queue, &spi_input_queue_head,
                                  &spi_input_queue_count,
@@ -693,37 +1168,84 @@ static void spi_service_task(void)
                   pending.data[6], pending.data[7] },
     };
     spi_write_frame(&spi_retry_frame);
+    spi_last_tx_us = time_us_32();
+
+    if (pending.type == LINK_TYPE_KEYBOARD) {
+        memcpy(last_transport_keyboard, pending.data, KBD_REPORT_LEN);
+        last_transport_keyboard_valid = true;
+    } else if (pending.type == LINK_TYPE_CONSUMER) {
+        uint16_t const usage = (uint16_t)pending.data[0] |
+                               ((uint16_t)pending.data[1] << 8);
+        last_transport_consumer_usage = usage;
+        last_transport_consumer_valid = true;
+    }
+
+    spi_retry_copies_remaining = 0U;
     spi_retry_pending = false;
 }
 
-static void __unused spi_send_control_command(uint8_t command)
+static void spi_send_control_command(uint8_t command)
 {
     struct link_input_frame const frame = {
         .magic = LINK_MAGIC,
         .version = LINK_VERSION,
         .type = LINK_TYPE_CONTROL,
-        .sequence = spi_sequence++,
+        /* SPI-only control traffic is not visible to the Receiver's per-type
+         * input sequence tracking, but keep it out of the Keyboard/Consumer
+         * sequence namespace anyway so hidden polls can never make a later
+         * key transition look like an old packet. */
+        .sequence = spi_control_sequence++,
         .data = { command, 0, 0, 0, 0, 0, 0, 0 },
     };
 
     spi_write_frame(&frame);
+    /* A control transaction uses the same SPIS EasyDMA endpoint as input:
+     * preserve the inter-frame gap before a key transition can be sent. */
+    spi_last_tx_us = time_us_32();
 }
 
+/* Reverse-ACK pump.  During an OTA session the PC's DFU commands travel as
+ * ESB ACK payloads and need regular SPI transactions to be delivered; 1 kHz
+ * input alone cannot guarantee that.  Idle polling stays far from the input
+ * hot path (never within SPI_ACK_POLL_QUIET_MS of real input, never while
+ * input work is queued) and doubles as LED-state refresh.  While the radio
+ * is in System OFF, periodic wake requests let an OTA session start without
+ * a physical keypress (OTA discovery). */
 static void spi_ack_poll_task(void)
 {
-    /* Temporarily commented out for experiment: test typing without type=3 polling packets */
-    /*
     uint32_t const now = board_millis();
+
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
+    if (radio_power_state == RADIO_SYSTEM_OFF) {
+        if ((uint32_t)(now - ota_last_radio_discovery_ms) >=
+            OTA_RADIO_DISCOVERY_MS) {
+            ota_last_radio_discovery_ms = now;
+            radio_wake_requested = true;
+        }
+        return;
+    }
+
+    uint32_t const interval = dfu_session_active ?
+        SPI_ACK_POLL_DFU_MS : SPI_ACK_POLL_IDLE_MS;
+#else
+    /* No OTA receiver compiled in: no session can exist and no discovery
+     * wake is ever needed; only the idle LED-state refresh poll remains. */
+    uint32_t const interval = SPI_ACK_POLL_IDLE_MS;
+#endif
 
     if (radio_power_state != RADIO_AWAKE || spi_retry_pending ||
         spi_input_queue_count != 0 || battery_spi_pending ||
-        (uint32_t)(now - spi_last_ack_poll_ms) < SPI_ACK_POLL_MS) {
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
+        (!dfu_session_active &&
+         (uint32_t)(now - radio_last_activity_ms) < SPI_ACK_POLL_QUIET_MS) ||
+#endif
+        (uint32_t)(now - spi_last_ack_poll_ms) < interval ||
+        (uint32_t)(time_us_32() - spi_last_tx_us) < 250u) {
         return;
     }
 
     spi_last_ack_poll_ms = now;
     spi_send_control_command(LINK_CONTROL_POLL_ACK);
-    */
 }
 
 static bool keyboard_report_is_released(void)
@@ -764,7 +1286,8 @@ static bool hid_report_changed(uint8_t instance,
 static void radio_note_activity(void)
 {
     radio_last_activity_ms = board_millis();
-    if (radio_power_state == RADIO_SYSTEM_OFF) {
+    if (radio_power_state == RADIO_SYSTEM_OFF ||
+        radio_power_state == RADIO_POWERING_OFF) {
         radio_wake_requested = true;
     }
 }
@@ -793,6 +1316,25 @@ static void radio_power_task(void)
             (int32_t)(now - radio_transition_after_ms) >= 0) {
             radio_start_wake();
         }
+        return;
+    }
+
+    if (radio_power_state == RADIO_POWERING_OFF) {
+        if (spi_retry_pending || spi_input_queue_count != 0) {
+            return;
+        }
+
+        /* The control frame and its SPI safety copy have both completed.
+         * Battery is latest-state-only and must never postpone System OFF. */
+        battery_spi_pending = false;
+        battery_tx_pending = true;
+        radio_sleep_indicator_active = true;
+        radio_sleep_indicator_started_ms = now;
+        radio_power_state = RADIO_SYSTEM_OFF;
+        radio_transition_after_ms = now + RADIO_OFF_SETTLE_MS;
+#if PERIODIC_DEBUG
+        printf("[POWER] nRF52840 System OFF control completed\n");
+#endif
         return;
     }
 
@@ -828,20 +1370,25 @@ static void radio_power_task(void)
         !keyboard_report_is_released() ||
         (previous_consumer_valid && previous_consumer_usage != 0) ||
         keyboard_led_transfer_active || spi_retry_pending ||
-        spi_input_queue_count != 0) {
+        spi_input_queue_count != 0 || radio_wake_queue_count != 0) {
         return;
     }
 
-    spi_send_control_command(LINK_CONTROL_SYSTEM_OFF);
-    radio_sleep_indicator_active = true;
-    radio_sleep_indicator_started_ms = now;
-    radio_power_state = RADIO_SYSTEM_OFF;
-    radio_wake_queue_head = 0;
-    radio_wake_queue_count = 0;
+    /* Drop/retain only the latest low-priority telemetry; it will be sent
+     * after a real keyboard/Consumer wake, never as a wake source itself. */
+    battery_spi_pending = false;
+    battery_tx_pending = true;
+    uint8_t const command[KBD_REPORT_LEN] = {
+        LINK_CONTROL_SYSTEM_OFF, 0, 0, 0, 0, 0, 0, 0
+    };
+    if (!spi_queue_input(LINK_TYPE_CONTROL, command)) {
+        return;
+    }
+
+    radio_power_state = RADIO_POWERING_OFF;
     radio_wake_requested = false;
-    radio_transition_after_ms = now + RADIO_OFF_SETTLE_MS;
 #if PERIODIC_DEBUG
-    printf("[POWER] nRF52840 System OFF requested after 5 minutes idle\n");
+    printf("[POWER] nRF52840 System OFF queued after idle timeout\n");
 #endif
 }
 
@@ -1131,16 +1678,61 @@ static uint16_t decode_consumer_usage(struct hid_instance_state const *state,
 
 static void forward_consumer_usage(uint16_t usage)
 {
+    if (usage != 0) {
+        consumer_press_ms = board_millis();
+    }
     if (previous_consumer_valid && usage == previous_consumer_usage) return;
     uint8_t data[KBD_REPORT_LEN] = {
         (uint8_t)usage, (uint8_t)(usage >> 8), 0, 0, 0, 0, 0, 0
     };
-    if (!spi_queue_input(LINK_TYPE_CONSUMER, data)) return;
-    previous_consumer_usage = usage;
-    previous_consumer_valid = true;
+    radio_note_activity();
+    if (!spi_queue_input(LINK_TYPE_CONSUMER, data)) {
+        /* SPI queue full: stash the latest usage for retry in consumer_task
+         * and invalidate dedup state so the next press of the same key is not
+         * silently blocked.  Always overwrite consumer_retry_usage with the
+         * most recent value so a release (0) replaces a stale press. */
+        consumer_retry_usage = usage;
+        consumer_retry_pending = true;
+        previous_consumer_valid = false;
+        return;
+    }
+    previous_consumer_usage  = usage;
+    previous_consumer_valid  = true;
+    consumer_retry_pending   = false;
 #if CONSUMER_DEBUG
     printf("[CONSUMER] usage=0x%04x\n", usage);
 #endif
+}
+
+static void consumer_task(void)
+{
+    /* Retry a consumer frame that was rejected by a full SPI queue.  The
+     * caller invokes spi_service_task later in the same loop iteration, so
+     * the queue drains between retries. */
+    if (consumer_retry_pending) {
+        uint8_t data[KBD_REPORT_LEN] = {
+            (uint8_t)consumer_retry_usage,
+            (uint8_t)(consumer_retry_usage >> 8),
+            0, 0, 0, 0, 0, 0
+        };
+        radio_note_activity();
+        if (spi_queue_input(LINK_TYPE_CONSUMER, data)) {
+            previous_consumer_usage  = consumer_retry_usage;
+            previous_consumer_valid  = true;
+            /* Refresh the press timestamp so a retry that arrives after a
+             * long stall does not immediately trigger the safety release. */
+            if (consumer_retry_usage != 0) {
+                consumer_press_ms = board_millis();
+            }
+            consumer_retry_pending = false;
+        }
+    }
+
+    if (previous_consumer_valid && previous_consumer_usage != 0 &&
+        (uint32_t)(board_millis() - consumer_press_ms) >=
+            CONSUMER_SAFETY_RELEASE_MS) {
+        forward_consumer_usage(0);
+    }
 }
 
 static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN]);
@@ -1383,13 +1975,13 @@ static void filter_null_movement(const uint8_t input[KBD_REPORT_LEN],
     bool const w_now = report_has_key(input, HID_KEY_W);
     bool const s_now = report_has_key(input, HID_KEY_S);
     bool const a_before = previous_physical_valid &&
-                          report_has_key(previous_physical_report, HID_KEY_A);
+                            report_has_key(previous_physical_report, HID_KEY_A);
     bool const d_before = previous_physical_valid &&
-                          report_has_key(previous_physical_report, HID_KEY_D);
+                            report_has_key(previous_physical_report, HID_KEY_D);
     bool const w_before = previous_physical_valid &&
-                          report_has_key(previous_physical_report, HID_KEY_W);
+                            report_has_key(previous_physical_report, HID_KEY_W);
     bool const s_before = previous_physical_valid &&
-                          report_has_key(previous_physical_report, HID_KEY_S);
+                            report_has_key(previous_physical_report, HID_KEY_S);
 
     active_ad_key = select_last_input_key(a_now, d_now,
                                          a_now && !a_before,
@@ -1433,6 +2025,7 @@ static void forward_keyboard_report(const uint8_t input[KBD_REPORT_LEN])
         return;
     }
 
+    radio_note_activity();
     if (!spi_send_keyboard_transition(output)) return;
     memcpy(previous_output_report, output, KBD_REPORT_LEN);
     previous_output_valid = true;
@@ -1482,7 +2075,6 @@ static void led_pwm_init(void)
     pwm_set_enabled(slice_g, true);
     pwm_set_enabled(slice_b, true);
 
-    printf("[LED] PWM init OK: R=GP%d G=GP%d B=GP%d\n", PIN_LED_R, PIN_LED_G, PIN_LED_B);
 }
 
 static uint8_t led_pwm_level(uint8_t brightness)
@@ -1501,6 +2093,15 @@ static void led_apply(struct rgb_color color)
     pwm_set_chan_level(slice_b, chan_b, led_pwm_level(color.b));
 }
 
+static struct rgb_color led_scale(struct rgb_color color, uint8_t level)
+{
+    return (struct rgb_color) {
+        .r = (uint8_t)(((uint16_t)color.r * level) / 255u),
+        .g = (uint8_t)(((uint16_t)color.g * level) / 255u),
+        .b = (uint8_t)(((uint16_t)color.b * level) / 255u),
+    };
+}
+
 static void led_off(void)
 {
     led_apply((struct rgb_color) { 0, 0, 0 });
@@ -1510,7 +2111,7 @@ static struct rgb_color battery_color_for_pct(uint8_t pct)
 {
     if (pct >= 75) return (struct rgb_color) { 0, 255, 0 };   // green
     if (pct >= 50) return (struct rgb_color) { 255, 255, 0 }; // yellow
-    if (pct >= 25) return (struct rgb_color) { 255, 80, 0 };  // orange
+    if (pct >= 25) return (struct rgb_color) { 255, 75, 0 };  // orange
     return (struct rgb_color) { 255, 0, 0 };                  // red
 }
 
@@ -1528,11 +2129,19 @@ enum battery_led_state {
 
 static enum battery_led_state battery_led_state = BATT_LED_BOOT;
 static uint32_t battery_state_started_ms;
-static uint32_t battery_last_check_ms;
+static uint32_t battery_slope_enable_after_ms;
 static uint32_t battery_filtered_mv;
 static uint32_t battery_previous_sample_mv;
-static uint8_t battery_pct;
-static bool battery_charge_detected_during_boot;
+static uint32_t battery_baseline_mv;
+static uint32_t battery_charge_peak_mv;
+static uint32_t battery_history_mv[BATT_HISTORY_LEN];
+static uint8_t  battery_history_idx = 0;
+static bool     battery_history_filled = false;
+static uint16_t battery_no_rise_seconds = 0;
+static int8_t   battery_trend_counter;
+static uint8_t  battery_pct;
+static bool     battery_sample_valid;
+static uint32_t battery_invalid_sample_count;
 
 static void battery_adc_init(void)
 {
@@ -1549,13 +2158,21 @@ static uint32_t battery_read_mv(void)
     adc_select_input(BATT_ADC_INPUT);
     uint32_t raw_sum = 0;
 
-    for (uint8_t i = 0; i < 16; ++i) {
+    /* Discard the first conversion after selecting the high-impedance divider
+     * channel, then average 64 conversions for ultra-low noise and maximum ENOB. */
+    (void)adc_read();
+    for (uint8_t i = 0; i < 64; ++i) {
         raw_sum += adc_read();
     }
 
-    uint32_t const raw_average = raw_sum / 16;
-    uint32_t const pin_mv = raw_average * 3300 / 4095;
-    return pin_mv * BATT_DIVIDER_RATIO;
+    uint32_t const raw_average = (raw_sum + 32u) / 64u;
+    uint32_t const battery_mv = (raw_average * BATT_ADC_SCALE_NUM + (BATT_ADC_SCALE_DEN / 2u)) / BATT_ADC_SCALE_DEN;
+    if (battery_mv < BATT_VALID_MIN_MV ||
+        battery_mv > BATT_VALID_MAX_MV) {
+        battery_invalid_sample_count++;
+        return 0;
+    }
+    return battery_mv;
 }
 
 static uint8_t battery_pct_for_mv(uint32_t batt_mv)
@@ -1566,8 +2183,36 @@ static uint8_t battery_pct_for_mv(uint32_t batt_mv)
                      (BATT_MAX_MV - BATT_MIN_MV));
 }
 
+static bool battery_visual_update_deferred(void)
+{
+    return spi_retry_pending || spi_input_queue_count != 0 ||
+           radio_wake_queue_count != 0 ||
+           usb_host_event_head != usb_host_event_tail;
+}
+
 static void battery_update_led(uint32_t now)
 {
+#if HID_DIAGNOSTIC_LOG
+    /* Temporary OTA reverse-path diagnostic flash (see ota_diag_blink). */
+    if (ota_diag_blink_color != 0u) {
+        if ((int32_t)(ota_diag_blink_until_ms - now) > 0) {
+            led_apply(ota_diag_blink_color == 1u
+                          ? (struct rgb_color){ 0, 0, 255 }
+                          : (struct rgb_color){ 255, 0, 0 });
+            return;
+        }
+        ota_diag_blink_color = 0u;
+        led_off();
+    }
+#endif
+
+    static uint32_t last_led_update_ms = 0;
+    if (battery_visual_update_deferred() ||
+        (uint32_t)(now - last_led_update_ms) < BATT_LED_UPDATE_MS) {
+        return;
+    }
+    last_led_update_ms = now;
+
     if (radio_sleep_indicator_active) {
         uint32_t const elapsed = now - radio_sleep_indicator_started_ms;
         uint32_t const duration = RADIO_SLEEP_BLINK_COUNT * 2u *
@@ -1584,6 +2229,11 @@ static void battery_update_led(uint32_t now)
         radio_sleep_indicator_active = false;
     }
 
+    if (!battery_sample_valid) {
+        led_off();
+        return;
+    }
+
     struct rgb_color const color = battery_color_for_pct(battery_pct);
 
     switch (battery_led_state) {
@@ -1593,12 +2243,17 @@ static void battery_update_led(uint32_t now)
         led_apply(color);
         break;
     case BATT_LED_CHARGING:
-        /* Exactly two ON/OFF cycles in every two-second animation window. */
-        if (((now - battery_state_started_ms) % BATT_PULSE_WINDOW_MS) %
-             BATT_PULSE_PERIOD_MS < (BATT_PULSE_PERIOD_MS / 2)) {
-            led_apply(color);
-        } else {
-            led_off();
+        /* Hardware-PWM breathing: one 0->100->0 pulse per second, or two
+         * smooth pulses in the existing two-second animation window. */
+        {
+            uint32_t const phase = (now - battery_state_started_ms) %
+                                   BATT_PULSE_PERIOD_MS;
+            uint32_t const half_period = BATT_PULSE_PERIOD_MS / 2u;
+            uint32_t const ramp = phase < half_period ?
+                                  phase : (BATT_PULSE_PERIOD_MS - phase);
+            uint8_t const brightness = (uint8_t)(
+                (ramp * LED_PWM_WRAP) / half_period);
+            led_apply(led_scale(color, brightness));
         }
         break;
     case BATT_LED_IDLE:
@@ -1614,13 +2269,23 @@ static void battery_start_display(void)
 
     battery_filtered_mv = initial_mv;
     battery_previous_sample_mv = initial_mv;
-    battery_pct = battery_pct_for_mv(initial_mv);
+    battery_baseline_mv = initial_mv;
+    battery_charge_peak_mv = initial_mv;
+    battery_trend_counter = 0;
+    battery_sample_valid = initial_mv != 0;
+    battery_pct = battery_sample_valid ? battery_pct_for_mv(initial_mv) : 0;
     battery_state_started_ms = board_millis();
     battery_last_check_ms = battery_state_started_ms;
     battery_led_state = BATT_LED_BOOT;
     battery_last_tx_ms = battery_state_started_ms;
     battery_tx_pending = false;
     battery_spi_pending = false;
+    for (uint8_t i = 0; i < BATT_HISTORY_LEN; ++i) {
+        battery_history_mv[i] = initial_mv;
+    }
+    battery_history_idx = 0;
+    battery_history_filled = false;
+    battery_no_rise_seconds = 0;
     battery_update_led(battery_state_started_ms);
 
 #if PERIODIC_DEBUG
@@ -1629,37 +2294,198 @@ static void battery_start_display(void)
 #endif
 }
 
+static void battery_set_led_state(enum battery_led_state next_state,
+                                  uint32_t now)
+{
+    if (battery_led_state == next_state) {
+        return;
+    }
+    battery_led_state = next_state;
+    battery_state_started_ms = now;
+    battery_material_step = true;
+    battery_tx_pending = true;
+}
+
 static void battery_sample_task(uint32_t now)
 {
     if (now - battery_last_check_ms < BATT_CHECK_MS) return;
     battery_last_check_ms = now;
 
     uint32_t const sample_mv = battery_read_mv();
-    int32_t const delta_mv = (int32_t)sample_mv -
-                             (int32_t)battery_previous_sample_mv;
-    battery_previous_sample_mv = sample_mv;
+    if (sample_mv == 0) {
+        return;
+    }
+    if (!battery_sample_valid) {
+        battery_filtered_mv = sample_mv;
+        battery_previous_sample_mv = sample_mv;
+        battery_baseline_mv = sample_mv;
+        battery_charge_peak_mv = sample_mv;
+        battery_trend_counter = 0;
+        battery_pct = battery_pct_for_mv(sample_mv);
+        battery_sample_valid = true;
+        battery_material_step = true;
+        battery_tx_pending = true;
+        for (uint8_t i = 0; i < BATT_HISTORY_LEN; ++i) {
+            battery_history_mv[i] = sample_mv;
+        }
+        battery_history_idx = 0;
+        battery_history_filled = false;
+        battery_no_rise_seconds = 0;
+        return;
+    }
+    /* During Boot, use the current hardware-filtered ADC sample directly. */
+    if (battery_led_state == BATT_LED_BOOT) {
+        battery_previous_sample_mv = battery_filtered_mv;
+        battery_filtered_mv = sample_mv;
+        battery_pct = battery_pct_for_mv(sample_mv);
+        battery_baseline_mv = sample_mv;
+        battery_charge_peak_mv = sample_mv;
+        battery_trend_counter = 0;
+        for (uint8_t i = 0; i < BATT_HISTORY_LEN; ++i) {
+            battery_history_mv[i] = sample_mv;
+        }
+        battery_history_idx = 0;
+        battery_history_filled = false;
+        battery_no_rise_seconds = 0;
+        return;
+    }
+
+    uint32_t const previous_filtered_mv = battery_filtered_mv;
     battery_filtered_mv = (battery_filtered_mv * 3 + sample_mv) / 4;
+    battery_previous_sample_mv = previous_filtered_mv;
     battery_pct = battery_pct_for_mv(battery_filtered_mv);
 
-    /* Detect only a large step between consecutive one-second ADC samples.
-     * 50 mV at GP28 corresponds to 150 mV at the battery through the x3
-     * divider. Stable voltage is monitored silently and never latches an LED. */
-    if (delta_mv >= (int32_t)BATT_EVENT_DELTA_MV) {
-        battery_material_step = true;
-        if (battery_led_state == BATT_LED_BOOT) {
-            battery_charge_detected_during_boot = true;
+    /* Update rolling 15-second history */
+    uint32_t const oldest_history_mv = battery_history_mv[battery_history_idx];
+    battery_history_mv[battery_history_idx] = battery_filtered_mv;
+    battery_history_idx = (battery_history_idx + 1) % BATT_HISTORY_LEN;
+    if (battery_history_idx == 0) {
+        battery_history_filled = true;
+    }
+
+    if ((int32_t)(now - battery_slope_enable_after_ms) < 0) {
+        battery_baseline_mv = battery_filtered_mv;
+        battery_charge_peak_mv = battery_filtered_mv;
+        battery_trend_counter = 0;
+        battery_no_rise_seconds = 0;
+        return;
+    }
+
+    if (battery_baseline_mv == 0) {
+        battery_baseline_mv = battery_filtered_mv;
+    }
+    if (battery_charge_peak_mv == 0) {
+        battery_charge_peak_mv = battery_filtered_mv;
+    }
+
+    int32_t const delta_15s = battery_history_filled ?
+        ((int32_t)battery_filtered_mv - (int32_t)oldest_history_mv) : 0;
+
+    switch (battery_led_state) {
+    case BATT_LED_IDLE: {
+        /* Check if battery reached full */
+        if (battery_filtered_mv >= BATT_MAX_MV) {
+            battery_charge_peak_mv = battery_filtered_mv;
+            battery_baseline_mv = battery_filtered_mv;
+            battery_trend_counter = 0;
+            battery_no_rise_seconds = 0;
+            battery_set_led_state(BATT_LED_FULL, now);
+            return;
+        }
+
+        /* Check for charging entry:
+         * 1. Sudden plug-in step: >= 10 mV rise over baseline or 15s history
+         * 2. Sustained CC rise: delta_15s >= 4 mV (sustained climbing) */
+        int32_t const diff_from_baseline = (int32_t)battery_filtered_mv - (int32_t)battery_baseline_mv;
+        bool const plug_step = diff_from_baseline >= (int32_t)BATT_CHARGE_STEP_MV ||
+                               (battery_history_filled && delta_15s >= (int32_t)BATT_CHARGE_STEP_MV);
+        bool const cc_rising = battery_history_filled && (delta_15s >= (int32_t)BATT_CHARGE_SLOPE_MV);
+
+        if (plug_step || cc_rising) {
+            if (battery_trend_counter < 10) battery_trend_counter += 2;
+            if (battery_trend_counter >= BATT_CHARGE_TREND_ENTER) {
+                battery_charge_peak_mv = battery_filtered_mv;
+                battery_baseline_mv = battery_filtered_mv;
+                battery_no_rise_seconds = 0;
+                battery_set_led_state(BATT_LED_CHARGING, now);
+                return;
+            }
+        } else if (diff_from_baseline < 0) {
+            /* Normal discharge: smoothly follow baseline downward */
+            battery_baseline_mv = (battery_baseline_mv * 7 + battery_filtered_mv) / 8;
+            if (battery_trend_counter > 0) battery_trend_counter--;
         } else {
-            battery_led_state = battery_pct >= 100 ?
-                BATT_LED_FULL : BATT_LED_CHARGING;
-            battery_state_started_ms = now;
+            /* Minor drift: very slow baseline pull and decay trend counter */
+            battery_baseline_mv = (battery_baseline_mv * 63 + battery_filtered_mv + 32) / 64;
+            if (battery_trend_counter > 0) battery_trend_counter--;
         }
-    } else if (delta_mv <= -(int32_t)BATT_EVENT_DELTA_MV) {
-        battery_material_step = true;
-        battery_charge_detected_during_boot = false;
-        if (battery_led_state != BATT_LED_BOOT) {
-            battery_led_state = BATT_LED_UNPLUG_SHOW;
-            battery_state_started_ms = now;
+        break;
+    }
+
+    case BATT_LED_CHARGING: {
+        if (battery_filtered_mv > battery_charge_peak_mv) {
+            battery_charge_peak_mv = battery_filtered_mv;
+            battery_no_rise_seconds = 0;
+        } else {
+            if (battery_no_rise_seconds < 600) battery_no_rise_seconds++;
         }
+        battery_baseline_mv = battery_charge_peak_mv;
+
+        /* Check if reached 100% full */
+        if (battery_filtered_mv >= BATT_MAX_MV) {
+            battery_trend_counter = 0;
+            battery_no_rise_seconds = 0;
+            battery_set_led_state(BATT_LED_FULL, now);
+            return;
+        }
+
+        /* Check for unplug: sudden drop >= BATT_UNPLUG_DROP_MV below peak */
+        int32_t const drop_from_peak = (int32_t)battery_charge_peak_mv - (int32_t)battery_filtered_mv;
+        if (drop_from_peak >= (int32_t)BATT_UNPLUG_DROP_MV) {
+            battery_baseline_mv = battery_filtered_mv;
+            battery_charge_peak_mv = battery_filtered_mv;
+            battery_trend_counter = 0;
+            battery_no_rise_seconds = 0;
+            battery_set_led_state(BATT_LED_UNPLUG_SHOW, now);
+            return;
+        }
+
+        /* In CC range (< 4.10V), if voltage has not risen at all for 45s and is flat/falling, exit to IDLE */
+        if (battery_filtered_mv < BATT_CV_THRESHOLD_MV && battery_no_rise_seconds >= 45 && delta_15s <= 0) {
+            battery_baseline_mv = battery_filtered_mv;
+            battery_charge_peak_mv = battery_filtered_mv;
+            battery_trend_counter = 0;
+            battery_no_rise_seconds = 0;
+            battery_set_led_state(BATT_LED_IDLE, now);
+            return;
+        }
+
+        /* In CV range (>= 4.10V / 95%+): REMAINS in CHARGING even with flat voltage! */
+        break;
+    }
+
+    case BATT_LED_FULL: {
+        if (battery_filtered_mv > battery_charge_peak_mv) {
+            battery_charge_peak_mv = battery_filtered_mv;
+        }
+        battery_baseline_mv = battery_charge_peak_mv;
+
+        int32_t const drop_from_peak = (int32_t)battery_charge_peak_mv - (int32_t)battery_filtered_mv;
+        if (drop_from_peak >= (int32_t)BATT_UNPLUG_DROP_MV || battery_filtered_mv < BATT_FULL_EXIT_MV) {
+            battery_baseline_mv = battery_filtered_mv;
+            battery_charge_peak_mv = battery_filtered_mv;
+            battery_trend_counter = 0;
+            battery_no_rise_seconds = 0;
+            battery_set_led_state(BATT_LED_UNPLUG_SHOW, now);
+            return;
+        }
+        break;
+    }
+
+    case BATT_LED_UNPLUG_SHOW:
+    case BATT_LED_BOOT:
+    default:
+        break;
     }
 }
 
@@ -1671,9 +2497,8 @@ static uint8_t battery_link_state(void)
     case BATT_LED_FULL:
         return 3; /* full */
     case BATT_LED_UNPLUG_SHOW:
-        return 2; /* discharging */
     case BATT_LED_IDLE:
-        return 0; /* idle */
+        return 2; /* discharging */
     case BATT_LED_BOOT:
     default:
         return 4; /* unknown */
@@ -1682,18 +2507,21 @@ static uint8_t battery_link_state(void)
 
 static void battery_telemetry_task(uint32_t now)
 {
-    if ((uint32_t)(now - battery_last_tx_ms) >=
+    if (battery_material_step ||
+        (uint32_t)(now - battery_last_tx_ms) >=
         BATTERY_TELEMETRY_PERIOD_MS) {
         battery_tx_pending = true;
     }
 
-    if (!battery_tx_pending || radio_power_state != RADIO_AWAKE ||
-        (uint32_t)(now - radio_last_activity_ms) <
+    if (!battery_sample_valid || !battery_tx_pending ||
+        radio_power_state != RADIO_AWAKE) {
+        return;
+    }
+
+    if ((uint32_t)(now - radio_last_activity_ms) <
             BATTERY_HID_QUIET_GUARD_MS ||
         radio_wake_queue_count != 0 || spi_input_queue_count != 0 ||
         spi_retry_pending || battery_spi_pending ||
-        !keyboard_report_is_released() ||
-        (previous_consumer_valid && previous_consumer_usage != 0) ||
         keyboard_led_transfer_active) {
         return;
     }
@@ -1724,14 +2552,28 @@ static void battery_task(void)
 
     if (battery_led_state == BATT_LED_BOOT &&
         now - battery_state_started_ms >= BATT_BOOT_SHOW_MS) {
-        battery_led_state = battery_charge_detected_during_boot ?
-            (battery_pct >= 100 ? BATT_LED_FULL : BATT_LED_CHARGING) :
-            BATT_LED_IDLE;
+        battery_led_state = battery_sample_valid &&
+                            battery_filtered_mv >= BATT_MAX_MV ?
+                            BATT_LED_FULL : BATT_LED_IDLE;
         battery_state_started_ms = now;
-    } else if (battery_led_state != BATT_LED_IDLE &&
+        battery_slope_enable_after_ms = now +
+                                        BATT_POST_BOOT_SLOPE_GUARD_MS;
+        battery_baseline_mv = battery_filtered_mv;
+        battery_charge_peak_mv = battery_filtered_mv;
+        battery_trend_counter = 0;
+        battery_no_rise_seconds = 0;
+        battery_material_step = true;
+        battery_tx_pending = true;
+    } else if (battery_led_state == BATT_LED_UNPLUG_SHOW &&
                now - battery_state_started_ms >= BATT_EVENT_SHOW_MS) {
         battery_led_state = BATT_LED_IDLE;
         battery_state_started_ms = now;
+        battery_baseline_mv = battery_filtered_mv;
+        battery_charge_peak_mv = battery_filtered_mv;
+        battery_trend_counter = 0;
+        battery_no_rise_seconds = 0;
+        battery_material_step = true;
+        battery_tx_pending = true;
     }
 
     battery_update_led(now);
@@ -2191,9 +3033,9 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
     hid_receive_arm_or_defer(dev_addr, instance);
 }
 
-/* Core 0 consumes complete reports in arrival order.  The only work in the
- * PIO-USB callback is descriptor decoding, copying eight bytes and immediately
- * arming the next IN transfer. */
+/* Core 1 consumes complete reports in arrival order. The only work on Core 0
+ * in the PIO-USB callback is descriptor decoding, copying eight bytes and
+ * immediately arming the next IN transfer. */
 static void usb_host_event_task(void)
 {
     struct usb_host_event event;
@@ -2232,12 +3074,10 @@ static void usb_host_event_task(void)
         }
 
         case USB_HOST_EVENT_KEYBOARD_REPORT:
-            radio_note_activity();
             forward_keyboard_report(event.data);
             break;
 
         case USB_HOST_EVENT_CONSUMER_REPORT:
-            radio_note_activity();
             forward_consumer_usage((uint16_t)(event.data[0] |
                                               (event.data[1] << 8)));
             break;
@@ -2248,25 +3088,48 @@ static void usb_host_event_task(void)
     }
 }
 
-static void usb_host_core1_main(void)
+/* Core 1 spins while work is pending; otherwise it naps with WFE so the clock
+ * tree gates the CPU. Core 0 raises SEV on every queued USB event (see
+ * usb_host_event_push), so input latency is unaffected. The 1 ms cap bounds
+ * battery/LED/power-state cadence, and a pending SPI safety copy schedules an
+ * exact timer wake so its 75 us re-arm guard is never overslept. */
+static void worker_core1_idle_wait(void)
 {
-    /* PIO-USB polls at USB bit timing.  Keep this task on the otherwise idle
-     * core so SPI retries, ADC/RGB updates and radio wakeups cannot defer an
-     * EP 0x81 re-arm during a multi-key transition. */
-    pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
-    pio_cfg.pin_dp = USB_HOST_DP_PIN;
-    tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION,
-                  &pio_cfg);
-    tuh_hid_set_default_protocol(HID_PROTOCOL_BOOT);
-    tuh_init(BOARD_TUH_RHPORT);
+    if (usb_host_event_head != usb_host_event_tail ||
+        spi_input_queue_count != 0 || radio_wake_queue_count != 0 ||
+        battery_spi_pending || consumer_retry_pending) {
+        return;
+    }
 
+    if (spi_retry_pending) {
+        sleep_until(from_us_since_boot(spi_retry_after_us));
+        return;
+    }
+
+    sleep_until(make_timeout_time_ms(1));
+}
+
+static void worker_core1_main(void)
+{
+    /* Core 1 owns every operation downstream of USB capture: ordered event
+     * consumption, SPI transmission, ADC/charging state and RGB handling.
+     * It never calls TinyUSB/PIO-USB APIs. */
     while (true) {
-        tuh_task();
-        hid_receive_rearm_task();
-        keyboard_halt_recovery_task();
-        keyboard_hid_stall_recovery_task();
-        keyboard_led_task();
-        usb_descriptor_dump_task();
+        usb_host_event_task();
+        consumer_task();
+        spi_service_task();
+        radio_power_task();
+        battery_task();
+#if SPI_LINK_TEST_MODE
+        spi_link_test_task();
+#endif
+        spi_ack_poll_task();
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
+        dfu_apply_task();
+        dfu_boot_report_task();
+#endif
+        status_task();
+        worker_core1_idle_wait();
     }
 }
 
@@ -2289,7 +3152,7 @@ static void led_blinking_task(void)
  *--------------------------------------------------------------------*/
 int main(void)
 {
-    set_sys_clock_khz(120000, true);
+    set_sys_clock_khz(RP2040_SYS_CLOCK_KHZ, true);
 
     board_init();
 #if RUNTIME_LOGGING
@@ -2308,27 +3171,54 @@ int main(void)
     battery_adc_init();
     watchdog_enable(RP2040_WATCHDOG_TIMEOUT_MS, true);
 
-    multicore_reset_core1();
-    multicore_launch_core1(usb_host_core1_main);
-    printf("[INIT] TinyUSB host stack initialized on core 1\n");
-
     printf("[INIT] Starting 5-second battery display...\n");
     battery_start_display();
 
-    printf("[INIT] Ready. Waiting for keyboard on D+/D-...\n\n");
     radio_last_activity_ms = board_millis();
+    /* Receiver remains enumerated while RP2040 may reboot independently.
+     * Reset its per-session sequence/cache state before any captured input. */
+    uint8_t const session_reset[KBD_REPORT_LEN] = {
+        LINK_CONTROL_SESSION_RESET, 0, 0, 0, 0, 0, 0, 0
+    };
+    (void)spi_queue_input(LINK_TYPE_CONTROL, session_reset);
+    multicore_reset_core1();
+    multicore_launch_core1(worker_core1_main);
+    printf("[INIT] SPI/battery/RGB worker initialized on core 1\n");
+
+    /* Core 0 is dedicated to PIO-USB/TinyUSB host timing and immediate
+     * endpoint re-arm. No SPI, ADC, radio or battery work runs here. */
+    pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+    pio_cfg.pin_dp = USB_HOST_DP_PIN;
+    tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION,
+                  &pio_cfg);
+    tuh_hid_set_default_protocol(HID_PROTOCOL_BOOT);
+    tuh_init(BOARD_TUH_RHPORT);
+    printf("[INIT] TinyUSB/PIO-USB host initialized on core 0\n");
+
+    printf("[INIT] Ready. Waiting for keyboard on D+/D-...\n\n");
 
     while (1) {
-        watchdog_update();
-        usb_host_event_task();
-        radio_power_task();
-        battery_task();
-        spi_ack_poll_task();
-        spi_service_task();
-#if SPI_LINK_TEST_MODE
-        spi_link_test_task();
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
+        /* Core 1 hands the verified slot swap to core 0: this is the only
+         * context where multicore_reset_core1() is used in its documented
+         * direction before dfu_apply_and_reboot takes the whole chip. */
+        if (dfu_apply_requested) {
+            dfu_apply_requested = false;
+            dfu_apply_and_reboot(dfu_apply_size);
+        }
 #endif
+
+        watchdog_update();
+        tuh_task();
+        hid_receive_rearm_task();
+        keyboard_halt_recovery_task();
+        keyboard_hid_stall_recovery_task();
+        keyboard_led_task();
+        usb_descriptor_dump_task();
         led_blinking_task();
-        status_task();
+        /* PIO-USB's repeating 1 ms SOF timer (plus every transaction IRQ)
+         * wakes WFI, so polling tasks keep their cadence while the CPU gates
+         * between interrupts instead of spinning. */
+        __wfi();
     }
 }

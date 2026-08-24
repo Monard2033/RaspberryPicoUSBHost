@@ -4,7 +4,9 @@ param()
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $sourcePath = Join-Path $projectRoot 'src\main.cpp'
+$rcPath = Join-Path $projectRoot 'src\resources.rc'
 $distPath = Join-Path $projectRoot 'dist'
+$resObjPath = Join-Path $distPath 'resources.o'
 $outputPath = Join-Path $distPath 'WirelessKeyboardTray.exe'
 
 $compiler = Get-Command 'g++.exe' -ErrorAction SilentlyContinue
@@ -17,7 +19,28 @@ if ($null -eq $compiler) {
     }
 }
 
+$windres = Get-Command 'windres.exe' -ErrorAction SilentlyContinue
+if ($null -eq $windres) {
+    $fallbackWindres = 'C:\ProgramData\mingw64\mingw64\bin\windres.exe'
+    if (Test-Path -LiteralPath $fallbackWindres) {
+        $windres = Get-Item -LiteralPath $fallbackWindres
+    }
+}
+
 New-Item -ItemType Directory -Path $distPath -Force | Out-Null
+
+if ($null -ne $windres -and (Test-Path -LiteralPath $rcPath)) {
+    $windresArgs = @(
+        '-i', $rcPath,
+        '-o', $resObjPath,
+        '--input-format=rc',
+        '--output-format=coff'
+    )
+    & $windres.Source @windresArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Resource compilation failed with exit code $LASTEXITCODE."
+    }
+}
 
 $arguments = @(
     '-std=c++17',
@@ -36,7 +59,14 @@ $arguments = @(
     '-static-libstdc++',
     '-DWINVER=0x0A00',
     '-D_WIN32_WINNT=0x0A00',
-    $sourcePath,
+    $sourcePath
+)
+
+if (Test-Path -LiteralPath $resObjPath) {
+    $arguments += $resObjPath
+}
+
+$arguments += @(
     '-o',
     $outputPath,
     '-Wl,--gc-sections',

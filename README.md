@@ -49,11 +49,15 @@ the nRF52840 transmitter over SPI.
   Receiver; the RGB animation and ADC sampling remain local to RP2040.
 - RGB uses red `GP21`, green `GP20`, blue `GP19`; this pin-only adjustment was
   isolated in commit `ea4827d` before the low-power implementation.
-- Low-power Stage 1 is implemented. RP2040 remains at 120 MHz to service the
-  PIO-USB host, while nRF52840 stops released-state keepalives and enters System
+- Low-power Stage 1 is implemented. RP2040 runs at 96 MHz (the lowest safe
+  clock for PIO-USB's 96 MHz full-speed receive sampler; override with
+  `RP2040_SYS_CLOCK_KHZ=120000`) and gates both cores with WFI/WFE idle waits,
+  while nRF52840 stops released-state keepalives and enters System
   OFF after five minutes without changed HID input. CSN/P0.22 wakes it and the
   RP2040 retransmits keyboard and Consumer state after the boot guard time.
-  Hardware sleep-current and wake-latency validation remains required.
+  Wake from System OFF with the first keypress is hardware-validated at
+  96 MHz (functional, under 1 s to first delivered input, acceptable for
+  this build); only the sleep-current measurement itself remains open.
 - Sticky Consumer-release and modifier-order hardening is implemented across
   the matched set. RP2040 captures changed USB reports immediately, places them
   in a bounded FIFO, and schedules an exact-sequence duplicate after a 250 us
@@ -163,6 +167,17 @@ the nRF52840 transmitter over SPI.
   timer, adds no radio packet, and never opens the Keyboard/Consumer HID
   collections. Real Battery values and native Windows battery presentation
   still require hardware validation after flashing the corrected Receiver.
+
+### Wireless OTA Firmware Updates (RP2040 & nRF52840 Transmitter)
+
+See [OTA DFU Roadmap & TODO](file:///c:/Users/Monard/Raspberry/WirelessKeyboard/docs/OTA_DFU_TODO.md) for full technical specifications.
+
+- [x] **RP2040 Host Wireless OTA DFU**: Dual-Bank 4MB Winbond Flash partitioning (2MB Slot A + 2MB Slot B Staging), CRC32 verification, RAM-resident `dfu_apply_and_reboot()`, and standalone native Windows tool `tools/flash_ota.exe` (C++). Since 2026-08-22 the strict session protocol from `codex/rp2040-ota-strict` is ported onto link protocol 0x03: session/command-token acknowledged commands (START/QUERY/CRC/DATA/FINISH/ACTIVATE/ABORT), full 32-bit CRC32 plus on-device vector validation and target/board lock, watchdog-safe per-sector staging erase, WKOT install-metadata BOOT_OK self-report, OTA radio discovery while the nRF sleeps, and target-locked `.wkota` packages (`tools/make_ota_package.py`). The Receiver must be flashed from its `codex/rp2040-ota-strict-port` branch (end-to-end DFU command acknowledgement, 8-byte status Feature report); the Transmitter is unchanged.
+- [ ] **nRF52840 Transmitter Wireless OTA DFU via Receiver**: Research and verify feasibility of flashing the Transmitter module wirelessly over the 2.4GHz ESB radio link from the Receiver Dongle.
+  - Investigate nRF52840 1MB flash layout (MCUboot Dual-Bank vs custom RAM ESB DFU writer) compatible with the onboard Adafruit UF2 bootloader.
+  - Extend DFU header with target selector (RP2040 vs Transmitter).
+  - Add Transmitter internal flash staging write, checksum verification, and fallback recovery.
+  - Add `--target transmitter` support to `tools/flash_ota.exe`.
 
 ## Active wiring
 
@@ -290,13 +305,33 @@ Do not connect a Li-ion/LiPo battery directly to GP28. The documented
   Receiver caches it in vendor HID report ID `3`; telemetry never wakes radio
   System OFF or resets the five-minute inactivity deadline.
 
-## Firmware
+## Firmware artifacts and their roles
 
-The build copies the current UF2 to:
+There is exactly **one firmware image per build**; every build contains the
+( dormant unless addressed ) strict OTA receiver, so any build can be
+updated over the air *and* reverted by cable. File names describe the
+**delivery format**, not different code:
 
-```text
-firmware/WirelessKeyboard.uf2
+| File | Role |
+| --- | --- |
+| `firmware/WirelessKeyboard.uf2` | Current build — BOOTSEL cable image (flash or revert from any state) |
+| `firmware/WirelessKeyboard_OTA.bin` | Raw flash payload, input for `tools/make_ota_package.py` |
+| `firmware/WirelessKeyboard_OTA.wkota` | Strict OTA package consumed by `tools/flash_ota.exe` (auto-regenerated at build) |
+| `firmware/WirelessKeyboardSafe.uf2` | No-OTA safe image: identical input pipeline, DFU receiver fully compiled out (`WIRELESS_KEYBOARD_OTA_SUPPORT=0`) — immune to `flash_ota.exe`. Build on demand: `cmake --build build --target WirelessKeyboardSafe` |
+| `firmware/good/<timestamp>_<sha>/` | **Validated snapshots ("Latest Good")** with `BUILD_INFO.txt` (SHA-256, commit, notes, revert instructions) |
+| `firmware/good/LATEST.txt` | Pointer answering "which build is the Latest Good" |
+
+After hardware-validating a build, snapshot it:
+
+```powershell
+tools\save_good_build.ps1                                     # current build
+tools\save_good_build.ps1 -Ref codex/rp2040-low-power-stage1 -Note "why it is good"
 ```
+
+Reverting to a good build: BOOTSEL-flash its `WirelessKeyboard.uf2` (always
+works). Reverting over the air with `flash_ota.exe` only works once the
+running firmware speaks the strict DFU protocol; pre-strict builds
+(before 2026-08-22) are cable-only.
 
 ### Optional UART diagnostic build
 
@@ -318,12 +353,17 @@ the 1 kHz release.
 ### Release matched protocol `0x03` artifacts
 
 The current RP2040 release artifact is
-`04C9D86D201694BB84208984A7D06ED691B25C8C80F5FE377FD050D703B94B30`.
+`7D4DF6A848C5AF0B004DA9C714328EC59F1E3E48549F6873B28FD83713D65B7B`.
 It adds universal keyboard report decoding (supporting standard 6KRO 8-byte,
 9-byte Report-ID, and NKRO bitmaps from 10 to 64 bytes), eliminates rigid
 8-byte length filtering, configures default BOOT protocol for boot keyboards
 while keeping Consumer Control in Report protocol, and provides nonblocking
-endpoint recovery. The Transmitter and Receiver artifacts remain:
+endpoint recovery. It also runs the low-power Stage 1 clock plan: 96 MHz
+system clock (the lowest valid for PIO-USB's 96 MHz receive sampler) with
+WFI/WFE idle gating on both cores; typed-input validation on hardware shows
+no typing-speed or consumer/keyboard regression versus the 120 MHz image.
+Restore 120 MHz with `RP2040_SYS_CLOCK_KHZ=120000` at configure time. The
+Transmitter and Receiver artifacts remain:
 
 - Transmitter `firmware/transmitter.uf2`:
   `551751E5353223CFDB7CF2456723514039473C2D11304410888080C6B2FAF89D`

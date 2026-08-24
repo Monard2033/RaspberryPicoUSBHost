@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cwchar>
 #include <new>
@@ -24,6 +25,9 @@
 #endif
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
+#ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
 #endif
 
 namespace {
@@ -42,7 +46,7 @@ constexpr USAGE kBatteryUsage = 0x0001;
 constexpr uint8_t kBatteryReportId = 3;
 constexpr size_t kBatteryPayloadLength = 8;
 constexpr size_t kBatteryReportLength = 1 + kBatteryPayloadLength;
-constexpr DWORD kPollIntervalMs = 30000;
+constexpr DWORD kPollIntervalMs = 5000;
 constexpr DWORD kTimerToleranceMs = 5000;
 constexpr uint16_t kStaleAfterSeconds = 120;
 
@@ -56,8 +60,6 @@ constexpr int kItemAutostart = 1;
 constexpr int kItemExit = 2;
 
 constexpr LONG kTrayMenuLiftPx = 23;
-constexpr int kSideMargin = 5;
-constexpr int kItemHeight = 30;
 
 enum class Availability {
     Offline,
@@ -120,6 +122,60 @@ BatterySnapshot gLastSnapshot{};
 bool gIsRefreshing = false;
 int gHoverItem = -1;
 int gPressedItem = -1;
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-function-type"
+void EnableHighDpiAwareness()
+{
+    HMODULE const user32 = GetModuleHandleW(L"user32.dll");
+    if (user32 != nullptr) {
+        typedef BOOL(WINAPI * SetProcessDpiAwarenessContextProc)(
+            DPI_AWARENESS_CONTEXT);
+        auto const setDpiContext =
+            reinterpret_cast<SetProcessDpiAwarenessContextProc>(
+                GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+        if (setDpiContext != nullptr) {
+            setDpiContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            return;
+        }
+
+        typedef BOOL(WINAPI * SetProcessDPIAwareProc)();
+        auto const setDpiAware = reinterpret_cast<SetProcessDPIAwareProc>(
+            GetProcAddress(user32, "SetProcessDPIAware"));
+        if (setDpiAware != nullptr) {
+            setDpiAware();
+        }
+    }
+}
+
+UINT GetWindowDpi(HWND window)
+{
+    if (window != nullptr) {
+        HMODULE const user32 = GetModuleHandleW(L"user32.dll");
+        if (user32 != nullptr) {
+            typedef UINT(WINAPI * GetDpiForWindowProc)(HWND);
+            auto const getDpiForWindow =
+                reinterpret_cast<GetDpiForWindowProc>(
+                    GetProcAddress(user32, "GetDpiForWindow"));
+            if (getDpiForWindow != nullptr) {
+                UINT const dpi = getDpiForWindow(window);
+                if (dpi != 0) {
+                    return dpi;
+                }
+            }
+        }
+    }
+    HDC const screen = GetDC(nullptr);
+    int const dpi = GetDeviceCaps(screen, LOGPIXELSY);
+    ReleaseDC(nullptr, screen);
+    return dpi > 0 ? static_cast<UINT>(dpi) : 96;
+}
+#pragma GCC diagnostic pop
+
+int ScaleDpi(int value, UINT dpi)
+{
+    return MulDiv(value, static_cast<int>(dpi), 96);
+}
 
 std::wstring GetExecutablePath()
 {
@@ -243,17 +299,65 @@ PopupColors GetCurrentColors()
     return c;
 }
 
-uint32_t Argb(COLORREF color)
+struct Vec2 {
+    float x, y;
+};
+
+inline float Length(Vec2 v)
 {
-    return 0xFF000000U |
-           (static_cast<uint32_t>(GetRValue(color)) << 16U) |
-           (static_cast<uint32_t>(GetGValue(color)) << 8U) |
-           static_cast<uint32_t>(GetBValue(color));
+    return std::sqrt(v.x * v.x + v.y * v.y);
+}
+
+inline float ClampFloat(float v, float minVal, float maxVal)
+{
+    return std::max(minVal, std::min(maxVal, v));
+}
+
+inline float SdfRoundedBox(Vec2 p, Vec2 b, float r)
+{
+    Vec2 q = {std::abs(p.x) - b.x + r, std::abs(p.y) - b.y + r};
+    Vec2 m = {std::max(q.x, 0.0f), std::max(q.y, 0.0f)};
+    return std::min(std::max(q.x, q.y), 0.0f) + Length(m) - r;
+}
+
+inline float SdfSegment(Vec2 p, Vec2 a, Vec2 b)
+{
+    Vec2 pa = {p.x - a.x, p.y - a.y};
+    Vec2 ba = {b.x - a.x, b.y - a.y};
+    float h = ClampFloat((pa.x * ba.x + pa.y * ba.y) / (ba.x * ba.x + ba.y * ba.y), 0.0f, 1.0f);
+    Vec2 d = {pa.x - ba.x * h, pa.y - ba.y * h};
+    return Length(d);
+}
+
+inline float SdfCircle(Vec2 p, float r)
+{
+    return Length(p) - r;
+}
+
+inline float SdfRing(Vec2 p, float r, float thickness)
+{
+    return std::abs(Length(p) - r) - thickness * 0.5f;
+}
+
+struct Color4f {
+    float r, g, b, a;
+};
+
+inline uint32_t ToArgb(Color4f c)
+{
+    uint8_t a = static_cast<uint8_t>(ClampFloat(c.a * 255.0f + 0.5f, 0.0f, 255.0f));
+    uint8_t r = static_cast<uint8_t>(ClampFloat(c.r * 255.0f + 0.5f, 0.0f, 255.0f));
+    uint8_t g = static_cast<uint8_t>(ClampFloat(c.g * 255.0f + 0.5f, 0.0f, 255.0f));
+    uint8_t b = static_cast<uint8_t>(ClampFloat(c.b * 255.0f + 0.5f, 0.0f, 255.0f));
+    return (static_cast<uint32_t>(a) << 24U) |
+           (static_cast<uint32_t>(r) << 16U) |
+           (static_cast<uint32_t>(g) << 8U) |
+           static_cast<uint32_t>(b);
 }
 
 HICON CreateBatteryIcon(BatterySnapshot const &snapshot)
 {
-    constexpr int size = 16;
+    int const size = std::max(16, GetSystemMetrics(SM_CXSMICON));
     BITMAPV5HEADER header{};
     header.bV5Size = sizeof(header);
     header.bV5Width = size;
@@ -282,63 +386,149 @@ HICON CreateBatteryIcon(BatterySnapshot const &snapshot)
     auto *pixels = static_cast<uint32_t *>(bits);
     std::fill(pixels, pixels + size * size, 0U);
 
-    COLORREF color = RGB(130, 130, 130);
-    if (snapshot.availability == Availability::Live ||
-        snapshot.availability == Availability::Stale) {
-        if (snapshot.batteryState == 1) {
-            color = RGB(45, 170, 255);
-        } else if (snapshot.percentage >= 50) {
-            color = RGB(45, 200, 90);
-        } else if (snapshot.percentage >= 20) {
-            color = RGB(245, 175, 35);
-        } else {
-            color = RGB(235, 65, 65);
-        }
-    }
-    uint32_t const pixel = Argb(color);
+    bool const isOffline = (snapshot.availability == Availability::Offline ||
+                            snapshot.availability == Availability::WaitingForTelemetry ||
+                            snapshot.availability == Availability::ReadError);
+    bool const isStale = (snapshot.availability == Availability::Stale);
+    bool const isCharging = (snapshot.availability == Availability::Live && snapshot.batteryState == 1);
+    bool const isFull = (snapshot.availability == Availability::Live &&
+                         (snapshot.batteryState == 3 || snapshot.percentage >= 100));
 
-    auto putPixel = [pixels](int x, int y, uint32_t value) {
-        if (x >= 0 && x < size && y >= 0 && y < size) {
-            pixels[y * size + x] = value;
-        }
-    };
-
-    for (int x = 1; x <= 12; ++x) {
-        putPixel(x, 3, pixel);
-        putPixel(x, 12, pixel);
-    }
-    for (int y = 3; y <= 12; ++y) {
-        putPixel(1, y, pixel);
-        putPixel(12, y, pixel);
-    }
-    for (int y = 6; y <= 9; ++y) {
-        putPixel(13, y, pixel);
-        putPixel(14, y, pixel);
-    }
-
-    if (snapshot.availability == Availability::Live ||
-        snapshot.availability == Availability::Stale) {
-        int const fillColumns = std::clamp(
-            (static_cast<int>(snapshot.percentage) * 9 + 99) / 100, 0, 9);
-        for (int x = 3; x < 3 + fillColumns; ++x) {
-            for (int y = 5; y <= 10; ++y) {
-                putPixel(x, y, pixel);
-            }
-        }
-        if (snapshot.availability == Availability::Stale) {
-            uint32_t const stalePixel = Argb(RGB(120, 120, 120));
-            for (int i = 0; i < 7; ++i) {
-                putPixel(4 + i, 5 + i, stalePixel);
-            }
-        }
+    Color4f mainColor;
+    if (isOffline || isStale) {
+        mainColor = {0.55f, 0.55f, 0.58f, 1.0f}; // Muted gray
+    } else if (isCharging) {
+        mainColor = {0.15f, 0.65f, 1.0f, 1.0f};  // Electric blue #26A6FF
+    } else if (snapshot.percentage >= 50) {
+        mainColor = {0.18f, 0.80f, 0.38f, 1.0f}; // Vibrant green #2ECC71
+    } else if (snapshot.percentage >= 20) {
+        mainColor = {1.0f, 0.60f, 0.0f, 1.0f};   // Amber / Orange #FF9900
     } else {
-        for (int i = 0; i < 7; ++i) {
-            putPixel(4 + i, 5 + i, pixel);
-            putPixel(10 - i, 5 + i, pixel);
+        mainColor = {1.0f, 0.25f, 0.22f, 1.0f};  // Alert Red #FF3F38
+    }
+
+    float const scale = static_cast<float>(size) / 16.0f;
+    int const ss = 4; // 4x4 subpixel anti-aliasing
+
+    Vec2 const bodyCenter = {8.0f, 9.0f};
+    Vec2 const bodyHalfExtents = {5.7f, 6.4f};
+    float const bodyRadius = 2.4f;
+
+    float const capTop = 0.3f;
+    float const capBottom = 2.6f;
+    Vec2 const capCenter = {8.0f, (capTop + capBottom) * 0.5f};
+    Vec2 const capHalfExtents = {2.4f, (capBottom - capTop) * 0.5f};
+    float const capRadius = 0.7f;
+
+    Vec2 const innerCenter = {8.0f, 9.0f};
+    Vec2 const innerHalfExtents = {4.5f, 5.2f};
+    float const innerRadius = 1.5f;
+
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            float accumR = 0.0f;
+            float accumG = 0.0f;
+            float accumB = 0.0f;
+            float accumA = 0.0f;
+
+            for (int sy = 0; sy < ss; ++sy) {
+                for (int sx = 0; sx < ss; ++sx) {
+                    float const px = (static_cast<float>(x) + (static_cast<float>(sx) + 0.5f) / ss) / scale;
+                    float const py = (static_cast<float>(y) + (static_cast<float>(sy) + 0.5f) / ss) / scale;
+
+                    Vec2 const bp = {px - bodyCenter.x, py - bodyCenter.y};
+                    Vec2 const cp = {px - capCenter.x, py - capCenter.y};
+
+                    float const dBody = SdfRoundedBox(bp, bodyHalfExtents, bodyRadius);
+                    float const dCap = SdfRoundedBox(cp, capHalfExtents, capRadius);
+                    float const dShellOuter = std::min(dBody, dCap);
+
+                    Vec2 const ip = {px - innerCenter.x, py - innerCenter.y};
+                    float const dInner = SdfRoundedBox(ip, innerHalfExtents, innerRadius);
+
+                    bool const isBorder = (dShellOuter <= 0.0f) && (dInner >= 0.0f);
+
+                    float const fillFrac = ClampFloat(static_cast<float>(snapshot.percentage) / 100.0f, 0.0f, 1.0f);
+                    float const fillTopY = 14.2f - fillFrac * 10.4f;
+
+                    bool isFilled = false;
+                    if (!isOffline && !isStale) {
+                        if (dInner <= 0.0f && (isFull || py >= fillTopY)) {
+                            isFilled = true;
+                        }
+                    }
+
+                    bool isSymbol = false;
+                    Color4f symbolCol = {1.0f, 1.0f, 1.0f, 1.0f};
+
+                    if (isCharging) {
+                        float const lx = px - 8.0f;
+                        float const ly = py - 8.9f;
+                        Vec2 poly[6] = {
+                            {0.7f, -4.5f},
+                            {-2.4f, 0.35f},
+                            {-0.35f, 0.35f},
+                            {-0.7f, 4.5f},
+                            {2.4f, -0.35f},
+                            {0.35f, -0.35f}
+                        };
+                        bool inside = false;
+                        for (int i = 0, j = 5; i < 6; j = i++) {
+                            if (((poly[i].y > ly) != (poly[j].y > ly)) &&
+                                (lx < (poly[j].x - poly[i].x) * (ly - poly[i].y) / (poly[j].y - poly[i].y) + poly[i].x)) {
+                                inside = !inside;
+                            }
+                        }
+                        if (inside) {
+                            isSymbol = true;
+                            symbolCol = {1.0f, 1.0f, 1.0f, 1.0f};
+                        }
+                    } else if (isStale) {
+                        Vec2 const clockP = {px - 8.0f, py - 8.9f};
+                        float const ring = SdfRing(clockP, 2.9f, 0.95f);
+                        float const hand1 = SdfSegment(clockP, {0.0f, 0.0f}, {0.0f, -1.9f}) - 0.50f;
+                        float const hand2 = SdfSegment(clockP, {0.0f, 0.0f}, {1.7f, 0.0f}) - 0.50f;
+                        float const clockDist = std::min(ring, std::min(hand1, hand2));
+                        if (clockDist <= 0.0f) {
+                            isSymbol = true;
+                            symbolCol = {0.90f, 0.90f, 0.93f, 1.0f};
+                        }
+                    } else if (isOffline) {
+                        Vec2 const exP = {px - 8.0f, py - 8.9f};
+                        float const bar = SdfSegment(exP, {0.0f, -2.8f}, {0.0f, 0.7f}) - 0.60f;
+                        float const dot = SdfCircle({exP.x, exP.y - 2.6f}, 0.60f);
+                        if (bar <= 0.0f || dot <= 0.0f) {
+                            isSymbol = true;
+                            symbolCol = {0.85f, 0.85f, 0.88f, 1.0f};
+                        }
+                    }
+
+                    Color4f sampleColor = {0.0f, 0.0f, 0.0f, 0.0f};
+                    if (isSymbol) {
+                        sampleColor = symbolCol;
+                    } else if (isFilled) {
+                        sampleColor = mainColor;
+                    } else if (isBorder) {
+                        sampleColor = mainColor;
+                    }
+
+                    accumR += sampleColor.r * sampleColor.a;
+                    accumG += sampleColor.g * sampleColor.a;
+                    accumB += sampleColor.b * sampleColor.a;
+                    accumA += sampleColor.a;
+                }
+            }
+
+            float const total = static_cast<float>(ss * ss);
+            float const a = accumA / total;
+            if (a > 0.001f) {
+                Color4f const finalCol = {accumR / accumA, accumG / accumA, accumB / accumA, a};
+                pixels[y * size + x] = ToArgb(finalCol);
+            }
         }
     }
 
-    std::array<BYTE, size * 2> maskBits{};
+    std::vector<BYTE> maskBits(size * ((size + 31) / 32 * 4), 0);
     HBITMAP const maskBitmap = CreateBitmap(size, size, 1, 1, maskBits.data());
     ICONINFO iconInfo{};
     iconInfo.fIcon = TRUE;
@@ -355,11 +545,10 @@ wchar_t const *BatteryStateName(uint8_t state)
 {
     switch (state) {
     case 0:
-        return L"Idle";
-    case 1:
-        return L"Charging";
     case 2:
         return L"Discharging";
+    case 1:
+        return L"Charging";
     case 3:
         return L"Full";
     default:
@@ -402,14 +591,18 @@ void CopyTooltip(std::wstring const &tooltip)
 }
 
 PopupLayout ComputeLayout(BatterySnapshot const &snapshot,
-                         PopupColors const &colors)
+                         PopupColors const &colors, UINT dpi)
 {
     PopupLayout l{};
-    l.width = 236;
-    int y = 10;
+    l.width = ScaleDpi(236, dpi);
+    int y = ScaleDpi(10, dpi);
+    int const sidePad = ScaleDpi(16, dpi);
+    int const lineHeight = ScaleDpi(20, dpi);
+    int const itemHeight = ScaleDpi(30, dpi);
+    int const sideMargin = ScaleDpi(5, dpi);
 
-    l.titleRect = {16, y, l.width - 16, y + 18};
-    y += 20;
+    l.titleRect = {sidePad, y, l.width - sidePad, y + ScaleDpi(18, dpi)};
+    y += ScaleDpi(20, dpi);
 
     wchar_t text[128]{};
     switch (snapshot.availability) {
@@ -447,22 +640,23 @@ PopupLayout ComputeLayout(BatterySnapshot const &snapshot,
         break;
     }
 
-    y += static_cast<int>(l.telemetryLines.size()) * 20 + 6;
+    y += static_cast<int>(l.telemetryLines.size()) * lineHeight +
+         ScaleDpi(6, dpi);
 
     l.sep1Y = y;
-    y += 6;
+    y += ScaleDpi(6, dpi);
 
-    l.refreshRect = {kSideMargin, y, l.width - kSideMargin, y + kItemHeight};
-    y += kItemHeight + 2;
+    l.refreshRect = {sideMargin, y, l.width - sideMargin, y + itemHeight};
+    y += itemHeight + ScaleDpi(2, dpi);
 
-    l.autostartRect = {kSideMargin, y, l.width - kSideMargin, y + kItemHeight};
-    y += kItemHeight + 4;
+    l.autostartRect = {sideMargin, y, l.width - sideMargin, y + itemHeight};
+    y += itemHeight + ScaleDpi(4, dpi);
 
     l.sep2Y = y;
-    y += 5;
+    y += ScaleDpi(5, dpi);
 
-    l.exitRect = {kSideMargin, y, l.width - kSideMargin, y + kItemHeight};
-    y += kItemHeight + 6;
+    l.exitRect = {sideMargin, y, l.width - sideMargin, y + itemHeight};
+    y += itemHeight + ScaleDpi(6, dpi);
 
     l.height = y;
     return l;
@@ -482,8 +676,9 @@ void UpdateTray(BatterySnapshot const &snapshot)
     gIsRefreshing = false;
 
     if (gPopupWindow != nullptr && IsWindowVisible(gPopupWindow)) {
+        UINT const dpi = GetWindowDpi(gPopupWindow);
         PopupColors const colors = GetCurrentColors();
-        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors);
+        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors, dpi);
         RECT currentRect{};
         GetWindowRect(gPopupWindow, &currentRect);
         int const diff = layout.height - (currentRect.bottom - currentRect.top);
@@ -710,6 +905,15 @@ DWORD WINAPI WorkerMain(void *)
             continue;
         }
 
+        if (waitResult == WAIT_OBJECT_0 + 1) {
+            // User clicked Refresh now: trigger immediate on-demand battery poll
+            std::array<uint8_t, kBatteryReportLength> pollReq{};
+            pollReq[0] = kBatteryReportId;
+            pollReq[1] = 0x01;
+            HidD_SetFeature(battery, pollReq.data(), static_cast<ULONG>(pollReq.size()));
+            Sleep(150);
+        }
+
         BatterySnapshot const snapshot = ReadBattery(battery);
         PostSnapshot(snapshot);
         if (snapshot.availability == Availability::ReadError) {
@@ -733,8 +937,9 @@ void RequestRefresh()
 
 void ShowModernPopup()
 {
+    UINT const dpi = GetWindowDpi(gPopupWindow != nullptr ? gPopupWindow : gWindow);
     PopupColors const colors = GetCurrentColors();
-    PopupLayout const layout = ComputeLayout(gLastSnapshot, colors);
+    PopupLayout const layout = ComputeLayout(gLastSnapshot, colors, dpi);
 
     if (gPopupWindow == nullptr) {
         gPopupWindow = CreateWindowExW(
@@ -762,7 +967,7 @@ void ShowModernPopup()
 
     LONG x = std::clamp(cursor.x - layout.width / 2, work.left,
                         work.right - layout.width);
-    LONG y = cursor.y - kTrayMenuLiftPx - layout.height;
+    LONG y = cursor.y - ScaleDpi(kTrayMenuLiftPx, dpi) - layout.height;
     y = std::clamp(y, work.top, work.bottom - layout.height);
 
     SetWindowPos(gPopupWindow, HWND_TOPMOST, x, y, layout.width, layout.height,
@@ -782,8 +987,9 @@ LRESULT CALLBACK PopupWindowProcedure(HWND window, UINT message, WPARAM wParam,
     case WM_MOUSEMOVE: {
         int const x = GET_X_LPARAM(lParam);
         int const y = GET_Y_LPARAM(lParam);
+        UINT const dpi = GetWindowDpi(window);
         PopupColors const colors = GetCurrentColors();
-        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors);
+        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors, dpi);
 
         int hovered = -1;
         POINT pt = {x, y};
@@ -815,8 +1021,9 @@ LRESULT CALLBACK PopupWindowProcedure(HWND window, UINT message, WPARAM wParam,
     case WM_LBUTTONDOWN: {
         int const x = GET_X_LPARAM(lParam);
         int const y = GET_Y_LPARAM(lParam);
+        UINT const dpi = GetWindowDpi(window);
         PopupColors const colors = GetCurrentColors();
-        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors);
+        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors, dpi);
 
         POINT pt = {x, y};
         if (PtInRect(&layout.refreshRect, pt)) gPressedItem = kItemRefresh;
@@ -831,8 +1038,9 @@ LRESULT CALLBACK PopupWindowProcedure(HWND window, UINT message, WPARAM wParam,
     case WM_LBUTTONUP: {
         int const x = GET_X_LPARAM(lParam);
         int const y = GET_Y_LPARAM(lParam);
+        UINT const dpi = GetWindowDpi(window);
         PopupColors const colors = GetCurrentColors();
-        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors);
+        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors, dpi);
 
         int releasedItem = -1;
         POINT pt = {x, y};
@@ -868,12 +1076,14 @@ LRESULT CALLBACK PopupWindowProcedure(HWND window, UINT message, WPARAM wParam,
         RECT rc;
         GetClientRect(window, &rc);
 
+        UINT const dpi = GetWindowDpi(window);
+
         HDC memDC = CreateCompatibleDC(hdc);
         HBITMAP memBmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
         HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
 
         PopupColors const colors = GetCurrentColors();
-        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors);
+        PopupLayout const layout = ComputeLayout(gLastSnapshot, colors, dpi);
 
         HBRUSH bgBrush = CreateSolidBrush(colors.bg);
         FillRect(memDC, &rc, bgBrush);
@@ -887,15 +1097,19 @@ LRESULT CALLBACK PopupWindowProcedure(HWND window, UINT message, WPARAM wParam,
         SelectObject(memDC, oldPen);
         DeleteObject(borderPen);
 
-        HFONT fontTitle = CreateFontW(-12, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE,
+        int const fontTitleHeight = -MulDiv(9, static_cast<int>(dpi), 72);
+        int const fontRegularHeight = -MulDiv(9, static_cast<int>(dpi), 72);
+        int const fontCheckHeight = -MulDiv(10, static_cast<int>(dpi), 72);
+
+        HFONT fontTitle = CreateFontW(fontTitleHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE,
                                      FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                                      CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                      DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        HFONT fontRegular = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE,
+        HFONT fontRegular = CreateFontW(fontRegularHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE,
                                        FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                                        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        HFONT fontCheck = CreateFontW(-13, 0, 0, 0, FW_BOLD, FALSE, FALSE,
+        HFONT fontCheck = CreateFontW(fontCheckHeight, 0, 0, 0, FW_BOLD, FALSE, FALSE,
                                      FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                                      CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                      DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
@@ -909,25 +1123,34 @@ LRESULT CALLBACK PopupWindowProcedure(HWND window, UINT message, WPARAM wParam,
                   DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
 
         SelectObject(memDC, fontRegular);
-        int lineY = layout.titleRect.bottom + 2;
+        int const lineHeight = ScaleDpi(20, dpi);
+        int const sidePad = ScaleDpi(16, dpi);
+        int lineY = layout.titleRect.bottom + ScaleDpi(2, dpi);
         for (auto const &line : layout.telemetryLines) {
-            RECT lr = {16, lineY, layout.width - 16, lineY + 20};
+            RECT lr = {sidePad, lineY, layout.width - sidePad, lineY + lineHeight};
             SetTextColor(memDC, line.second);
             DrawTextW(memDC, line.first.c_str(), -1, &lr,
                       DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-            lineY += 20;
+            lineY += lineHeight;
         }
 
+        int const sepMargin = ScaleDpi(10, dpi);
         auto drawSep = [&](int sepY) {
             HPEN sepPen = CreatePen(PS_SOLID, 1, colors.separator);
             HGDIOBJ prevPen = SelectObject(memDC, sepPen);
-            MoveToEx(memDC, 10, sepY, nullptr);
-            LineTo(memDC, layout.width - 10, sepY);
+            MoveToEx(memDC, sepMargin, sepY, nullptr);
+            LineTo(memDC, layout.width - sepMargin, sepY);
             SelectObject(memDC, prevPen);
             DeleteObject(sepPen);
         };
 
         drawSep(layout.sep1Y);
+
+        int const cornerRadius = ScaleDpi(6, dpi);
+        int const checkLeft = ScaleDpi(8, dpi);
+        int const checkWidth = ScaleDpi(16, dpi);
+        int const textLeft = ScaleDpi(28, dpi);
+        int const textRightPad = ScaleDpi(8, dpi);
 
         auto drawItem = [&](int itemId, RECT const &itemRect,
                             wchar_t const *label, bool hasCheck,
@@ -943,7 +1166,7 @@ LRESULT CALLBACK PopupWindowProcedure(HWND window, UINT message, WPARAM wParam,
                 HGDIOBJ pPen = SelectObject(memDC, itemPen);
                 HGDIOBJ pBrush = SelectObject(memDC, itemBrush);
                 RoundRect(memDC, itemRect.left, itemRect.top, itemRect.right,
-                          itemRect.bottom, 6, 6);
+                          itemRect.bottom, cornerRadius, cornerRadius);
                 SelectObject(memDC, pBrush);
                 SelectObject(memDC, pPen);
                 DeleteObject(itemPen);
@@ -953,7 +1176,8 @@ LRESULT CALLBACK PopupWindowProcedure(HWND window, UINT message, WPARAM wParam,
             if (hasCheck && isChecked) {
                 SelectObject(memDC, fontCheck);
                 SetTextColor(memDC, colors.checkColor);
-                RECT cr = {itemRect.left + 8, itemRect.top, itemRect.left + 24,
+                RECT cr = {itemRect.left + checkLeft, itemRect.top,
+                           itemRect.left + checkLeft + checkWidth,
                            itemRect.bottom};
                 DrawTextW(memDC, L"\x2713", -1, &cr,
                           DT_CENTER | DT_SINGLELINE | DT_VCENTER);
@@ -961,8 +1185,8 @@ LRESULT CALLBACK PopupWindowProcedure(HWND window, UINT message, WPARAM wParam,
 
             SelectObject(memDC, fontRegular);
             SetTextColor(memDC, colors.textPrimary);
-            RECT lr = {itemRect.left + 26, itemRect.top, itemRect.right - 8,
-                       itemRect.bottom};
+            RECT lr = {itemRect.left + textLeft, itemRect.top,
+                       itemRect.right - textRightPad, itemRect.bottom};
             DrawTextW(memDC, label, -1, &lr,
                       DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
         };
@@ -1152,6 +1376,8 @@ bool StartWorker()
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 {
+    EnableHighDpiAwareness();
+
     gInstance = instance;
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
 

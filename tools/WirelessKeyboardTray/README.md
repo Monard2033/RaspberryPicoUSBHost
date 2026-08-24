@@ -93,8 +93,8 @@ The committed `dist\WirelessKeyboardTray.exe` is the portable release artifact.
 Current release:
 
 ```text
-size      250880 bytes
-SHA-256   EA029CDC4D81EB4D5F33B0ADC108B758716CBAF948DBA8EDC201F90A74957458
+size      253440 bytes
+SHA-256   9FBFF9A1CDC61CB4EE6311DB4E6F6EEB8A86E248D31BB88ADB8734CC267E06AC
 ```
 
 Offline idle smoke test on Windows 11: zero additional CPU milliseconds during
