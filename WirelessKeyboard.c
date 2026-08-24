@@ -2498,9 +2498,8 @@ static uint8_t battery_link_state(void)
     case BATT_LED_FULL:
         return 3; /* full */
     case BATT_LED_UNPLUG_SHOW:
-        return 2; /* discharging */
     case BATT_LED_IDLE:
-        return 0; /* idle */
+        return 2; /* discharging */
     case BATT_LED_BOOT:
     default:
         return 4; /* unknown */

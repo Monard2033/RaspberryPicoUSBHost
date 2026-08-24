@@ -545,11 +545,10 @@ wchar_t const *BatteryStateName(uint8_t state)
 {
     switch (state) {
     case 0:
-        return L"Idle";
-    case 1:
-        return L"Charging";
     case 2:
         return L"Discharging";
+    case 1:
+        return L"Charging";
     case 3:
         return L"Full";
     default:
