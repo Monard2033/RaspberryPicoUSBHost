@@ -27,11 +27,11 @@ polling must not create additional radio traffic.
 ## Required scheduling policy
 
 RP2040 continues sampling locally once per second. Wireless telemetry is one
-complete current-state packet, normally once every 30 seconds, and may be sent
+complete current-state packet, normally once every 5 seconds, and may be sent
 only when all of the following are true:
 
 ```text
-now - last_battery_tx_ms >= 30000
+now - last_battery_tx_ms >= 5000
 radio_power_state == RADIO_AWAKE
 time since last changed HID input >= 50 ms
 no Keyboard transition or retry is pending
@@ -42,14 +42,16 @@ no wake queue or urgent SPI/ESB work is pending
 Recommended constants:
 
 ```c
-#define BATTERY_TELEMETRY_PERIOD_MS 30000u
+#define BATTERY_TELEMETRY_PERIOD_MS  5000u
 #define BATTERY_HID_QUIET_GUARD_MS     50u
 ```
 
-When the 30-second deadline occurs during typing, keep one `battery_tx_pending`
+When the 5-second deadline occurs during typing, keep one `battery_tx_pending`
 flag and the latest measurement only. Send it in the first quiet window; never
-replay missed intervals or queue historical samples. Start the next 30-second
-period from the successful transmission time.
+replay missed intervals or queue historical samples. A key held without new
+transitions counts as quiet after the 50 ms guard; do not require a released
+keyboard report for telemetry. Start the next 5-second period from the
+successful transmission time.
 
 Battery telemetry is not user activity. It must never call
 `radio_note_activity()`, update `radio_last_activity_ms`, wake a sleeping
@@ -131,7 +133,7 @@ if (battery_tx_pending &&
 }
 ```
 
-The 30-second deadline keeps one pending latest state. The local SPI scheduler
+The 5-second deadline keeps one pending latest state. The local SPI scheduler
 marks it accepted only after it owns the one-slot Battery frame. Battery does
 not use the Keyboard 250 us duplicate slot and cannot displace an ordered
 Consumer edge.
@@ -195,7 +197,7 @@ any external runtime. It:
 
 - identifies VID/PID `1B4F:0001` and only vendor collection
   `Usage Page 0xFF00 / Usage 0x01`;
-- reads the local Receiver cache once per 30 seconds, with a five-second timer
+- reads the local Receiver cache once per 5 seconds, with a five-second timer
   tolerance, or immediately after a Plug-and-Play/user refresh event;
 - displays percentage, voltage, charging state and cache age in its tooltip;
 - uses changing tray icons and an optional per-user `Start with Windows` entry;
@@ -215,7 +217,7 @@ OFFLINE   Receiver has not observed the keyboard for a long policy interval
 
 An optional best-effort `about-to-sleep` flag may be sent before System OFF,
 but it must not delay sleep if it cannot be acknowledged. A cached value from
-up to roughly 30 seconds before sleep is acceptable and should be displayed as
+up to roughly 5 seconds before sleep is acceptable and should be displayed as
 the last known value, not immediately treated as invalid.
 
 ## Implementation order
@@ -233,8 +235,8 @@ the last known value, not immediately treated as invalid.
 ## Acceptance criteria
 
 - Battery is sampled locally every second and normally transmitted no more than
-  once per 30 seconds while awake.
-- No Battery transmission occurs during active/pending Keyboard or Consumer
+  once per 5 seconds while awake.
+- No Battery transmission occurs during queued/pending Keyboard or Consumer
   work, or within 50 ms of changed HID input.
 - Continuous typing postpones telemetry and results in one latest-state packet,
   not a backlog.

@@ -2429,8 +2429,6 @@ static void battery_telemetry_task(uint32_t now)
             BATTERY_HID_QUIET_GUARD_MS ||
         radio_wake_queue_count != 0 || spi_input_queue_count != 0 ||
         spi_retry_pending || battery_spi_pending ||
-        !keyboard_report_is_released() ||
-        (previous_consumer_valid && previous_consumer_usage != 0) ||
         keyboard_led_transfer_active) {
         return;
     }
