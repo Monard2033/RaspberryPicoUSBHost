@@ -45,7 +45,7 @@ constexpr USAGE kBatteryUsage = 0x0001;
 constexpr uint8_t kBatteryReportId = 3;
 constexpr size_t kBatteryPayloadLength = 8;
 constexpr size_t kBatteryReportLength = 1 + kBatteryPayloadLength;
-constexpr DWORD kPollIntervalMs = 30000;
+constexpr DWORD kPollIntervalMs = 5000;
 constexpr DWORD kTimerToleranceMs = 5000;
 constexpr uint16_t kStaleAfterSeconds = 120;
 
