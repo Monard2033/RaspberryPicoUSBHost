@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cwchar>
 #include <new>
@@ -298,12 +299,60 @@ PopupColors GetCurrentColors()
     return c;
 }
 
-uint32_t Argb(COLORREF color)
+struct Vec2 {
+    float x, y;
+};
+
+inline float Length(Vec2 v)
 {
-    return 0xFF000000U |
-           (static_cast<uint32_t>(GetRValue(color)) << 16U) |
-           (static_cast<uint32_t>(GetGValue(color)) << 8U) |
-           static_cast<uint32_t>(GetBValue(color));
+    return std::sqrt(v.x * v.x + v.y * v.y);
+}
+
+inline float ClampFloat(float v, float minVal, float maxVal)
+{
+    return std::max(minVal, std::min(maxVal, v));
+}
+
+inline float SdfRoundedBox(Vec2 p, Vec2 b, float r)
+{
+    Vec2 q = {std::abs(p.x) - b.x + r, std::abs(p.y) - b.y + r};
+    Vec2 m = {std::max(q.x, 0.0f), std::max(q.y, 0.0f)};
+    return std::min(std::max(q.x, q.y), 0.0f) + Length(m) - r;
+}
+
+inline float SdfSegment(Vec2 p, Vec2 a, Vec2 b)
+{
+    Vec2 pa = {p.x - a.x, p.y - a.y};
+    Vec2 ba = {b.x - a.x, b.y - a.y};
+    float h = ClampFloat((pa.x * ba.x + pa.y * ba.y) / (ba.x * ba.x + ba.y * ba.y), 0.0f, 1.0f);
+    Vec2 d = {pa.x - ba.x * h, pa.y - ba.y * h};
+    return Length(d);
+}
+
+inline float SdfCircle(Vec2 p, float r)
+{
+    return Length(p) - r;
+}
+
+inline float SdfRing(Vec2 p, float r, float thickness)
+{
+    return std::abs(Length(p) - r) - thickness * 0.5f;
+}
+
+struct Color4f {
+    float r, g, b, a;
+};
+
+inline uint32_t ToArgb(Color4f c)
+{
+    uint8_t a = static_cast<uint8_t>(ClampFloat(c.a * 255.0f + 0.5f, 0.0f, 255.0f));
+    uint8_t r = static_cast<uint8_t>(ClampFloat(c.r * 255.0f + 0.5f, 0.0f, 255.0f));
+    uint8_t g = static_cast<uint8_t>(ClampFloat(c.g * 255.0f + 0.5f, 0.0f, 255.0f));
+    uint8_t b = static_cast<uint8_t>(ClampFloat(c.b * 255.0f + 0.5f, 0.0f, 255.0f));
+    return (static_cast<uint32_t>(a) << 24U) |
+           (static_cast<uint32_t>(r) << 16U) |
+           (static_cast<uint32_t>(g) << 8U) |
+           static_cast<uint32_t>(b);
 }
 
 HICON CreateBatteryIcon(BatterySnapshot const &snapshot)
@@ -337,76 +386,145 @@ HICON CreateBatteryIcon(BatterySnapshot const &snapshot)
     auto *pixels = static_cast<uint32_t *>(bits);
     std::fill(pixels, pixels + size * size, 0U);
 
-    COLORREF color = RGB(130, 130, 130);
-    if (snapshot.availability == Availability::Live ||
-        snapshot.availability == Availability::Stale) {
-        if (snapshot.batteryState == 1) {
-            color = RGB(45, 170, 255);
-        } else if (snapshot.percentage >= 50) {
-            color = RGB(45, 200, 90);
-        } else if (snapshot.percentage >= 20) {
-            color = RGB(245, 175, 35);
-        } else {
-            color = RGB(235, 65, 65);
-        }
-    }
-    uint32_t const pixel = Argb(color);
+    bool const isOffline = (snapshot.availability == Availability::Offline ||
+                            snapshot.availability == Availability::WaitingForTelemetry ||
+                            snapshot.availability == Availability::ReadError);
+    bool const isStale = (snapshot.availability == Availability::Stale);
+    bool const isCharging = (snapshot.availability == Availability::Live && snapshot.batteryState == 1);
+    bool const isFull = (snapshot.availability == Availability::Live &&
+                         (snapshot.batteryState == 3 || snapshot.percentage >= 100));
 
-    auto putPixel = [pixels, size](int x, int y, uint32_t value) {
-        if (x >= 0 && x < size && y >= 0 && y < size) {
-            pixels[y * size + x] = value;
-        }
-    };
-
-    int const scaleX = size;
-    int const scaleY = size;
-
-    auto mapX = [scaleX](int x16) { return (x16 * scaleX) / 16; };
-    auto mapY = [scaleY](int y16) { return (y16 * scaleY) / 16; };
-
-    int const x1 = mapX(1);
-    int const x2 = mapX(12);
-    int const y1 = mapY(3);
-    int const y2 = mapY(12);
-
-    for (int x = x1; x <= x2; ++x) {
-        putPixel(x, y1, pixel);
-        putPixel(x, y2, pixel);
-    }
-    for (int y = y1; y <= y2; ++y) {
-        putPixel(x1, y, pixel);
-        putPixel(x2, y, pixel);
-    }
-    int const tipY1 = mapY(6);
-    int const tipY2 = mapY(9);
-    for (int y = tipY1; y <= tipY2; ++y) {
-        for (int x = x2 + 1; x <= mapX(14); ++x) {
-            putPixel(x, y, pixel);
-        }
-    }
-
-    if (snapshot.availability == Availability::Live ||
-        snapshot.availability == Availability::Stale) {
-        int const fillCols = std::clamp(
-            (static_cast<int>(snapshot.percentage) * (x2 - x1 - 3) + 99) / 100,
-            0, x2 - x1 - 3);
-        for (int x = x1 + 2; x < x1 + 2 + fillCols; ++x) {
-            for (int y = y1 + 2; y <= y2 - 2; ++y) {
-                putPixel(x, y, pixel);
-            }
-        }
-        if (snapshot.availability == Availability::Stale) {
-            uint32_t const stalePixel = Argb(RGB(120, 120, 120));
-            int const diag = std::min(x2 - x1 - 4, y2 - y1 - 4);
-            for (int i = 0; i <= diag; ++i) {
-                putPixel(x1 + 3 + i, y1 + 2 + i, stalePixel);
-            }
-        }
+    Color4f mainColor;
+    if (isOffline || isStale) {
+        mainColor = {0.55f, 0.55f, 0.58f, 1.0f}; // Muted gray
+    } else if (isCharging) {
+        mainColor = {0.15f, 0.65f, 1.0f, 1.0f};  // Electric blue #26A6FF
+    } else if (snapshot.percentage >= 50) {
+        mainColor = {0.18f, 0.80f, 0.38f, 1.0f}; // Vibrant green #2ECC71
+    } else if (snapshot.percentage >= 20) {
+        mainColor = {1.0f, 0.60f, 0.0f, 1.0f};   // Amber / Orange #FF9900
     } else {
-        int const diag = std::min(x2 - x1 - 4, y2 - y1 - 4);
-        for (int i = 0; i <= diag; ++i) {
-            putPixel(x1 + 3 + i, y1 + 2 + i, pixel);
-            putPixel(x2 - 3 - i, y1 + 2 + i, pixel);
+        mainColor = {1.0f, 0.25f, 0.22f, 1.0f};  // Alert Red #FF3F38
+    }
+
+    float const scale = static_cast<float>(size) / 16.0f;
+    int const ss = 4; // 4x4 subpixel anti-aliasing
+
+    Vec2 const bodyCenter = {8.0f, 9.0f};
+    Vec2 const bodyHalfExtents = {5.7f, 6.4f};
+    float const bodyRadius = 2.4f;
+
+    float const capTop = 0.3f;
+    float const capBottom = 2.6f;
+    Vec2 const capCenter = {8.0f, (capTop + capBottom) * 0.5f};
+    Vec2 const capHalfExtents = {2.4f, (capBottom - capTop) * 0.5f};
+    float const capRadius = 0.7f;
+
+    Vec2 const innerCenter = {8.0f, 9.0f};
+    Vec2 const innerHalfExtents = {4.5f, 5.2f};
+    float const innerRadius = 1.5f;
+
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            float accumR = 0.0f;
+            float accumG = 0.0f;
+            float accumB = 0.0f;
+            float accumA = 0.0f;
+
+            for (int sy = 0; sy < ss; ++sy) {
+                for (int sx = 0; sx < ss; ++sx) {
+                    float const px = (static_cast<float>(x) + (static_cast<float>(sx) + 0.5f) / ss) / scale;
+                    float const py = (static_cast<float>(y) + (static_cast<float>(sy) + 0.5f) / ss) / scale;
+
+                    Vec2 const bp = {px - bodyCenter.x, py - bodyCenter.y};
+                    Vec2 const cp = {px - capCenter.x, py - capCenter.y};
+
+                    float const dBody = SdfRoundedBox(bp, bodyHalfExtents, bodyRadius);
+                    float const dCap = SdfRoundedBox(cp, capHalfExtents, capRadius);
+                    float const dShellOuter = std::min(dBody, dCap);
+
+                    Vec2 const ip = {px - innerCenter.x, py - innerCenter.y};
+                    float const dInner = SdfRoundedBox(ip, innerHalfExtents, innerRadius);
+
+                    bool const isBorder = (dShellOuter <= 0.0f) && (dInner >= 0.0f);
+
+                    float const fillFrac = ClampFloat(static_cast<float>(snapshot.percentage) / 100.0f, 0.0f, 1.0f);
+                    float const fillTopY = 14.2f - fillFrac * 10.4f;
+
+                    bool isFilled = false;
+                    if (!isOffline && !isStale) {
+                        if (dInner <= 0.0f && (isFull || py >= fillTopY)) {
+                            isFilled = true;
+                        }
+                    }
+
+                    bool isSymbol = false;
+                    Color4f symbolCol = {1.0f, 1.0f, 1.0f, 1.0f};
+
+                    if (isCharging) {
+                        float const lx = px - 8.0f;
+                        float const ly = py - 8.9f;
+                        Vec2 poly[6] = {
+                            {0.7f, -4.5f},
+                            {-2.4f, 0.35f},
+                            {-0.35f, 0.35f},
+                            {-0.7f, 4.5f},
+                            {2.4f, -0.35f},
+                            {0.35f, -0.35f}
+                        };
+                        bool inside = false;
+                        for (int i = 0, j = 5; i < 6; j = i++) {
+                            if (((poly[i].y > ly) != (poly[j].y > ly)) &&
+                                (lx < (poly[j].x - poly[i].x) * (ly - poly[i].y) / (poly[j].y - poly[i].y) + poly[i].x)) {
+                                inside = !inside;
+                            }
+                        }
+                        if (inside) {
+                            isSymbol = true;
+                            symbolCol = {1.0f, 1.0f, 1.0f, 1.0f};
+                        }
+                    } else if (isStale) {
+                        Vec2 const clockP = {px - 8.0f, py - 8.9f};
+                        float const ring = SdfRing(clockP, 2.9f, 0.95f);
+                        float const hand1 = SdfSegment(clockP, {0.0f, 0.0f}, {0.0f, -1.9f}) - 0.50f;
+                        float const hand2 = SdfSegment(clockP, {0.0f, 0.0f}, {1.7f, 0.0f}) - 0.50f;
+                        float const clockDist = std::min(ring, std::min(hand1, hand2));
+                        if (clockDist <= 0.0f) {
+                            isSymbol = true;
+                            symbolCol = {0.90f, 0.90f, 0.93f, 1.0f};
+                        }
+                    } else if (isOffline) {
+                        Vec2 const exP = {px - 8.0f, py - 8.9f};
+                        float const bar = SdfSegment(exP, {0.0f, -2.8f}, {0.0f, 0.7f}) - 0.60f;
+                        float const dot = SdfCircle({exP.x, exP.y - 2.6f}, 0.60f);
+                        if (bar <= 0.0f || dot <= 0.0f) {
+                            isSymbol = true;
+                            symbolCol = {0.85f, 0.85f, 0.88f, 1.0f};
+                        }
+                    }
+
+                    Color4f sampleColor = {0.0f, 0.0f, 0.0f, 0.0f};
+                    if (isSymbol) {
+                        sampleColor = symbolCol;
+                    } else if (isFilled) {
+                        sampleColor = mainColor;
+                    } else if (isBorder) {
+                        sampleColor = mainColor;
+                    }
+
+                    accumR += sampleColor.r * sampleColor.a;
+                    accumG += sampleColor.g * sampleColor.a;
+                    accumB += sampleColor.b * sampleColor.a;
+                    accumA += sampleColor.a;
+                }
+            }
+
+            float const total = static_cast<float>(ss * ss);
+            float const a = accumA / total;
+            if (a > 0.001f) {
+                Color4f const finalCol = {accumR / accumA, accumG / accumA, accumB / accumA, a};
+                pixels[y * size + x] = ToArgb(finalCol);
+            }
         }
     }
 

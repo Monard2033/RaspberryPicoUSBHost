@@ -152,21 +152,19 @@
 #define BATT_MIN_MV        3050  // User-selected 1S empty reference.
 #define BATT_MAX_MV        4150  // Measured absolute full-charge voltage of this pack.
 #define BATT_CHECK_MS      1000
-#define BATT_BOOT_SHOW_MS  5000
-#define BATT_EVENT_SHOW_MS 5000
+#define BATT_BOOT_SHOW_MS  8000
+#define BATT_EVENT_SHOW_MS 8000
 #define BATT_PULSE_WINDOW_MS 2000
 #define BATT_PULSE_PERIOD_MS 4500
 #define BATT_LED_UPDATE_MS  20
 #define BATT_POST_BOOT_SLOPE_GUARD_MS 3000
-#define BATT_PIN_EVENT_DELTA_MV 15
-#define BATT_EVENT_DELTA_MV 45
-#define BATT_CHARGE_TREND_ENTER 4
-#define BATT_UNPLUG_TREND_ENTER (-4)
-#define BATT_UNPLUG_DROP_MV 25
-/* Hysteresis ~41 mV below the full-charge reference, matching the band the
- * previous 4110/4070 pair used, so FULL exits after unplug at the same
- * relative depth of surface-charge sag. */
-#define BATT_FULL_EXIT_MV 4120
+#define BATT_CV_THRESHOLD_MV     4100  // Above 4.10V (~90-95%), TP4056 enters CV mode
+#define BATT_CHARGE_STEP_MV        10  // Sudden rise >= 10mV in 15s confirms plug-in
+#define BATT_CHARGE_SLOPE_MV        4  // Sustained rise >= 4mV in 15s confirms CC charging
+#define BATT_CHARGE_TREND_ENTER     3  // 3 confirmations (~3s) to enter CHARGING
+#define BATT_UNPLUG_DROP_MV        12  // Drop >= 12mV from charge peak confirms charger disconnected
+#define BATT_FULL_EXIT_MV        4120  // Voltage threshold to exit FULL after unplug
+#define BATT_HISTORY_LEN           16  // 16 samples = 15-second rolling window at 1Hz
 
 // --- RGB LED, driven locally by RP2040 PWM on GP21, GP20, GP19 (Catod Comun) -----
 #define PIN_LED_R         21
@@ -2136,9 +2134,14 @@ static uint32_t battery_slope_enable_after_ms;
 static uint32_t battery_filtered_mv;
 static uint32_t battery_previous_sample_mv;
 static uint32_t battery_baseline_mv;
+static uint32_t battery_charge_peak_mv;
+static uint32_t battery_history_mv[BATT_HISTORY_LEN];
+static uint8_t  battery_history_idx = 0;
+static bool     battery_history_filled = false;
+static uint16_t battery_no_rise_seconds = 0;
 static int8_t   battery_trend_counter;
-static uint8_t battery_pct;
-static bool battery_sample_valid;
+static uint8_t  battery_pct;
+static bool     battery_sample_valid;
 static uint32_t battery_invalid_sample_count;
 
 static void battery_adc_init(void)
@@ -2268,6 +2271,7 @@ static void battery_start_display(void)
     battery_filtered_mv = initial_mv;
     battery_previous_sample_mv = initial_mv;
     battery_baseline_mv = initial_mv;
+    battery_charge_peak_mv = initial_mv;
     battery_trend_counter = 0;
     battery_sample_valid = initial_mv != 0;
     battery_pct = battery_sample_valid ? battery_pct_for_mv(initial_mv) : 0;
@@ -2277,6 +2281,12 @@ static void battery_start_display(void)
     battery_last_tx_ms = battery_state_started_ms;
     battery_tx_pending = false;
     battery_spi_pending = false;
+    for (uint8_t i = 0; i < BATT_HISTORY_LEN; ++i) {
+        battery_history_mv[i] = initial_mv;
+    }
+    battery_history_idx = 0;
+    battery_history_filled = false;
+    battery_no_rise_seconds = 0;
     battery_update_led(battery_state_started_ms);
 
 #if PERIODIC_DEBUG
@@ -2294,6 +2304,7 @@ static void battery_set_led_state(enum battery_led_state next_state,
     battery_led_state = next_state;
     battery_state_started_ms = now;
     battery_material_step = true;
+    battery_tx_pending = true;
 }
 
 static void battery_sample_task(uint32_t now)
@@ -2309,21 +2320,34 @@ static void battery_sample_task(uint32_t now)
         battery_filtered_mv = sample_mv;
         battery_previous_sample_mv = sample_mv;
         battery_baseline_mv = sample_mv;
+        battery_charge_peak_mv = sample_mv;
         battery_trend_counter = 0;
         battery_pct = battery_pct_for_mv(sample_mv);
         battery_sample_valid = true;
         battery_material_step = true;
+        battery_tx_pending = true;
+        for (uint8_t i = 0; i < BATT_HISTORY_LEN; ++i) {
+            battery_history_mv[i] = sample_mv;
+        }
+        battery_history_idx = 0;
+        battery_history_filled = false;
+        battery_no_rise_seconds = 0;
         return;
     }
-    /* During Boot, use the current hardware-filtered ADC sample directly.
-     * Carrying the IIR up from a low power-on sample would leave a long
-     * software ramp after Boot and falsely look like Charging. */
+    /* During Boot, use the current hardware-filtered ADC sample directly. */
     if (battery_led_state == BATT_LED_BOOT) {
         battery_previous_sample_mv = battery_filtered_mv;
         battery_filtered_mv = sample_mv;
         battery_pct = battery_pct_for_mv(sample_mv);
         battery_baseline_mv = sample_mv;
+        battery_charge_peak_mv = sample_mv;
         battery_trend_counter = 0;
+        for (uint8_t i = 0; i < BATT_HISTORY_LEN; ++i) {
+            battery_history_mv[i] = sample_mv;
+        }
+        battery_history_idx = 0;
+        battery_history_filled = false;
+        battery_no_rise_seconds = 0;
         return;
     }
 
@@ -2332,66 +2356,137 @@ static void battery_sample_task(uint32_t now)
     battery_previous_sample_mv = previous_filtered_mv;
     battery_pct = battery_pct_for_mv(battery_filtered_mv);
 
+    /* Update rolling 15-second history */
+    uint32_t const oldest_history_mv = battery_history_mv[battery_history_idx];
+    battery_history_mv[battery_history_idx] = battery_filtered_mv;
+    battery_history_idx = (battery_history_idx + 1) % BATT_HISTORY_LEN;
+    if (battery_history_idx == 0) {
+        battery_history_filled = true;
+    }
+
     if ((int32_t)(now - battery_slope_enable_after_ms) < 0) {
         battery_baseline_mv = battery_filtered_mv;
+        battery_charge_peak_mv = battery_filtered_mv;
         battery_trend_counter = 0;
+        battery_no_rise_seconds = 0;
         return;
     }
 
     if (battery_baseline_mv == 0) {
         battery_baseline_mv = battery_filtered_mv;
     }
-
-    int32_t const diff_from_baseline = (int32_t)battery_filtered_mv - (int32_t)battery_baseline_mv;
-
-    /* If voltage is rising above baseline by >= 8mV, increment charging trend counter */
-    if (diff_from_baseline >= 8) {
-        if (battery_trend_counter < 10) battery_trend_counter += 2;
-        /* Pull baseline up smoothly as charging voltage climbs */
-        battery_baseline_mv = (battery_baseline_mv * 7 + battery_filtered_mv) / 8;
-    } else if (diff_from_baseline <= -25) {
-        /* Voltage dropped below baseline (unplugged or discharge) */
-        if (battery_trend_counter > -10) battery_trend_counter -= 3;
-        battery_baseline_mv = (battery_baseline_mv * 3 + battery_filtered_mv) / 4;
-    } else {
-        /* Minor drift: slowly decay trend towards neutral */
-        if (battery_trend_counter > 0) battery_trend_counter--;
-        else if (battery_trend_counter < 0) battery_trend_counter++;
+    if (battery_charge_peak_mv == 0) {
+        battery_charge_peak_mv = battery_filtered_mv;
     }
 
-    /* A high but stable 1S voltage is state-of-charge, not proof that a
-     * charger is connected. Enter Charging only after two sustained rising
-     * observations (counter >= 4); Full remains a strict voltage threshold. */
-    bool const unplug_drop = diff_from_baseline <= -BATT_UNPLUG_DROP_MV ||
-        battery_trend_counter <= BATT_UNPLUG_TREND_ENTER;
-    bool const is_full = battery_filtered_mv >= BATT_MAX_MV ||
-        (battery_led_state == BATT_LED_FULL &&
-         battery_filtered_mv >= BATT_FULL_EXIT_MV && !unplug_drop);
-    bool const is_charging = !is_full &&
-        (battery_trend_counter >= BATT_CHARGE_TREND_ENTER ||
-         (battery_led_state == BATT_LED_CHARGING &&
-          battery_trend_counter > 0));
+    int32_t const delta_15s = battery_history_filled ?
+        ((int32_t)battery_filtered_mv - (int32_t)oldest_history_mv) : 0;
 
-    if (is_full) {
-        battery_set_led_state(BATT_LED_FULL, now);
-        return;
-    }
-    if (is_charging) {
-        battery_set_led_state(BATT_LED_CHARGING, now);
-        return;
+    switch (battery_led_state) {
+    case BATT_LED_IDLE: {
+        /* Check if battery reached full */
+        if (battery_filtered_mv >= BATT_MAX_MV) {
+            battery_charge_peak_mv = battery_filtered_mv;
+            battery_baseline_mv = battery_filtered_mv;
+            battery_trend_counter = 0;
+            battery_no_rise_seconds = 0;
+            battery_set_led_state(BATT_LED_FULL, now);
+            return;
+        }
+
+        /* Check for charging entry:
+         * 1. Sudden plug-in step: >= 10 mV rise over baseline or 15s history
+         * 2. Sustained CC rise: delta_15s >= 4 mV (sustained climbing) */
+        int32_t const diff_from_baseline = (int32_t)battery_filtered_mv - (int32_t)battery_baseline_mv;
+        bool const plug_step = diff_from_baseline >= (int32_t)BATT_CHARGE_STEP_MV ||
+                               (battery_history_filled && delta_15s >= (int32_t)BATT_CHARGE_STEP_MV);
+        bool const cc_rising = battery_history_filled && (delta_15s >= (int32_t)BATT_CHARGE_SLOPE_MV);
+
+        if (plug_step || cc_rising) {
+            if (battery_trend_counter < 10) battery_trend_counter += 2;
+            if (battery_trend_counter >= BATT_CHARGE_TREND_ENTER) {
+                battery_charge_peak_mv = battery_filtered_mv;
+                battery_baseline_mv = battery_filtered_mv;
+                battery_no_rise_seconds = 0;
+                battery_set_led_state(BATT_LED_CHARGING, now);
+                return;
+            }
+        } else if (diff_from_baseline < 0) {
+            /* Normal discharge: smoothly follow baseline downward */
+            battery_baseline_mv = (battery_baseline_mv * 7 + battery_filtered_mv) / 8;
+            if (battery_trend_counter > 0) battery_trend_counter--;
+        } else {
+            /* Minor drift: very slow baseline pull and decay trend counter */
+            battery_baseline_mv = (battery_baseline_mv * 63 + battery_filtered_mv + 32) / 64;
+            if (battery_trend_counter > 0) battery_trend_counter--;
+        }
+        break;
     }
 
-    if ((battery_led_state == BATT_LED_CHARGING ||
-         battery_led_state == BATT_LED_FULL) && unplug_drop) {
-        battery_set_led_state(BATT_LED_UNPLUG_SHOW, now);
-        return;
+    case BATT_LED_CHARGING: {
+        if (battery_filtered_mv > battery_charge_peak_mv) {
+            battery_charge_peak_mv = battery_filtered_mv;
+            battery_no_rise_seconds = 0;
+        } else {
+            if (battery_no_rise_seconds < 600) battery_no_rise_seconds++;
+        }
+        battery_baseline_mv = battery_charge_peak_mv;
+
+        /* Check if reached 100% full */
+        if (battery_filtered_mv >= BATT_MAX_MV) {
+            battery_trend_counter = 0;
+            battery_no_rise_seconds = 0;
+            battery_set_led_state(BATT_LED_FULL, now);
+            return;
+        }
+
+        /* Check for unplug: sudden drop >= BATT_UNPLUG_DROP_MV below peak */
+        int32_t const drop_from_peak = (int32_t)battery_charge_peak_mv - (int32_t)battery_filtered_mv;
+        if (drop_from_peak >= (int32_t)BATT_UNPLUG_DROP_MV) {
+            battery_baseline_mv = battery_filtered_mv;
+            battery_charge_peak_mv = battery_filtered_mv;
+            battery_trend_counter = 0;
+            battery_no_rise_seconds = 0;
+            battery_set_led_state(BATT_LED_UNPLUG_SHOW, now);
+            return;
+        }
+
+        /* In CC range (< 4.10V), if voltage has not risen at all for 45s and is flat/falling, exit to IDLE */
+        if (battery_filtered_mv < BATT_CV_THRESHOLD_MV && battery_no_rise_seconds >= 45 && delta_15s <= 0) {
+            battery_baseline_mv = battery_filtered_mv;
+            battery_charge_peak_mv = battery_filtered_mv;
+            battery_trend_counter = 0;
+            battery_no_rise_seconds = 0;
+            battery_set_led_state(BATT_LED_IDLE, now);
+            return;
+        }
+
+        /* In CV range (>= 4.10V / 95%+): REMAINS in CHARGING even with flat voltage! */
+        break;
     }
 
-    /* With no sustained rise and no real unplug drop, a stable battery is
-     * simply Idle. Do not keep a false Charging animation at 3.95-4.17 V. */
-    if (battery_led_state == BATT_LED_CHARGING ||
-        battery_led_state == BATT_LED_FULL) {
-        battery_set_led_state(BATT_LED_IDLE, now);
+    case BATT_LED_FULL: {
+        if (battery_filtered_mv > battery_charge_peak_mv) {
+            battery_charge_peak_mv = battery_filtered_mv;
+        }
+        battery_baseline_mv = battery_charge_peak_mv;
+
+        int32_t const drop_from_peak = (int32_t)battery_charge_peak_mv - (int32_t)battery_filtered_mv;
+        if (drop_from_peak >= (int32_t)BATT_UNPLUG_DROP_MV || battery_filtered_mv < BATT_FULL_EXIT_MV) {
+            battery_baseline_mv = battery_filtered_mv;
+            battery_charge_peak_mv = battery_filtered_mv;
+            battery_trend_counter = 0;
+            battery_no_rise_seconds = 0;
+            battery_set_led_state(BATT_LED_UNPLUG_SHOW, now);
+            return;
+        }
+        break;
+    }
+
+    case BATT_LED_UNPLUG_SHOW:
+    case BATT_LED_BOOT:
+    default:
+        break;
     }
 }
 
@@ -2414,7 +2509,8 @@ static uint8_t battery_link_state(void)
 
 static void battery_telemetry_task(uint32_t now)
 {
-    if ((uint32_t)(now - battery_last_tx_ms) >=
+    if (battery_material_step ||
+        (uint32_t)(now - battery_last_tx_ms) >=
         BATTERY_TELEMETRY_PERIOD_MS) {
         battery_tx_pending = true;
     }
@@ -2464,11 +2560,22 @@ static void battery_task(void)
         battery_state_started_ms = now;
         battery_slope_enable_after_ms = now +
                                         BATT_POST_BOOT_SLOPE_GUARD_MS;
+        battery_baseline_mv = battery_filtered_mv;
+        battery_charge_peak_mv = battery_filtered_mv;
+        battery_trend_counter = 0;
+        battery_no_rise_seconds = 0;
+        battery_material_step = true;
         battery_tx_pending = true;
     } else if (battery_led_state == BATT_LED_UNPLUG_SHOW &&
                now - battery_state_started_ms >= BATT_EVENT_SHOW_MS) {
         battery_led_state = BATT_LED_IDLE;
         battery_state_started_ms = now;
+        battery_baseline_mv = battery_filtered_mv;
+        battery_charge_peak_mv = battery_filtered_mv;
+        battery_trend_counter = 0;
+        battery_no_rise_seconds = 0;
+        battery_material_step = true;
+        battery_tx_pending = true;
     }
 
     battery_update_led(now);
