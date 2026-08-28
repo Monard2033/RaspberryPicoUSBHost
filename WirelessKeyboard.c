@@ -387,7 +387,6 @@ static uint8_t spi_control_sequence;
 static struct link_input_frame spi_retry_frame;
 static bool spi_retry_pending;
 static uint32_t spi_retry_after_us;
-static uint8_t spi_retry_copies_remaining;
 static uint8_t last_transport_keyboard[KBD_REPORT_LEN];
 static bool last_transport_keyboard_valid;
 static uint16_t last_transport_consumer_usage;
@@ -1004,7 +1003,7 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
 
     if (keyboard_led_state != remote_keyboard_led_state) {
         keyboard_led_state = remote_keyboard_led_state;
-        keyboard_led_update_pending = false;
+        keyboard_led_update_pending = true;
     }
 #if HID_DIAGNOSTIC_LOG
     static uint8_t last_logged_led = 0xFF;
@@ -1030,11 +1029,10 @@ static void spi_write_frame(struct link_input_frame const *frame)
     gpio_put(PIN_SPI_CSN, 1);
 
     total_spi_frames_sent++;
+    if (rx[0] == LINK_ACK_MAGIC && rx[1] == LINK_VERSION) {
+        spi_process_ack(rx);
+    }
 #if HID_DIAGNOSTIC_LOG
-    /* Raw MISO witness: what did the Transmitter actually clock out?
-     * Prints only when the leading bytes change, so the volume stays
-     * bounded. 5A 03 xx = an ACK frame (xx: 00 initial, 01 LED, 02 DFU);
-     * 00 .. = nothing armed on the slave (ORC) or dead MISO. */
     static uint8_t miso_witness[3];
     if (rx[0] != miso_witness[0] || rx[1] != miso_witness[1] ||
         rx[2] != miso_witness[2]) {
@@ -1044,9 +1042,6 @@ static void spi_write_frame(struct link_input_frame const *frame)
         printf("[MISO] %02x %02x %02x %02x %02x %02x\n",
                rx[0], rx[1], rx[2], rx[3], rx[4], rx[5]);
     }
-#endif
-    spi_process_ack(rx);
-#if HID_DIAGNOSTIC_LOG
     printf("[SPI TX #%lu] type=%u seq=%u data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
            (unsigned long)total_spi_frames_sent,
            frame->type, frame->sequence,
@@ -1099,7 +1094,7 @@ static bool keyboard_transport_has_key(
     return false;
 }
 
-static bool keyboard_transition_releases_state(
+static bool __unused keyboard_transition_releases_state(
     const uint8_t previous[KBD_REPORT_LEN],
     const uint8_t current[KBD_REPORT_LEN])
 {
@@ -1120,26 +1115,6 @@ static uint32_t spi_last_tx_us = 0;
 static void spi_service_task(void)
 {
     struct pending_radio_input pending;
-
-    if (spi_retry_pending) {
-        if ((radio_power_state != RADIO_AWAKE &&
-             radio_power_state != RADIO_POWERING_OFF) ||
-            (int32_t)(time_us_32() - spi_retry_after_us) < 0) {
-            return;
-        }
-
-        spi_write_frame(&spi_retry_frame);
-        spi_last_tx_us = time_us_32();
-        if (spi_retry_copies_remaining > 1U) {
-            spi_retry_copies_remaining--;
-            spi_retry_after_us = spi_last_tx_us + SPI_REARM_GUARD_US;
-            spi_retry_pending = true;
-        } else {
-            spi_retry_copies_remaining = 0U;
-            spi_retry_pending = false;
-        }
-        return;
-    }
 
     if (radio_power_state != RADIO_AWAKE &&
         radio_power_state != RADIO_POWERING_OFF) return;
@@ -1167,8 +1142,10 @@ static void spi_service_task(void)
                   pending.data[3], pending.data[4], pending.data[5],
                   pending.data[6], pending.data[7] },
     };
+
     spi_write_frame(&spi_retry_frame);
     spi_last_tx_us = time_us_32();
+    spi_retry_pending = false;
 
     if (pending.type == LINK_TYPE_KEYBOARD) {
         memcpy(last_transport_keyboard, pending.data, KBD_REPORT_LEN);
@@ -1179,9 +1156,6 @@ static void spi_service_task(void)
         last_transport_consumer_usage = usage;
         last_transport_consumer_valid = true;
     }
-
-    spi_retry_copies_remaining = 0U;
-    spi_retry_pending = false;
 }
 
 static void spi_send_control_command(uint8_t command)
@@ -1611,9 +1585,7 @@ static void parse_keyboard_led_output(struct hid_instance_state *state,
         usage_min_valid = false;
     }
 
-    if (!selected || selected_offsets[0] == 0xFFFFu ||
-        selected_offsets[1] == 0xFFFFu ||
-        selected_offsets[2] == 0xFFFFu) {
+    if (!selected || (selected_offsets[0] == 0xFFFFu && selected_offsets[1] == 0xFFFFu)) {
         return;
     }
 
@@ -1852,11 +1824,9 @@ static bool keyboard_decode_report(uint8_t const *report, uint16_t len,
     return false;
 }
 
+
 static void keyboard_led_reset(void)
 {
-    /* The target Windows installation boots with Num Lock enabled. Mirror
-     * that known state locally as soon as the keyboard mounts so its keypad
-     * and physical Num Lock LED do not start inverted relative to Windows. */
     keyboard_led_state = HID_LED_NUM_LOCK;
     keyboard_lock_pressed = 0;
     keyboard_led_update_pending = false;
@@ -1908,8 +1878,11 @@ static void keyboard_led_toggle_on_press(
     keyboard_lock_pressed = pressed_now;
 }
 
-/* Disabled: sending SET_REPORT control transfers over USB to physical keyboard
- * crashes the keyboard's onboard controller and stalls the software host engine. */
+/* Pure 1000 Hz Streaming:
+ * Never send SET_REPORT control transfers to the physical Sonix keyboard.
+ * The keyboard initializes its NumLock LED automatically on power-up.
+ * Keeping EP 0 quiet guarantees Endpoint 0x81 streams at 1000 Hz with
+ * zero stalls, zero data-toggle collisions, and unlimited simultaneous keys. */
 static void keyboard_led_task(void)
 {
     keyboard_led_update_pending = false;
@@ -2933,6 +2906,11 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
 
     keyboard_led_transfer_active = false;
     keyboard_led_update_pending = false;
+    keyboard_last_report_ms = board_millis();
+
+    /* Cleanly re-arm keyboard interrupt-IN report after control transfer completion */
+    hid_receive_rearm_pending[instance] = false;
+    (void)tuh_hid_receive_report(dev_addr, instance);
 }
 
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,

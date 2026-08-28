@@ -5,8 +5,8 @@ This firmware runs on the RP2040 board inside the custom wireless keyboard build
 ## Current handoff (2026-08-25 — v1.0 / v1.1 Stable Release)
 
 - **Branch**: `release/v1.0-stable` across all three repositories ([RP2040 PR #4](https://github.com/Monard2033/RaspberryPicoUSBHost/pull/4), [Transmitter PR #4](https://github.com/Monard2033/nRF52840-Transmitter/pull/4), [Receiver PR #4](https://github.com/Monard2033/nRF52840-Receiver/pull/4)).
-- **RP2040**: `C:\Users\Monard\Raspberry\WirelessKeyboard`, artifact `firmware/WirelessKeyboard.uf2`, SHA-256 `F05F842C193029689E344A27ADB8C7C4FED21D263CFD2DDBF30B25BA704387BD`.
-- **Transmitter**: `C:\ncs\v3.4.0\myproject\Transmitter`, artifact `firmware/transmitter.uf2`, SHA-256 `F466A5EF3ED6B9A6EBEFC34FB08B1E801A6563AE2DE622B90F81655D1F2A580D`.
+- **RP2040**: `C:\Users\Monard\Raspberry\WirelessKeyboard`, artifact `firmware/WirelessKeyboard.uf2`, SHA-256 `0FA3A4A77B47A2C2B87D6F246EC59ADF248640CAAFF4FF2576CF8703B4C98111`.
+- **Transmitter**: `C:\ncs\v3.4.0\myproject\Transmitter`, artifact `firmware/transmitter.uf2`, SHA-256 `52996D63E5B6F7BC4225576D4B5427EA804444F583E5B19AC592C0DDAD9C7295`.
 - **Receiver**: `C:\ncs\v3.4.0\myproject\Receiver`, artifact `firmware/receiver.hex`, SHA-256 `9B31317B46A8D0FA8A70F2776F1FD2BA121299516E809B693494B02FA0C30903`.
 - **A4Tech Composite Compatibility**: VID `0x09DA` / PID `0xEA04` exposes three HID interfaces: keyboard (`inst=0`, EP `0x81`), mouse (`inst=1`, EP `0x82`), multimedia (`inst=2`, EP `0x83`, Report ID 3).
 - **USB Host Engine**: `CFG_TUH_HID=4` in REPORT mode with `tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT)`. No runtime BOOT switch control transfers compete with the 1 kHz interrupt-IN stream.
