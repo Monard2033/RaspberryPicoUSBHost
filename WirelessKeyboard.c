@@ -145,7 +145,7 @@
 // --- Battery (read locally, RP2040 is the sole "brain" for this) --------
 #define PIN_BATT_ADC      28   // GP28 = ADC2. Battery divider tap goes here.
 #define BATT_ADC_INPUT    2    // adc_select_input() channel matching GP28
-#define BATT_ADC_SCALE_NUM 9839u // Calibrated: 3984 mV physical = 1320 mV on GP28 (Vref=3.268V)
+#define BATT_ADC_SCALE_NUM 9831u // Calibrated: 3984 mV physical = 1320 mV on GP28 (Vref=3.268V)
 #define BATT_ADC_SCALE_DEN 4095u
 #define BATT_VALID_MIN_MV  2800  // Reject impossible/corrupt 1S telemetry.
 #define BATT_VALID_MAX_MV  4250
