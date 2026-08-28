@@ -103,7 +103,9 @@
 #define SPI_INPUT_QUEUE_DEPTH 128u
 #define RADIO_SLEEP_BLINK_COUNT 4u
 #define RADIO_SLEEP_BLINK_HALF_PERIOD_MS 100u
-#define SPI_REARM_GUARD_US 500u
+#define SPI_MIN_GUARD_US     150u  /* physical min for SPIS thread re-arm    */
+#define SPI_RETRY_GUARD_US   100u  /* pause between MISO-triggered retries   */
+#define SPI_MAX_RETRIES      8u    /* safety cap (8 × ~116 us ≈ 1 ms worst)  */
 #define SPI_ACK_POLL_MS 100u
 #define SPI_ACK_POLL_IDLE_MS 1000u
 #define SPI_ACK_POLL_DFU_MS  1u
@@ -387,6 +389,9 @@ static uint8_t spi_control_sequence;
 static struct link_input_frame spi_retry_frame;
 static bool spi_retry_pending;
 static uint32_t spi_retry_after_us;
+static uint8_t spi_retry_count;
+static uint32_t spi_frames_lost;
+static uint32_t spi_miso_retries;
 static uint8_t last_transport_keyboard[KBD_REPORT_LEN];
 static bool last_transport_keyboard_valid;
 static uint16_t last_transport_consumer_usage;
@@ -1014,7 +1019,7 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
 #endif
 }
 
-static void spi_write_frame(struct link_input_frame const *frame)
+static bool spi_write_frame(struct link_input_frame const *frame)
 {
     uint8_t rx[LINK_FRAME_LEN] = { 0 };
 #if HOT_PATH_DEBUG
@@ -1029,7 +1034,14 @@ static void spi_write_frame(struct link_input_frame const *frame)
     gpio_put(PIN_SPI_CSN, 1);
 
     total_spi_frames_sent++;
-    if (rx[0] == LINK_ACK_MAGIC && rx[1] == LINK_VERSION) {
+
+    /* MISO carries the reverse-ACK snapshot when SPIS was armed (magic 0x5A),
+     * or the def-char 0x00 when SPIS was not yet re-armed by its RTOS thread.
+     * This is the deterministic delivery indicator that replaces the blind
+     * timing guard. */
+    bool const slave_armed = (rx[0] == LINK_ACK_MAGIC &&
+                              rx[1] == LINK_VERSION);
+    if (slave_armed) {
         spi_process_ack(rx);
     }
 #if HID_DIAGNOSTIC_LOG
@@ -1055,6 +1067,7 @@ static void spi_write_frame(struct link_input_frame const *frame)
            frame->data[0], frame->data[1], frame->data[2], frame->data[3],
            frame->data[4], frame->data[5], frame->data[6], frame->data[7]);
 #endif
+    return slave_armed;
 }
 
 static bool spi_queue_input(uint8_t type, const uint8_t data[KBD_REPORT_LEN])
@@ -1119,9 +1132,48 @@ static void spi_service_task(void)
     if (radio_power_state != RADIO_AWAKE &&
         radio_power_state != RADIO_POWERING_OFF) return;
 
-    /* Keep a bounded inter-frame gap for queued bursts so the slave RTOS
-     * thread has time to re-arm EasyDMA for the next transfer. */
-    if ((uint32_t)(time_us_32() - spi_last_tx_us) < SPI_REARM_GUARD_US) {
+    /* ---- Retry a previously unacknowledged frame ---- */
+    if (spi_retry_pending) {
+        /* Short guard between rapid retries */
+        if ((uint32_t)(time_us_32() - spi_last_tx_us) < SPI_RETRY_GUARD_US)
+            return;
+
+        if (spi_retry_count >= SPI_MAX_RETRIES) {
+            /* SPIS was unresponsive for 8 × ~116 us ≈ 1 ms — give up on this
+             * frame to avoid blocking the pipeline indefinitely.  The next
+             * keyboard state change will carry the correct snapshot. */
+            spi_retry_pending = false;
+            spi_retry_count = 0;
+            spi_frames_lost++;
+            /* Fall through to try the next queued frame */
+        } else {
+            bool delivered = spi_write_frame(&spi_retry_frame);
+            spi_last_tx_us = time_us_32();
+            if (delivered) {
+                spi_retry_pending = false;
+                spi_retry_count = 0;
+                if (spi_retry_frame.type == LINK_TYPE_KEYBOARD) {
+                    memcpy(last_transport_keyboard,
+                           spi_retry_frame.data, KBD_REPORT_LEN);
+                    last_transport_keyboard_valid = true;
+                } else if (spi_retry_frame.type == LINK_TYPE_CONSUMER) {
+                    uint16_t const usage =
+                        (uint16_t)spi_retry_frame.data[0] |
+                        ((uint16_t)spi_retry_frame.data[1] << 8);
+                    last_transport_consumer_usage = usage;
+                    last_transport_consumer_valid = true;
+                }
+            } else {
+                spi_retry_count++;
+                spi_miso_retries++;
+                spi_retry_after_us = spi_last_tx_us + SPI_RETRY_GUARD_US;
+            }
+            return;
+        }
+    }
+
+    /* ---- Minimum guard for new frames ---- */
+    if ((uint32_t)(time_us_32() - spi_last_tx_us) < SPI_MIN_GUARD_US) {
         return;
     }
 
@@ -1143,18 +1195,29 @@ static void spi_service_task(void)
                   pending.data[6], pending.data[7] },
     };
 
-    spi_write_frame(&spi_retry_frame);
+    bool delivered = spi_write_frame(&spi_retry_frame);
     spi_last_tx_us = time_us_32();
-    spi_retry_pending = false;
 
-    if (pending.type == LINK_TYPE_KEYBOARD) {
-        memcpy(last_transport_keyboard, pending.data, KBD_REPORT_LEN);
-        last_transport_keyboard_valid = true;
-    } else if (pending.type == LINK_TYPE_CONSUMER) {
-        uint16_t const usage = (uint16_t)pending.data[0] |
-                               ((uint16_t)pending.data[1] << 8);
-        last_transport_consumer_usage = usage;
-        last_transport_consumer_valid = true;
+    if (delivered) {
+        spi_retry_pending = false;
+        if (pending.type == LINK_TYPE_KEYBOARD) {
+            memcpy(last_transport_keyboard, pending.data, KBD_REPORT_LEN);
+            last_transport_keyboard_valid = true;
+        } else if (pending.type == LINK_TYPE_CONSUMER) {
+            uint16_t const usage = (uint16_t)pending.data[0] |
+                                   ((uint16_t)pending.data[1] << 8);
+            last_transport_consumer_usage = usage;
+            last_transport_consumer_valid = true;
+        }
+    } else {
+        /* SPIS wasn't armed — schedule retry with the same sequence number.
+         * The Transmitter's dedup filter (memcmp on full 12-byte frame)
+         * guarantees that if both the lost and retried transfer somehow both
+         * arrive, only one is forwarded to ESB. */
+        spi_retry_pending = true;
+        spi_retry_count = 1;
+        spi_miso_retries++;
+        spi_retry_after_us = spi_last_tx_us + SPI_RETRY_GUARD_US;
     }
 }
 
@@ -1172,10 +1235,19 @@ static void spi_send_control_command(uint8_t command)
         .data = { command, 0, 0, 0, 0, 0, 0, 0 },
     };
 
-    spi_write_frame(&frame);
+    bool delivered = spi_write_frame(&frame);
     /* A control transaction uses the same SPIS EasyDMA endpoint as input:
      * preserve the inter-frame gap before a key transition can be sent. */
     spi_last_tx_us = time_us_32();
+
+    if (!delivered) {
+        /* Control commands (POLL_ACK, SYSTEM_OFF) benefit from retry too */
+        spi_retry_frame = frame;
+        spi_retry_pending = true;
+        spi_retry_count = 1;
+        spi_miso_retries++;
+        spi_retry_after_us = spi_last_tx_us + SPI_RETRY_GUARD_US;
+    }
 }
 
 /* Reverse-ACK pump.  During an OTA session the PC's DFU commands travel as
@@ -1214,7 +1286,7 @@ static void spi_ack_poll_task(void)
          (uint32_t)(now - radio_last_activity_ms) < SPI_ACK_POLL_QUIET_MS) ||
 #endif
         (uint32_t)(now - spi_last_ack_poll_ms) < interval ||
-        (uint32_t)(time_us_32() - spi_last_tx_us) < 250u) {
+        (uint32_t)(time_us_32() - spi_last_tx_us) < SPI_MIN_GUARD_US) {
         return;
     }
 
@@ -3069,8 +3141,8 @@ static void usb_host_event_task(void)
 /* Core 1 spins while work is pending; otherwise it naps with WFE so the clock
  * tree gates the CPU. Core 0 raises SEV on every queued USB event (see
  * usb_host_event_push), so input latency is unaffected. The 1 ms cap bounds
- * battery/LED/power-state cadence, and a pending SPI safety copy schedules an
- * exact timer wake so its 75 us re-arm guard is never overslept. */
+ * battery/LED/power-state cadence, and a pending SPI MISO retry schedules an
+ * exact timer wake so its 100 us retry guard is never overslept. */
 static void worker_core1_idle_wait(void)
 {
     if (usb_host_event_head != usb_host_event_tail ||
