@@ -4,15 +4,17 @@ This firmware runs on the **Raspberry Pi Pico (RP2040)** inside the custom wirel
 
 ---
 
-## Current Release Baseline (v1.0-stable)
+## Ecosystem & Repositories (v1.0 Stable)
 
-- **Branch**: `release/v1.0-stable` across all three project repositories:
-  - [RP2040 Keyboard Controller](https://github.com/Monard2033/RaspberryPicoUSBHost)
-  - [nRF52840 Transmitter](https://github.com/Monard2033/nRF52840-Transmitter)
-  - [nRF52840 Receiver](https://github.com/Monard2033/nRF52840-Receiver)
-- **Primary Binary Artifact**: [`firmware/WirelessKeyboard.uf2`](firmware/WirelessKeyboard.uf2)
+This firmware is part of the 3-tier custom wireless keyboard project:
+- 🧠 **[RP2040 Keyboard Controller](https://github.com/Monard2033/RaspberryPicoUSBHost)** (this repository): USB Host, Battery ADC & 8 MHz SPI Master.
+- 📻 **[nRF52840 Transmitter](https://github.com/Monard2033/nRF52840-Transmitter)**: Pro Micro SPI Slave & 2.4 GHz ESB PTX (+8 dBm).
+- 📡 **[nRF52840 Receiver](https://github.com/Monard2033/nRF52840-Receiver)**: USB Dongle 2.4 GHz ESB PRX & 1000 Hz USB HID Bridge.
+
+### Primary Release Artifacts
+- **Firmware Binary**: [`firmware/WirelessKeyboard.uf2`](firmware/WirelessKeyboard.uf2)
 - **SHA-256 Checksum**: `B5D6648AE805D4E2FA4B50BF3EB4223CE8851FC9AAE9F0E654EB87BE12F36DDC`
-- **Strict OTA Package**: [`firmware/WirelessKeyboard_OTA.wkota`](firmware/WirelessKeyboard_OTA.wkota)
+- **Wireless OTA Package**: [`firmware/WirelessKeyboard_OTA.wkota`](firmware/WirelessKeyboard_OTA.wkota)
 
 ---
 
