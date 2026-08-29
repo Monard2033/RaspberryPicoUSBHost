@@ -104,3 +104,19 @@ To update the RP2040 over the air without opening the keyboard enclosure:
 | **`System Clock`** | **`96 MHz`** (or `120 MHz`) | Minimum clock required for PIO-USB 96 MHz receive sampler. |
 | **`Battery ADC Scale`** | **`9831u`** (`BATT_ADC_SCALE_NUM`) | Hardware-calibrated multiplier matching physical cell voltage 1:1 down to $0.001\text{ V}$. |
 | **`Battery Telemetry Period`** | **`20000 ms`** (20s) | Periodic telemetry update interval during keyboard activity without interrupting urgent input. |
+
+---
+
+## Windows Battery Monitoring App (`WirelessKeyboardTray`)
+
+A dedicated lightweight Windows utility is available in [`tools/WirelessKeyboardTray/dist/`](tools/WirelessKeyboardTray/dist/):
+
+- **Executable**: [`tools/WirelessKeyboardTray/dist/WirelessKeyboardTray.exe`](tools/WirelessKeyboardTray/dist/WirelessKeyboardTray.exe)
+- **Archive package**: [`tools/WirelessKeyboardTray/dist/WirelessKeyboardTray.zip`](tools/WirelessKeyboardTray/dist/WirelessKeyboardTray.zip)
+
+### Features & Capabilities:
+- 🔋 **Live Real-Time Telemetry**: Queries the Receiver's Vendor Feature Interface to display battery percentage and cell voltage with $0.001\text{ V}$ multimeter accuracy.
+- ⚡ **Charging & Power State Display**: Real-time status indicator for *Discharging*, *Charging (CC/CV)*, and *Full*.
+- 🕒 **Telemetry Age & Liveness**: Monitors telemetry freshness with an instant manual *Refresh now* action.
+- 🖥️ **System Tray Integration**: Native Windows notification area icon, low-battery alert popups, and *Start with Windows* autostart support.
+
