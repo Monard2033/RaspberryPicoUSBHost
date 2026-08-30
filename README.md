@@ -44,6 +44,10 @@ This firmware is part of the 3-tier custom wireless keyboard project:
 
 ## Active Hardware Pinout & Wiring
 
+<p align="center">
+  <img src="Wiring_Schematic_Keyboard_V5.svg" alt="Wireless Keyboard Hardware Wiring Schematic V5" width="100%">
+</p>
+
 ### 1. USB Keyboard Matrix / Converter to RP2040
 
 | USB Side | RP2040 Pin | Function / Description |
