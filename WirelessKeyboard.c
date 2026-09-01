@@ -115,7 +115,7 @@
 #define KEYBOARD_HID_STALL_RECOVERY_MS 250u
 #define SONIX_KEYBOARD_EP_IN 0x81u
 #define PIO_USB_ROOT_INDEX 0u
-#define RP2040_WATCHDOG_TIMEOUT_MS 8000u
+#define RP2040_WATCHDOG_TIMEOUT_MS 2000u
 #define BATTERY_TELEMETRY_PERIOD_MS 20000u
 #define BATTERY_HID_QUIET_GUARD_MS 50u
 #define MAX_HID_REPORTS   8
@@ -723,10 +723,16 @@ static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
     (void)ints;
 
     /* 2. Erase Slot A (active application starting at offset 0) */
-    flash_range_erase(0, aligned_size);
+    for (uint32_t off = 0; off < aligned_size; off += FLASH_SECTOR_SIZE) {
+        watchdog_update();
+        flash_range_erase(off, FLASH_SECTOR_SIZE);
+    }
 
     /* 3. Program Slot A directly from SRAM */
-    flash_range_program(0, dfu_swap_sram_buffer, aligned_size);
+    for (uint32_t off = 0; off < aligned_size; off += FLASH_PAGE_SIZE) {
+        watchdog_update();
+        flash_range_program(off, dfu_swap_sram_buffer + off, FLASH_PAGE_SIZE);
+    }
 
     /* 4. Reboot RP2040 into the newly installed firmware */
     watchdog_reboot(0, 0, 0);
