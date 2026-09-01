@@ -14,7 +14,7 @@
             "device": "${command:raspberry-pi-pico.getChipUppercase}",
             "configFiles": [
                 "interface/cmsis-dap.cfg",
-                "${workspaceFolder}/.vscode/rp2040-fixed.cfg"
+                "target/${command:raspberry-pi-pico.getTarget}.cfg"
             ],
             "svdFile": "${userHome}/.pico-sdk/sdk/2.3.0/src/${command:raspberry-pi-pico.getChip}/hardware_regs/${command:raspberry-pi-pico.getChipUppercase}.svd",
             "runToEntryPoint": "main",
@@ -25,7 +25,7 @@
                 "load \"${command:raspberry-pi-pico.launchTargetPath}\""
             ],
             "openOCDLaunchCommands": [
-                "adapter speed 1000"
+                "adapter speed 5000"
             ]
         },
         {
@@ -47,6 +47,6 @@
                 "monitor reset init",
                 "load \"${command:raspberry-pi-pico.launchTargetPath}\""
             ]
-        },
+        }
     ]
 }

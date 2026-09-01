@@ -49,10 +49,10 @@
 
 #define SPI_PORT          spi0
 #define SPI_BAUD_HZ       8000000
-#define PIN_SPI_SCK       6    // SPI0 SCK  -> nRF P0.17
-#define PIN_SPI_MOSI      7    // SPI0 TX   -> nRF P0.20
-#define PIN_SPI_MISO      8    // SPI0 RX   <- nRF P0.08 (reverse ACK/status path)
-#define PIN_SPI_CSN       9    // manual GPIO -> nRF P0.22 (SPIS CSN)
+#define PIN_SPI_MISO      16   // SPI0 RX  (Pin 21) <- nRF P0.08 (MISO)
+#define PIN_SPI_CSN       17   // SPI0 CSn (Pin 22) -> nRF P0.22 (CSN)
+#define PIN_SPI_SCK       18   // SPI0 SCK (Pin 24) -> nRF P0.17 (SCK)
+#define PIN_SPI_MOSI      19   // SPI0 TX  (Pin 25) -> nRF P0.20 (MOSI)
 
 #define KBD_REPORT_LEN    8    // boot report: modifier, reserved, key1..key6
 #define LINK_FRAME_LEN    12
@@ -77,8 +77,8 @@
 #define LINK_ACK_TYPE_LOCK_STATE 0x01
 #define LINK_ACK_TYPE_DFU       0x02
 
-#define FLASH_STAGING_OFFSET (2048u * 1024u)   /* 2MB offset for WeAct RP2040 4MB Flash */
-#define FLASH_STAGING_MAX_SIZE (1900u * 1024u) /* Up to 1.9MB firmware image size */
+#define FLASH_STAGING_OFFSET (1024u * 1024u)   /* 1MB offset (safe for 2MB, 4MB, 8MB, 16MB) */
+#define FLASH_STAGING_MAX_SIZE (900u * 1024u)  /* Up to 900KB firmware image size */
 
 #define DFU_STATUS_IDLE         0x00u
 #define DFU_STATUS_BUSY         0x01u
@@ -115,7 +115,7 @@
 #define KEYBOARD_HID_STALL_RECOVERY_MS 250u
 #define SONIX_KEYBOARD_EP_IN 0x81u
 #define PIO_USB_ROOT_INDEX 0u
-#define RP2040_WATCHDOG_TIMEOUT_MS 1000u
+#define RP2040_WATCHDOG_TIMEOUT_MS 8000u
 #define BATTERY_TELEMETRY_PERIOD_MS 20000u
 #define BATTERY_HID_QUIET_GUARD_MS 50u
 #define MAX_HID_REPORTS   8
@@ -168,10 +168,10 @@
 #define BATT_FULL_EXIT_MV        4120  // Voltage threshold to exit FULL after unplug
 #define BATT_HISTORY_LEN           16  // 16 samples = 15-second rolling window at 1Hz
 
-// --- RGB LED, driven locally by RP2040 PWM on GP21, GP20, GP19 (Catod Comun) -----
-#define PIN_LED_R         21
-#define PIN_LED_G         20
-#define PIN_LED_B         19
+// --- RGB LED, driven locally by RP2040 PWM on GP7, GP8, GP9 (Catod Comun) ---
+#define PIN_LED_R         7    // GP7 (Pin 10) - PWM3B
+#define PIN_LED_G         8    // GP8 (Pin 11) - PWM4A
+#define PIN_LED_B         9    // GP9 (Pin 12) - PWM4B
 #define LED_PWM_WRAP      255   // 8-bit duty resolution
 #define LED_COMMON_ANODE  0     // 0 = common cathode to GND, 1 = common anode to 3V3
 
@@ -443,6 +443,7 @@ static void spi_master_init(void)
     gpio_set_function(PIN_SPI_SCK,  GPIO_FUNC_SPI);
     gpio_set_function(PIN_SPI_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SPI_MISO, GPIO_FUNC_SPI);
+    gpio_pull_up(PIN_SPI_MISO);
 
     gpio_init(PIN_SPI_CSN);
     gpio_set_dir(PIN_SPI_CSN, GPIO_OUT);
@@ -520,73 +521,74 @@ static uint8_t dfu_boot_report_count;
 static uint32_t dfu_boot_report_after_ms;
 static uint32_t ota_last_radio_discovery_ms;
 
-enum dfu_flash_operation_type {
-    DFU_FLASH_ERASE,
-    DFU_FLASH_PROGRAM,
-};
+static volatile uint8_t  dfu_core0_flash_cmd;
+static volatile uint32_t dfu_core0_flash_offset;
+static volatile uint32_t dfu_core0_flash_size;
+static const uint8_t * volatile dfu_core0_flash_data;
+static volatile bool     dfu_core0_flash_done;
 
-struct dfu_flash_operation {
-    enum dfu_flash_operation_type type;
-    uint32_t offset;
-    uint32_t size;
-    const uint8_t *data;
-};
-
-static void __no_inline_not_in_flash_func(dfu_flash_callback)(void *context)
+static void __no_inline_not_in_flash_func(dfu_core0_flash_exec)(void)
 {
-    struct dfu_flash_operation const *const operation = context;
+    if (!dfu_core0_flash_cmd) return;
 
-    if (operation->type == DFU_FLASH_ERASE) {
-        flash_range_erase(operation->offset, operation->size);
-    } else {
-        flash_range_program(operation->offset, operation->data,
-                            operation->size);
+    uint32_t const ints = save_and_disable_interrupts();
+    if (dfu_core0_flash_cmd == 1) {
+        flash_range_erase(dfu_core0_flash_offset, dfu_core0_flash_size);
+    } else if (dfu_core0_flash_cmd == 2) {
+        flash_range_program(dfu_core0_flash_offset, dfu_core0_flash_data,
+                            dfu_core0_flash_size);
     }
+    restore_interrupts(ints);
+
+    __dmb();
+    dfu_core0_flash_cmd = 0;
+    dfu_core0_flash_done = true;
+    __sev();
 }
 
-static bool dfu_flash_erase(uint32_t offset, uint32_t size)
+static bool __no_inline_not_in_flash_func(dfu_flash_erase)(uint32_t offset, uint32_t size)
 {
-    struct dfu_flash_operation operation = {
-        .type = DFU_FLASH_ERASE,
-        .offset = offset,
-        .size = size,
-        .data = NULL,
-    };
-    return flash_safe_execute(dfu_flash_callback, &operation, 1000u) ==
-           PICO_OK;
-}
+    dfu_core0_flash_offset = offset;
+    dfu_core0_flash_size = size;
+    dfu_core0_flash_data = NULL;
+    dfu_core0_flash_done = false;
+    __dmb();
+    dfu_core0_flash_cmd = 1;
+    __sev();
 
-static bool dfu_flash_program(uint32_t offset, const uint8_t *data,
-                              uint32_t size)
-{
-    struct dfu_flash_operation operation = {
-        .type = DFU_FLASH_PROGRAM,
-        .offset = offset,
-        .size = size,
-        .data = data,
-    };
-    return flash_safe_execute(dfu_flash_callback, &operation, 1000u) ==
-           PICO_OK;
-}
-
-/* Erase staging one 4 kB sector per flash window so the 1 s watchdog can be
- * fed between sectors.  A single worst-case sector erase stays far below the
- * watchdog timeout, unlike the previous one-window whole-image erase. */
-static bool dfu_flash_erase_staging(uint32_t size)
-{
-    uint32_t const aligned_size = (size + FLASH_SECTOR_SIZE - 1u) &
-                                  ~(FLASH_SECTOR_SIZE - 1u);
-
-    for (uint32_t offset = 0; offset < aligned_size;
-         offset += FLASH_SECTOR_SIZE) {
-        watchdog_update();
-        if (!dfu_flash_erase(FLASH_STAGING_OFFSET + offset,
-                             FLASH_SECTOR_SIZE)) {
+    uint32_t const start = time_us_32();
+    while (!dfu_core0_flash_done) {
+        if ((uint32_t)(time_us_32() - start) > 2000000u) {
             return false;
         }
+        tight_loop_contents();
     }
     return true;
 }
+
+static bool __no_inline_not_in_flash_func(dfu_flash_program)(uint32_t offset,
+                                                             const uint8_t *data,
+                                                             uint32_t size)
+{
+    dfu_core0_flash_offset = offset;
+    dfu_core0_flash_size = size;
+    dfu_core0_flash_data = data;
+    dfu_core0_flash_done = false;
+    __dmb();
+    dfu_core0_flash_cmd = 2;
+    __sev();
+
+    uint32_t const start = time_us_32();
+    while (!dfu_core0_flash_done) {
+        if ((uint32_t)(time_us_32() - start) > 1000000u) {
+            return false;
+        }
+        tight_loop_contents();
+    }
+    return true;
+}
+
+
 
 static bool spi_queue_input(uint8_t type, const uint8_t data[KBD_REPORT_LEN]);
 
@@ -632,6 +634,7 @@ static void dfu_reset_session(void)
     dfu_session_active = false;
     dfu_crc_received = false;
     dfu_image_verified = false;
+    dfu_boot_report_count = 20u;
 }
 
 static bool dfu_flush_page(void)
@@ -697,30 +700,35 @@ static bool dfu_staged_image_vectors_valid(void)
  * multicore_reset_core1() runs in its documented core 0 direction and only
  * one core exists from here on.  The watchdog is fed inside the loop because
  * a full image swap can exceed one watchdog period. */
+static uint8_t dfu_swap_sram_buffer[64 * 1024];
+
 static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
 {
     /* 0. Stop Core 1 completely to prevent XIP instruction fetch collisions */
     multicore_reset_core1();
 
-    uint8_t ram_page[FLASH_PAGE_SIZE]; /* Must reside in SRAM */
     uint32_t const aligned_size = (size + FLASH_SECTOR_SIZE - 1u) & ~(FLASH_SECTOR_SIZE - 1u);
+    if (aligned_size > sizeof(dfu_swap_sram_buffer)) {
+        watchdog_reboot(0, 0, 0);
+        return;
+    }
+
+    /* 1. Copy entire staging image into SRAM BEFORE erasing Slot 0 */
+    const uint8_t *src_xip = (const uint8_t *)(XIP_BASE + FLASH_STAGING_OFFSET);
+    for (uint32_t i = 0; i < aligned_size; ++i) {
+        dfu_swap_sram_buffer[i] = src_xip[i];
+    }
+
     uint32_t const ints = save_and_disable_interrupts();
     (void)ints;
 
-    /* 1. Erase Slot A (active application starting at offset 0) */
+    /* 2. Erase Slot A (active application starting at offset 0) */
     flash_range_erase(0, aligned_size);
 
-    /* 2. Copy page-by-page from Staging Slot into SRAM, then program into Slot A */
-    for (uint32_t offset = 0; offset < aligned_size; offset += FLASH_PAGE_SIZE) {
-        const uint8_t *src_xip = (const uint8_t *)(XIP_BASE + FLASH_STAGING_OFFSET + offset);
-        for (uint16_t i = 0; i < FLASH_PAGE_SIZE; ++i) {
-            ram_page[i] = src_xip[i];
-        }
-        watchdog_update();
-        flash_range_program(offset, ram_page, FLASH_PAGE_SIZE);
-    }
+    /* 3. Program Slot A directly from SRAM */
+    flash_range_program(0, dfu_swap_sram_buffer, aligned_size);
 
-    /* 3. Reboot RP2040 into the newly installed firmware */
+    /* 4. Reboot RP2040 into the newly installed firmware */
     watchdog_reboot(0, 0, 0);
     while (1) {
         tight_loop_contents();
@@ -775,10 +783,6 @@ static void dfu_process_command(struct link_ack_frame const *ack)
         dfu_reset_session();
         dfu_session = command_session;
         dfu_total_size = image_size;
-        if (!dfu_flash_erase_staging(image_size)) {
-            dfu_reply(DFU_STATUS_ERR_FLASH, 1u, 0);
-            return;
-        }
         dfu_session_active = true;
         dfu_reply(DFU_STATUS_OK, 0, 0);
         return;
@@ -802,11 +806,12 @@ static void dfu_process_command(struct link_ack_frame const *ack)
         return;
     }
 
-    if (!dfu_session_active || command_session != dfu_session) {
+    if (!dfu_session_active) {
         dfu_session = command_session;
         dfu_reply(DFU_STATUS_ERR_SESSION, 0, 0);
         return;
     }
+    dfu_session = command_session;
 
     if (command == LINK_TYPE_DFU_CRC) {
         uint16_t const board_id = (uint16_t)ack->data[6] |
@@ -838,6 +843,15 @@ static void dfu_process_command(struct link_ack_frame const *ack)
             dfu_page_buffer[dfu_page_buffer_len++] = ack->data[i];
             ++dfu_bytes_accepted;
             if (dfu_page_buffer_len == FLASH_PAGE_SIZE) {
+                if ((dfu_bytes_committed & (FLASH_SECTOR_SIZE - 1u)) == 0u) {
+                    if (!dfu_flash_erase(
+                            FLASH_STAGING_OFFSET + dfu_bytes_committed,
+                            FLASH_SECTOR_SIZE)) {
+                        dfu_reply(DFU_STATUS_ERR_FLASH, 1u,
+                                  dfu_bytes_accepted);
+                        return;
+                    }
+                }
                 if (!dfu_flash_program(
                         FLASH_STAGING_OFFSET + dfu_bytes_committed,
                         dfu_page_buffer, FLASH_PAGE_SIZE)) {
@@ -847,11 +861,14 @@ static void dfu_process_command(struct link_ack_frame const *ack)
                 }
                 dfu_bytes_committed += FLASH_PAGE_SIZE;
                 dfu_page_buffer_len = 0;
+                uint8_t const progress =
+                    (uint8_t)((dfu_bytes_accepted * 100u) / dfu_total_size);
+                dfu_reply(DFU_STATUS_OK, progress, dfu_bytes_accepted);
             }
         }
-        uint8_t const progress =
-            (uint8_t)((dfu_bytes_accepted * 100u) / dfu_total_size);
-        dfu_reply(DFU_STATUS_OK, progress, dfu_bytes_accepted);
+        if (dfu_bytes_accepted == dfu_total_size) {
+            dfu_reply(DFU_STATUS_OK, 100u, dfu_bytes_accepted);
+        }
         return;
     }
 
@@ -921,6 +938,7 @@ static void dfu_apply_task(void)
     __dmb();
     dfu_apply_requested = true;
     dfu_apply_pending = false;
+    __sev();
 }
 
 /* After a successful install the new image confirms itself: the metadata
@@ -1271,20 +1289,22 @@ static void spi_ack_poll_task(void)
         return;
     }
 
-    uint32_t const interval = dfu_session_active ?
-        SPI_ACK_POLL_DFU_MS : SPI_ACK_POLL_IDLE_MS;
-#else
-    /* No OTA receiver compiled in: no session can exist and no discovery
-     * wake is ever needed; only the idle LED-state refresh poll remains. */
-    uint32_t const interval = SPI_ACK_POLL_IDLE_MS;
+    if (dfu_session_active) {
+        if (radio_power_state != RADIO_AWAKE || spi_retry_pending ||
+            spi_input_queue_count != 0 || battery_spi_pending ||
+            (uint32_t)(time_us_32() - spi_last_tx_us) < SPI_MIN_GUARD_US) {
+            return;
+        }
+        spi_send_control_command(LINK_CONTROL_POLL_ACK);
+        return;
+    }
 #endif
+
+    uint32_t const interval = SPI_ACK_POLL_IDLE_MS;
 
     if (radio_power_state != RADIO_AWAKE || spi_retry_pending ||
         spi_input_queue_count != 0 || battery_spi_pending ||
-#if WIRELESS_KEYBOARD_OTA_SUPPORT
-        (!dfu_session_active &&
-         (uint32_t)(now - radio_last_activity_ms) < SPI_ACK_POLL_QUIET_MS) ||
-#endif
+        (uint32_t)(now - radio_last_activity_ms) < SPI_ACK_POLL_QUIET_MS ||
         (uint32_t)(now - spi_last_ack_poll_ms) < interval ||
         (uint32_t)(time_us_32() - spi_last_tx_us) < SPI_MIN_GUARD_US) {
         return;
@@ -1355,6 +1375,9 @@ static void radio_start_wake(void)
 
 static void radio_power_task(void)
 {
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
+    if (dfu_session_active) return;
+#endif
     uint32_t const now = board_millis();
 
     if (radio_power_state == RADIO_SYSTEM_OFF) {
@@ -2591,6 +2614,9 @@ static void battery_telemetry_task(uint32_t now)
 
 static void battery_task(void)
 {
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
+    if (dfu_session_active) return;
+#endif
     uint32_t const now = board_millis();
 
     battery_sample_task(now);
@@ -3145,6 +3171,9 @@ static void usb_host_event_task(void)
  * exact timer wake so its 100 us retry guard is never overslept. */
 static void worker_core1_idle_wait(void)
 {
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
+    if (dfu_session_active) return;
+#endif
     if (usb_host_event_head != usb_host_event_tail ||
         spi_input_queue_count != 0 || radio_wake_queue_count != 0 ||
         battery_spi_pending || consumer_retry_pending) {
@@ -3165,6 +3194,7 @@ static void worker_core1_main(void)
      * consumption, SPI transmission, ADC/charging state and RGB handling.
      * It never calls TinyUSB/PIO-USB APIs. */
     while (true) {
+        watchdog_update();
         usb_host_event_task();
         consumer_task();
         spi_service_task();
@@ -3249,6 +3279,9 @@ int main(void)
 
     while (1) {
 #if WIRELESS_KEYBOARD_OTA_SUPPORT
+        if (dfu_core0_flash_cmd) {
+            dfu_core0_flash_exec();
+        }
         /* Core 1 hands the verified slot swap to core 0: this is the only
          * context where multicore_reset_core1() is used in its documented
          * direction before dfu_apply_and_reboot takes the whole chip. */
@@ -3266,9 +3299,8 @@ int main(void)
         keyboard_led_task();
         usb_descriptor_dump_task();
         led_blinking_task();
-        /* PIO-USB's repeating 1 ms SOF timer (plus every transaction IRQ)
-         * wakes WFI, so polling tasks keep their cadence while the CPU gates
-         * between interrupts instead of spinning. */
-        __wfi();
+        /* PIO-USB's repeating 1 ms SOF timer, transactions, and Core 1 __sev()
+         * wake WFE instantly without waiting for a hardware interrupt. */
+        __wfe();
     }
 }

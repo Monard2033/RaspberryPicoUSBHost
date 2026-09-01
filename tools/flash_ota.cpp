@@ -290,6 +290,7 @@ CommandResult SendCommandAndWait(HANDLE handle,
 
     bool accepted = SetDfuFeature(handle, payload);
     auto const deadline = std::chrono::steady_clock::now() + timeout;
+    auto lastRetry = std::chrono::steady_clock::now();
     uint8_t token = baseline.token;
     bool tokenObserved = false;
 
@@ -309,9 +310,10 @@ CommandResult SendCommandAndWait(HANDLE handle,
                 }
                 return {current, token};
             }
-        } else if (!accepted && !tokenObserved) {
-            /* A failed SetFeature may be a BUSY stall. Before retrying, first
-             * look for a changed token proving that Windows delivered it. */
+        } else if (!tokenObserved && payload[0] != DFU_CMD_START &&
+                   std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - lastRetry).count() > 2000) {
+            lastRetry = std::chrono::steady_clock::now();
             accepted = SetDfuFeature(handle, payload);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -426,7 +428,7 @@ int main(int argc, char* argv[]) {
 
                 size_t const nextOffset = offset + count;
                 CommandResult const result = SendCommandAndWait(
-                    receiver, data, std::chrono::seconds(5));
+                    receiver, data, std::chrono::seconds(15));
                 ExpectStatus(result, DFU_STATUS_OK,
                              static_cast<uint32_t>(nextOffset));
                 offset = nextOffset;
