@@ -1975,7 +1975,6 @@ static void keyboard_led_toggle_on_press(
 
 /* Pure 1000 Hz Streaming:
  * Never send SET_REPORT control transfers to the physical Sonix keyboard.
- * The keyboard initializes its NumLock LED automatically on power-up.
  * Keeping EP 0 quiet guarantees Endpoint 0x81 streams at 1000 Hz with
  * zero stalls, zero data-toggle collisions, and unlimited simultaneous keys. */
 static void keyboard_led_task(void)
