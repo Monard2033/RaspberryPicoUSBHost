@@ -197,7 +197,15 @@ def load_package(path):
 def main():
     pkg_path = sys.argv[1] if len(sys.argv) > 1 else "firmware/WirelessKeyboard_OTA.wkota"
     if not os.path.isabs(pkg_path):
-        pkg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), pkg_path)
+        if os.path.exists(pkg_path):
+            pkg_path = os.path.abspath(pkg_path)
+        else:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)))
+            candidate = os.path.join(base_dir, pkg_path)
+            if os.path.exists(candidate):
+                pkg_path = candidate
+            else:
+                pkg_path = os.path.abspath(pkg_path)
 
     print("WirelessKeyboard Strict RP2040 Python OTA Flasher")
     print(f"Package : {pkg_path}")
