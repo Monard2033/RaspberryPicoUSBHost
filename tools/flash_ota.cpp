@@ -290,6 +290,7 @@ CommandResult SendCommandAndWait(HANDLE handle,
 
     bool accepted = SetDfuFeature(handle, payload);
     auto const deadline = std::chrono::steady_clock::now() + timeout;
+    auto lastRetry = std::chrono::steady_clock::now();
     uint8_t token = baseline.token;
     bool tokenObserved = false;
 
@@ -309,9 +310,10 @@ CommandResult SendCommandAndWait(HANDLE handle,
                 }
                 return {current, token};
             }
-        } else if (!accepted && !tokenObserved) {
-            /* A failed SetFeature may be a BUSY stall. Before retrying, first
-             * look for a changed token proving that Windows delivered it. */
+        } else if (!tokenObserved && payload[0] != DFU_CMD_START &&
+                   std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - lastRetry).count() > 2000) {
+            lastRetry = std::chrono::steady_clock::now();
             accepted = SetDfuFeature(handle, payload);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -413,32 +415,79 @@ int main(int argc, char* argv[]) {
                              receiver, crc, std::chrono::seconds(5)),
                          DFU_STATUS_OK, 0);
 
+            constexpr size_t PAGE_SIZE = 256;
             size_t offset = 0;
-            int lastPercent = -1;
-            while (offset < package.payload.size()) {
-                std::array<uint8_t, 8> data{};
-                data[0] = DFU_CMD_DATA;
-                data[1] = session;
-                size_t const count = std::min<size_t>(
-                    6, package.payload.size() - offset);
-                std::copy_n(package.payload.begin() + offset, count,
-                            data.begin() + 2);
+            size_t nextPage = PAGE_SIZE;
+            auto const t0 = std::chrono::steady_clock::now();
+            size_t const totalSize = package.payload.size();
 
-                size_t const nextOffset = offset + count;
-                CommandResult const result = SendCommandAndWait(
-                    receiver, data, std::chrono::seconds(5));
-                ExpectStatus(result, DFU_STATUS_OK,
-                             static_cast<uint32_t>(nextOffset));
-                offset = nextOffset;
+            while (offset < totalSize) {
+                size_t const targetOffset = std::min(nextPage, totalSize);
 
-                int const percent = static_cast<int>(
-                    offset * 100 / package.payload.size());
-                if (percent != lastPercent) {
-                    lastPercent = percent;
-                    std::cout << "\rTransfer: " << std::setw(3) << percent
-                              << "%  " << offset << "/"
-                              << package.payload.size() << std::flush;
+                // Stream 6-byte chunks continuously until reaching targetOffset
+                while (offset < targetOffset) {
+                    size_t const count = std::min<size_t>(6, totalSize - offset);
+                    std::array<uint8_t, 8> data{};
+                    data[0] = DFU_CMD_DATA;
+                    data[1] = session;
+                    std::copy_n(package.payload.begin() + offset, count, data.begin() + 2);
+
+                    while (!SetDfuFeature(receiver, data)) {
+                        std::this_thread::sleep_for(std::chrono::microseconds(200));
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                    offset += count;
                 }
+
+                // Wait for RP2040 to process and commit this 256B page
+                auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                auto lastRetry = std::chrono::steady_clock::now();
+                while (std::chrono::steady_clock::now() < deadline) {
+                    DfuStatus st{};
+                    if (GetDfuStatus(receiver, st) && st.session == session) {
+                        if (st.value >= targetOffset) {
+                            break;
+                        }
+                        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - lastRetry).count() > 200) {
+                            lastRetry = std::chrono::steady_clock::now();
+                            if (st.value < offset) {
+                                size_t p = st.value;
+                                while (p < offset) {
+                                    size_t const chkLen = std::min<size_t>(6, totalSize - p);
+                                    std::array<uint8_t, 8> chkData{};
+                                    chkData[0] = DFU_CMD_DATA;
+                                    chkData[1] = session;
+                                    std::copy_n(package.payload.begin() + p, chkLen, chkData.begin() + 2);
+                                    while (!SetDfuFeature(receiver, chkData)) {
+                                        std::this_thread::sleep_for(std::chrono::microseconds(200));
+                                    }
+                                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                                    p += chkLen;
+                                }
+                            }
+                        }
+                        if (IsErrorStatus(st.status)) {
+                            throw std::runtime_error(
+                                "device returned " + StatusName(st.status) +
+                                " detail=" + std::to_string(st.detail) +
+                                " value=" + std::to_string(st.value));
+                        }
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    throw std::runtime_error("timeout waiting for RP2040 to commit page at offset " + std::to_string(targetOffset));
+                }
+
+                nextPage += PAGE_SIZE;
+                int const percent = static_cast<int>(offset * 100 / totalSize);
+                double const elapsedSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                double const speed = elapsedSec > 0.0 ? (offset / elapsedSec) : 0.0;
+
+                std::cout << "\rTransfer: " << std::setw(3) << percent << "%  "
+                          << offset << "/" << totalSize << " bytes ("
+                          << std::fixed << std::setprecision(1) << speed << " B/s) " << std::flush;
             }
             std::cout << "\nVerifying complete staging image...\n";
 
