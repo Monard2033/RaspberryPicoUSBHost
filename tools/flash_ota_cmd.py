@@ -277,29 +277,22 @@ def main():
                         break
                     # The device-reported value is the authoritative count of
                     # bytes actually applied. ACK frames drain asynchronously,
-                    # so val may lag briefly. Re-align the local offset to val
-                    # and continue from there: re-sending chunks the device
-                    # already applied would double-append them (the dongle
-                    # stamps every resend with a fresh token, so the RP2040
-                    # replay guard cannot catch it) and corrupt staging.
+                    # so val normally lags behind the PC offset for a few ms.
+                    # NEVER re-send during that lag: the dongle stamps every
+                    # HID command with a fresh token, so the RP2040 replay
+                    # guard cannot catch re-sent chunks and they would be
+                    # double-appended, corrupting staging. Only treat it as
+                    # genuine frame loss when val stays frozen for 2 s (far
+                    # longer than any ACK drain or flash erase). Then re-send
+                    # starting exactly at val — those bytes were never applied.
                     if val != last_val:
                         last_val = val
                         last_progress = time.time()
-                        if val < offset:
-                            sys.stderr.write(
-                                f"[ALIGN] device accepted {val} B, pc offset was {offset} B; "
-                                f"resuming from device count\n")
-                            offset = val
-                            next_page = ((offset // PAGE_SIZE) + 1) * PAGE_SIZE
-                            target_offset = min(next_page, total_size)
                     if (time.time() - last_progress) > 2.0:
-                        # No ACK movement for 2 s: the chunks between val and
-                        # the page target were genuinely lost in transit.
-                        # Re-send starting exactly at val (device never
-                        # applied those bytes).
                         last_progress = time.time()
                         sys.stderr.write(
-                            f"[RESEND] no progress 2s; re-sending {val}..{target_offset} from device count\n")
+                            f"[RESEND] no ACK progress 2s; device accepted {val} B, "
+                            f"re-sending {val}..{target_offset}\n")
                         p = val
                         while p < target_offset:
                             chk = payload[p:p + 6]
