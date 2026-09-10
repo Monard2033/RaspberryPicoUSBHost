@@ -506,6 +506,7 @@ static uint16_t dfu_page_buffer_len;
 static uint8_t dfu_session;
 static uint8_t dfu_last_command_token;
 static uint8_t dfu_last_command;
+static uint8_t dfu_last_chunk_seq;
 static uint8_t dfu_last_status;
 static uint8_t dfu_last_detail;
 static uint32_t dfu_last_status_value;
@@ -634,6 +635,7 @@ static void dfu_reset_session(void)
     dfu_session_active = false;
     dfu_crc_received = false;
     dfu_image_verified = false;
+    dfu_last_chunk_seq = 0u;
     dfu_boot_report_count = 20u;
 }
 
@@ -857,7 +859,23 @@ static void dfu_process_command(struct link_ack_frame const *ack)
             dfu_reply(DFU_STATUS_ERR_STATE, 2u, dfu_bytes_accepted);
             return;
         }
-        for (uint8_t i = 2u; i < 8u &&
+        /* Chunk sequence (protocol v2): the tool labels every 5-byte chunk
+         * with a rolling sequence in data[7]. The dongle stamps every
+         * feature-report resend with a fresh SPI token, so the token replay
+         * guard above cannot catch a redelivered chunk; a duplicate would
+         * shift the whole stream and corrupt the staged image. Drop any
+         * chunk whose sequence is not the expected next one — re-sent
+         * duplicates are silently ignored, and the tool recovers by
+         * re-sending exactly from the reported device count. */
+        uint8_t const chunk_seq = ack->data[7];
+        if (chunk_seq != (uint8_t)(dfu_last_chunk_seq + 1u)) {
+            /* Duplicate or out-of-order chunk: silently ignore and report
+             * the current accepted count so the tool re-aligns. */
+            dfu_reply(DFU_STATUS_OK, 0u, dfu_bytes_accepted);
+            return;
+        }
+        dfu_last_chunk_seq = chunk_seq;
+        for (uint8_t i = 2u; i < 7u &&
              dfu_bytes_accepted < dfu_total_size; ++i) {
             dfu_page_buffer[dfu_page_buffer_len++] = ack->data[i];
             ++dfu_bytes_accepted;

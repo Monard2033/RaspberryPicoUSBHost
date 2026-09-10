@@ -316,6 +316,7 @@ class FlasherWorker(QThread):
 
             # High-speed continuous 256B page streaming loop:
             PAGE_SIZE = 256
+            CHUNK_SIZE = 5
             offset = 0
             t0 = time.time()
             next_page = PAGE_SIZE
@@ -333,16 +334,20 @@ class FlasherWorker(QThread):
                 if (offset % 4096) == 0 and offset > 0:
                     time.sleep(0.040)
 
-                # Send 6-byte packets continuously:
+                # Send 5-byte packets with a sequence byte in data[7]; the
+                # RP2040 accepts only the exact next sequence (mod 256) and
+                # drops duplicates/out-of-order chunks idempotently:
                 while offset < target_offset:
                     if self._is_cancelled:
                         raise RuntimeError("Actualizarea a fost oprită de utilizator.")
 
-                    chunk = payload[offset:offset + 6]
-                    data_cmd = bytes([DFU_CMD_DATA, session]) + chunk + bytes(6 - len(chunk))
+                    chunk = payload[offset:offset + CHUNK_SIZE]
+                    seq = ((offset // CHUNK_SIZE) + 1) & 0xFF
+                    data_cmd = (bytes([DFU_CMD_DATA, session]) + chunk +
+                                bytes(5 - len(chunk)) + bytes([seq]))
                     while not set_feature(handle, data_cmd):
                         time.sleep(0.0002)
-                    time.sleep(0.0005)
+                    time.sleep(0.0024)
                     offset += len(chunk)
 
                 # Await page commit ACK from RP2040:
@@ -380,13 +385,19 @@ class FlasherWorker(QThread):
                                 self.sig_log.emit(
                                     f"[RESEND] no ACK progress 2s; device accepted {val} B, "
                                     f"re-sending {val}..{target_offset}")
+                                # Re-send exactly from the device count;
+                                # sequences derive from the byte offset so
+                                # re-sent chunks carry the expected next
+                                # sequences — device drops duplicates.
                                 p = val
                                 while p < target_offset:
-                                    chk = payload[p:p + 6]
-                                    data_cmd = bytes([DFU_CMD_DATA, session]) + chk + bytes(6 - len(chk))
+                                    chk = payload[p:p + CHUNK_SIZE]
+                                    seq = ((p // CHUNK_SIZE) + 1) & 0xFF
+                                    data_cmd = (bytes([DFU_CMD_DATA, session]) + chk +
+                                                bytes(5 - len(chk)) + bytes([seq]))
                                     while not set_feature(handle, data_cmd):
                                         time.sleep(0.0002)
-                                    time.sleep(0.0005)
+                                    time.sleep(0.0024)
                                     p += len(chk)
                                 offset = p
                             if status in (DFU_STATUS_ERR_SIZE, DFU_STATUS_ERR_CRC,
@@ -395,7 +406,7 @@ class FlasherWorker(QThread):
                                           DFU_STATUS_ERR_STATE, DFU_STATUS_ABORTED):
                                 name = STATUS_NAMES.get(status, f"0x{status:02X}")
                                 raise RuntimeError(f"RP2040 a raportat eroare {name} (detail={s_detail}, val={val})")
-                    time.sleep(0.0005)
+                    time.sleep(0.0024)
                 else:
                     raise TimeoutError(f"Timeout la confirmarea paginii la offset-ul {target_offset}")
 

@@ -243,6 +243,7 @@ def main():
     _, _, token, _, _ = send_command_and_wait(handle, crc_cmd, timeout_sec=15.0, baseline_token=token, retry_interval=0.8)
 
     PAGE_SIZE = 256
+    CHUNK_SIZE = 5
     offset = 0
     t0 = time.time()
     next_page = PAGE_SIZE
@@ -254,13 +255,17 @@ def main():
         if (offset % 4096) == 0 and offset > 0:
             time.sleep(0.040)
 
-        # Stream 6-byte chunks until we reach or pass target_offset:
+        # Stream 5-byte chunks, sequence byte in data[7] derived from the
+        # chunk index; the RP2040 accepts only the exact next sequence (mod
+        # 256) and drops duplicates/out-of-order chunks idempotently:
         while offset < target_offset:
-            chunk = payload[offset:offset + 6]
-            data_cmd = bytes([DFU_CMD_DATA, session]) + chunk + bytes(6 - len(chunk))
+            chunk = payload[offset:offset + CHUNK_SIZE]
+            seq = ((offset // CHUNK_SIZE) + 1) & 0xFF
+            data_cmd = (bytes([DFU_CMD_DATA, session]) + chunk +
+                        bytes(5 - len(chunk)) + bytes([seq]))
             while not set_feature(handle, data_cmd):
                 time.sleep(0.0002)
-            time.sleep(0.0005)
+            time.sleep(0.0024)
             offset += len(chunk)
 
         # Wait for RP2040 to process and commit this 256B page:
@@ -293,13 +298,18 @@ def main():
                         sys.stderr.write(
                             f"[RESEND] no ACK progress 2s; device accepted {val} B, "
                             f"re-sending {val}..{target_offset}\n")
+                        # Re-send exactly from the device count; sequences
+                        # derive from the byte offset, so re-sent chunks
+                        # carry the sequences the device expects next.
                         p = val
                         while p < target_offset:
-                            chk = payload[p:p + 6]
-                            data_cmd = bytes([DFU_CMD_DATA, session]) + chk + bytes(6 - len(chk))
+                            chk = payload[p:p + CHUNK_SIZE]
+                            seq = ((p // CHUNK_SIZE) + 1) & 0xFF
+                            data_cmd = (bytes([DFU_CMD_DATA, session]) + chk +
+                                        bytes(5 - len(chk)) + bytes([seq]))
                             while not set_feature(handle, data_cmd):
                                 time.sleep(0.0002)
-                            time.sleep(0.0005)
+                            time.sleep(0.0024)
                             p += len(chk)
                         offset = p
                     if status in (DFU_STATUS_ERR_SIZE, DFU_STATUS_ERR_CRC,
@@ -308,7 +318,7 @@ def main():
                                   DFU_STATUS_ERR_STATE, DFU_STATUS_ABORTED):
                         name = STATUS_NAMES.get(status, f"0x{status:02X}")
                         raise RuntimeError(f"device returned {name} detail={s_detail} value={val}")
-            time.sleep(0.0005)
+            time.sleep(0.0024)
         else:
             raise TimeoutError(f"timeout waiting for RP2040 to commit page at offset {target_offset}")
 
