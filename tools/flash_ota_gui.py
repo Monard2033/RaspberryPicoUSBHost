@@ -27,6 +27,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -41,6 +42,198 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+# ---------------------------------------------------------------------------
+# Localization (EN default, RU, RO)
+# ---------------------------------------------------------------------------
+LANGS = {
+    "EN": {
+        "title": "WirelessKeyboard OTA Flasher",
+        "subtitle": "2.4 GHz radio firmware updater for the RP2040",
+        "card_file": "1. Select Firmware File (.wkota)",
+        "file_placeholder": "Choose a compiled firmware .wkota file...",
+        "btn_browse": "📁 Browse...",
+        "meta_none": "No file selected",
+        "meta_ok": "✓ Target: {target} ({board}) | Size: {size} B | CRC32: 0x{crc:08X}",
+        "meta_err": "❌ Package error: {err}",
+        "file_selected_log": "File selected: {name} (CRC32: 0x{crc:08X})",
+        "card_dongle_lbl": "",
+        "dongle_check": "⏳ Checking for USB Dongle...",
+        "dongle_ok": "🟢 USB Receiver Dongle Connected (VID 1B4F, PID 0001)",
+        "dongle_off": "🔴 USB Dongle Disconnected — plug the USB Dongle into the PC",
+        "btn_refresh": "🔄 Refresh",
+        "card_prog": "2. Update Progress & Status",
+        "lbl_stats": "Ready for transfer",
+        "btn_flash": "⚡ Start OTA Update",
+        "log_title": "Event Log (Live)",
+        "dlg_open_title": "Select the OTA Firmware Package",
+        "dlg_open_filter": "WirelessKeyboard OTA (*.wkota);;All files (*.*)",
+        "warn_title": "Warning",
+        "warn_body": "Please choose a valid .wkota file!",
+        "err_title": "Update Error",
+        "err_body": "The update failed:\n\n{msg}",
+        "ok_title": "Success",
+        "ok_body": "{msg}",
+        "st_read": "Reading firmware package...",
+        "st_connect": "Connecting to USB Dongle...",
+        "st_negotiate": "Negotiating session with RP2040...",
+        "st_stream": "High-speed streaming in progress...",
+        "st_verify": "Verifying flash image integrity...",
+        "st_apply": "Applying update and resetting RP2040...",
+        "st_done": "Update finished successfully!",
+        "st_init": "Initiating transfer...",
+        "log_load": "📂 Loading package: {path}",
+        "log_valid": "✓ Valid package: {size} bytes | CRC32: 0x{crc:08X}",
+        "log_dongle_ok": "✓ USB Receiver Dongle connected successfully.",
+        "log_session": "📡 Session #{session} started. Waking RP2040 via ESB radio...",
+        "log_start_ack": "✓ START response received from RP2040.",
+        "log_crc_ack": "✓ Parameters and hardware target confirmed.",
+        "log_stream_begin": "⚡ Starting flash page streaming (~2,000 B/s)...",
+        "log_cancel": "Update stopped by user.",
+        "log_resend": "[RESEND] no ACK progress 2s; device accepted {val} B, re-sending {a}..{b}",
+        "log_crc_ok": "✓ CRC32 confirmed by RP2040: 0x{crc:08X} (100% match)",
+        "log_activate": "🔄 ACTIVATE command sent -> RP2040 swaps Slot 0 and reboots...",
+        "log_done": "🎉 OTA UPDATE COMPLETED! The keyboard rebooted into the new firmware.",
+        "ok_body_full": "The OTA update completed successfully!\nThe keyboard rebooted with the new firmware.",
+        "err_packet": "The Receiver Dongle (VID 1B4F, PID 0001) was not found!",
+        "err_dev": "RP2040 reported error {name} (detail={detail}, val={val})",
+        "err_page_timeout": "Timeout waiting for page commit at offset {offset}",
+        "err_crc": "CRC mismatch: expected 0x{exp:08X}, device reported 0x{got:08X}",
+        "prog_transfer": "Transfer: {pct}% ({done} / {total} B) | Speed: {speed} B/s",
+        "prog_done": "✅ Update Finished Successfully (100%)!",
+        "err_prefix": "Error: {msg}",
+        "log_error": "❌ ERROR: {msg}",
+        "err_stop": "The update was stopped by the user.",
+        "lang_lbl": "🌐",
+    },
+    "RU": {
+        "title": "WirelessKeyboard OTA Flasher",
+        "subtitle": "Обновление прошивки по радио 2.4 ГГц для RP2040",
+        "card_file": "1. Выберите файл прошивки (.wkota)",
+        "file_placeholder": "Выберите скомпилированный файл прошивки .wkota...",
+        "btn_browse": "📁 Обзор...",
+        "meta_none": "Файл не выбран",
+        "meta_ok": "✓ Цель: {target} ({board}) | Размер: {size} Б | CRC32: 0x{crc:08X}",
+        "meta_err": "❌ Ошибка пакета: {err}",
+        "file_selected_log": "Файл выбран: {name} (CRC32: 0x{crc:08X})",
+        "card_dongle_lbl": "",
+        "dongle_check": "⏳ Поиск USB-донгла...",
+        "dongle_ok": "🟢 USB-донгл приёмника подключён (VID 1B4F, PID 0001)",
+        "dongle_off": "🔴 USB-донгл отключён — подключите USB-донгл к ПК",
+        "btn_refresh": "🔄 Обновить",
+        "card_prog": "2. Прогресс обновления и состояние",
+        "lbl_stats": "Готов к передаче",
+        "btn_flash": "⚡ Начать OTA-обновление",
+        "log_title": "Журнал событий (Live)",
+        "dlg_open_title": "Выберите пакет прошивки OTA",
+        "dlg_open_filter": "WirelessKeyboard OTA (*.wkota);;Все файлы (*.*)",
+        "warn_title": "Внимание",
+        "warn_body": "Пожалуйста, выберите корректный файл .wkota!",
+        "err_title": "Ошибка обновления",
+        "err_body": "Обновление не удалось:\n\n{msg}",
+        "ok_title": "Успех",
+        "ok_body": "{msg}",
+        "st_read": "Чтение пакета прошивки...",
+        "st_connect": "Подключение к USB-донглу...",
+        "st_negotiate": "Согласование сеанса с RP2040...",
+        "st_stream": "Идёт потоковая передача...",
+        "st_verify": "Проверка целостности образа во флеш-памяти...",
+        "st_apply": "Применение обновления и перезагрузка RP2040...",
+        "st_done": "Обновление успешно завершено!",
+        "st_init": "Начало передачи...",
+        "log_load": "📂 Загрузка пакета: {path}",
+        "log_valid": "✓ Пакет корректен: {size} байт | CRC32: 0x{crc:08X}",
+        "log_dongle_ok": "✓ USB-донгл приёмника успешно подключён.",
+        "log_session": "📡 Сеанс #{session} начат. Пробуждение RP2040 по радио ESB...",
+        "log_start_ack": "✓ Получен ответ START от RP2040.",
+        "log_crc_ack": "✓ Параметры и аппаратная цель подтверждены.",
+        "log_stream_begin": "⚡ Начало потоковой передачи страниц флеш (~2 000 Б/с)...",
+        "log_cancel": "Обновление остановлено пользователем.",
+        "log_resend": "[RESEND] нет прогресса ACK 2 с; устройство приняло {val} Б, повторная отправка {a}..{b}",
+        "log_crc_ok": "✓ CRC32 подтверждено RP2040: 0x{crc:08X} (совпадение 100%)",
+        "log_activate": "🔄 Команда ACTIVATE отправлена -> RP2040 меняет слоты и перезагружается...",
+        "log_done": "🎉 OTA-ОБНОВЛЕНИЕ ЗАВЕРШЕНО! Клавиатура перезагрузилась с новой прошивкой.",
+        "ok_body_full": "OTA-обновление успешно завершено!\nКлавиатура перезагрузилась с новой прошивкой.",
+        "err_packet": "Донгл-приёмник (VID 1B4F, PID 0001) не найден!",
+        "err_dev": "RP2040 сообщил об ошибке {name} (detail={detail}, val={val})",
+        "err_page_timeout": "Таймаут подтверждения страницы по смещению {offset}",
+        "err_crc": "Несовпадение CRC: ожидалось 0x{exp:08X}, устройство сообщило 0x{got:08X}",
+        "prog_transfer": "Передача: {pct}% ({done} / {total} Б) | Скорость: {speed} Б/с",
+        "prog_done": "✅ Обновление успешно завершено (100%)!",
+        "err_prefix": "Ошибка: {msg}",
+        "log_error": "❌ ОШИБКА: {msg}",
+        "err_stop": "Обновление остановлено пользователем.",
+        "lang_lbl": "🌐",
+    },
+    "RO": {
+        "title": "WirelessKeyboard OTA Flasher",
+        "subtitle": "Utilitar de actualizare firmware prin radio 2.4GHz către RP2040",
+        "card_file": "1. Selectare Fișier Firmware (.wkota)",
+        "file_placeholder": "Alegeți fișierul .wkota cu firmware-ul compilat...",
+        "btn_browse": "📁 Răsfoiește...",
+        "meta_none": "Niciun fișier selectat",
+        "meta_ok": "✓ Țintă: {target} ({board}) | Dimensiune: {size} B | CRC32: 0x{crc:08X}",
+        "meta_err": "❌ Eroare pachet: {err}",
+        "file_selected_log": "Fișier selectat: {name} (CRC32: 0x{crc:08X})",
+        "card_dongle_lbl": "",
+        "dongle_check": "⏳ Se verifică prezența Dongle-ului USB...",
+        "dongle_ok": "🟢 Dongle USB Receiver Conectat (VID 1B4F, PID 0001)",
+        "dongle_off": "🔴 Dongle USB Deconectat — Conectați Dongle-ul USB în PC",
+        "btn_refresh": "🔄 Reîmprospătează",
+        "card_prog": "2. Progres Actualizare & Stare",
+        "lbl_stats": "Pregătit pentru transfer",
+        "btn_flash": "⚡ Pornește Actualizarea OTA",
+        "log_title": "Jurnal Evenimente (Live Logs)",
+        "dlg_open_title": "Selectați Pachetul Firmware OTA",
+        "dlg_open_filter": "WirelessKeyboard OTA (*.wkota);;Toate fișierele (*.*)",
+        "warn_title": "Atenție",
+        "warn_body": "Vă rugăm să alegeți un fișier .wkota valid!",
+        "err_title": "Eroare Actualizare",
+        "err_body": "Actualizarea a eșuat:\n\n{msg}",
+        "ok_title": "Succes",
+        "ok_body": "{msg}",
+        "st_read": "Se citește pachetul firmware...",
+        "st_connect": "Se conectează la Dongle USB...",
+        "st_negotiate": "Se negociază sesiunea cu RP2040...",
+        "st_stream": "Streaming de mare viteză în curs...",
+        "st_verify": "Se verifică integritatea imaginii flash...",
+        "st_apply": "Se aplică actualizarea și se resetează RP2040...",
+        "st_done": "Actualizare finalizată cu succes!",
+        "st_init": "Inițiere transfer...",
+        "log_load": "📂 Încărcare pachet: {path}",
+        "log_valid": "✓ Pachet valid: {size} octeți | CRC32: 0x{crc:08X}",
+        "log_dongle_ok": "✓ Dongle USB Receiver conectat cu succes.",
+        "log_session": "📡 Sesiune inițiată #{session}. Se trezește RP2040 prin radio ESB...",
+        "log_start_ack": "✓ Răspuns START primit de la RP2040.",
+        "log_crc_ack": "✓ Verificare parametri și țintă hardware confirmată.",
+        "log_stream_begin": "⚡ Începe streaming-ul paginilor flash (~2.000 B/s)...",
+        "log_cancel": "Actualizarea a fost oprită de utilizator.",
+        "log_resend": "[RESEND] no ACK progress 2s; device accepted {val} B, re-sending {a}..{b}",
+        "log_crc_ok": "✓ CRC32 Confirmat de RP2040: 0x{crc:08X} (Potrivire 100%)",
+        "log_activate": "🔄 Comandă ACTIVATE trimisă -> RP2040 execută swap-ul Slot 0 și repornește...",
+        "log_done": "🎉 ACTUALIZARE FINALIZATĂ CU SUCCES! Tastatura a repornit în noul firmware.",
+        "ok_body_full": "Actualizarea OTA a fost finalizată cu succes!\nTastatura a repornit cu noul firmware.",
+        "err_packet": "Dongle-ul Receiver (VID 1B4F, PID 0001) nu a fost găsit!",
+        "err_dev": "RP2040 a raportat eroare {name} (detail={detail}, val={val})",
+        "err_page_timeout": "Timeout la confirmarea paginii la offset-ul {offset}",
+        "err_crc": "CRC mismatch: expected 0x{exp:08X}, device reported 0x{got:08X}",
+        "prog_transfer": "Transfer: {pct}% ({done} / {total} B) | Viteză: {speed} B/s",
+        "prog_done": "✅ Actualizare Finalizată cu Succes (100%)!",
+        "err_prefix": "Eroare: {msg}",
+        "log_error": "❌ EROARE: {msg}",
+        "err_stop": "Actualizarea a fost oprită de utilizator.",
+        "lang_lbl": "🌐",
+    },
+}
+
+CURRENT_LANG = "EN"
+
+
+def tr(key, **kw):
+    table = LANGS.get(CURRENT_LANG, LANGS["EN"])
+    text = table.get(key) or LANGS["EN"].get(key) or key
+    return text.format(**kw) if kw else text
+
 
 # ---------------------------------------------------------------------------
 # Protocol & Hardware Constants
@@ -268,30 +461,30 @@ class FlasherWorker(QThread):
     def run(self):
         handle = None
         try:
-            self.sig_status.emit("Se citește pachetul firmware...")
-            self.sig_log.emit(f"📂 Încărcare pachet: {self.package_path}")
+            self.sig_status.emit(tr("st_read"))
+            self.sig_log.emit(tr("log_load", path=self.package_path))
 
             info = parse_package_metadata(self.package_path)
             payload = info["payload"]
             total_size = info["size"]
             expected_crc = info["crc32"]
 
-            self.sig_log.emit(f"✓ Pachet valid: {total_size:,} octeți | CRC32: 0x{expected_crc:08X}")
-            self.sig_status.emit("Se conectează la Dongle USB...")
+            self.sig_log.emit(tr("log_valid", size=f"{total_size:,}", crc=expected_crc))
+            self.sig_status.emit(tr("st_connect"))
 
             handle = open_receiver()
             if not handle:
-                raise RuntimeError("Dongle-ul Receiver (VID 1B4F, PID 0001) nu a fost găsit!")
+                raise RuntimeError(tr("err_packet"))
 
-            self.sig_log.emit("✓ Dongle USB Receiver conectat cu succes.")
-            self.sig_status.emit("Se negociază sesiunea cu RP2040...")
+            self.sig_log.emit(tr("log_dongle_ok"))
+            self.sig_status.emit(tr("st_negotiate"))
 
             base_status, base_session, base_token, _, _ = get_status(handle)
             session = (int(time.time() * 1000) ^ expected_crc ^ total_size) & 0xFF or 1
             if session == base_session:
                 session = (session + 1) & 0xFF or 1
 
-            self.sig_log.emit(f"📡 Sesiune inițiată #{session}. Se trezește RP2040 prin radio ESB...")
+            self.sig_log.emit(tr("log_session", session=session))
 
             start_cmd = bytes([
                 DFU_CMD_START, session, OTA_TARGET_RP2040, OTA_PROTOCOL_VERSION,
@@ -301,7 +494,7 @@ class FlasherWorker(QThread):
             _, _, token, _, _ = send_command_and_wait(
                 handle, start_cmd, timeout_sec=40.0, baseline_token=0, retry_interval=0.8
             )
-            self.sig_log.emit("✓ Răspuns START primit de la RP2040.")
+            self.sig_log.emit(tr("log_start_ack"))
 
             crc_cmd = bytes([
                 DFU_CMD_CRC, session,
@@ -312,7 +505,7 @@ class FlasherWorker(QThread):
             _, _, token, _, _ = send_command_and_wait(
                 handle, crc_cmd, timeout_sec=15.0, baseline_token=token, retry_interval=0.8
             )
-            self.sig_log.emit("✓ Verificare parametri și țintă hardware confirmată.")
+            self.sig_log.emit(tr("log_crc_ack"))
 
             # High-speed continuous 256B page streaming loop:
             PAGE_SIZE = 256
@@ -321,8 +514,8 @@ class FlasherWorker(QThread):
             t0 = time.time()
             next_page = PAGE_SIZE
 
-            self.sig_status.emit("Streaming de mare viteză în curs...")
-            self.sig_log.emit("⚡ Începe streaming-ul paginilor flash (~2.000 B/s)...")
+            self.sig_status.emit(tr("st_stream"))
+            self.sig_log.emit(tr("log_stream_begin"))
 
             while offset < total_size:
                 if self._is_cancelled:
@@ -339,7 +532,7 @@ class FlasherWorker(QThread):
                 # drops duplicates/out-of-order chunks idempotently:
                 while offset < target_offset:
                     if self._is_cancelled:
-                        raise RuntimeError("Actualizarea a fost oprită de utilizator.")
+                        raise RuntimeError(tr("err_stop"))
 
                     chunk = payload[offset:offset + CHUNK_SIZE]
                     seq = ((offset // CHUNK_SIZE) + 1) & 0xFF
@@ -356,7 +549,7 @@ class FlasherWorker(QThread):
                 last_val = -1
                 while time.time() < deadline:
                     if self._is_cancelled:
-                        raise RuntimeError("Actualizarea a fost oprită de utilizator.")
+                        raise RuntimeError(tr("err_stop"))
 
                     st = get_status(handle)
                     if st is not None:
@@ -382,9 +575,8 @@ class FlasherWorker(QThread):
                                 last_progress = time.time()
                             if (time.time() - last_progress) > 2.0:
                                 last_progress = time.time()
-                                self.sig_log.emit(
-                                    f"[RESEND] no ACK progress 2s; device accepted {val} B, "
-                                    f"re-sending {val}..{target_offset}")
+                                self.sig_log.emit(tr(
+                                    "log_resend", val=val, a=val, b=target_offset))
                                 # Re-send exactly from the device count;
                                 # sequences derive from the byte offset so
                                 # re-sent chunks carry the expected next
@@ -405,10 +597,10 @@ class FlasherWorker(QThread):
                                           DFU_STATUS_ERR_PROTOCOL, DFU_STATUS_ERR_SESSION,
                                           DFU_STATUS_ERR_STATE, DFU_STATUS_ABORTED):
                                 name = STATUS_NAMES.get(status, f"0x{status:02X}")
-                                raise RuntimeError(f"RP2040 a raportat eroare {name} (detail={s_detail}, val={val})")
+                                raise RuntimeError(tr("err_dev", name=name, detail=s_detail, val=val))
                     time.sleep(0.0024)
                 else:
-                    raise TimeoutError(f"Timeout la confirmarea paginii la offset-ul {target_offset}")
+                    raise TimeoutError(tr("err_page_timeout", offset=target_offset))
 
                 next_page += PAGE_SIZE
                 pct = (offset * 100) // total_size
@@ -416,8 +608,8 @@ class FlasherWorker(QThread):
                 speed = offset / elapsed if elapsed > 0 else 0
                 self.sig_progress.emit(pct, offset, total_size, speed)
 
-            self.sig_status.emit("Se verifică integritatea imaginii flash...")
-            self.sig_log.emit("🔍 Verificare imagine completă în flash staging...")
+            self.sig_status.emit(tr("st_verify"))
+            self.sig_log.emit("🔍 Verifying complete staging image...")
 
             fin_cmd = bytes([
                 DFU_CMD_FINISH, session,
@@ -433,10 +625,10 @@ class FlasherWorker(QThread):
                     f"CRC mismatch: expected 0x{expected_crc:08X}, "
                     f"device reported 0x{verified_crc:08X}"
                 )
-            self.sig_log.emit(f"✓ CRC32 Confirmat de RP2040: 0x{verified_crc:08X} (Potrivire 100%)")
+            self.sig_log.emit(tr("log_crc_ok", crc=verified_crc))
 
-            self.sig_status.emit("Se aplică actualizarea și se resetează RP2040...")
-            self.sig_log.emit("🔄 Comandă ACTIVATE trimisă -> RP2040 execută swap-ul Slot 0 și repornește...")
+            self.sig_status.emit(tr("st_apply"))
+            self.sig_log.emit(tr("log_activate"))
 
             act_cmd = bytes([
                 DFU_CMD_ACTIVATE, session,
@@ -450,14 +642,14 @@ class FlasherWorker(QThread):
                 pass
 
             self.sig_progress.emit(100, total_size, total_size, speed)
-            self.sig_status.emit("Actualizare finalizată cu succes!")
-            self.sig_log.emit("🎉 ACTUALIZARE FINALIZATĂ CU SUCCES! Tastatura a repornit în noul firmware.")
-            self.sig_finished.emit(True, "Actualizarea OTA a fost finalizată cu succes!\nTastatura a repornit cu noul firmware.")
+            self.sig_status.emit(tr("st_done"))
+            self.sig_log.emit(tr("log_done"))
+            self.sig_finished.emit(True, tr("ok_body_full"))
 
         except Exception as ex:
             err_msg = str(ex)
-            self.sig_status.emit(f"Eroare: {err_msg}")
-            self.sig_log.emit(f"❌ EROARE: {err_msg}")
+            self.sig_status.emit(tr("err_prefix", msg=err_msg))
+            self.sig_log.emit(tr("log_error", msg=err_msg))
             self.sig_finished.emit(False, err_msg)
         finally:
             if handle:
@@ -503,22 +695,16 @@ class CustomPercentageProgressBar(QProgressBar):
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WirelessKeyboard OTA Flasher")
-        self.setMinimumSize(660, 560)
-        self.resize(680, 600)
+        self.setWindowTitle(tr("title"))
+        self.setMinimumSize(660, 700)
+        self.resize(680, 760)
         self.worker = None
 
         self.setup_ui()
         self.apply_dark_theme()
 
-        # Check default path
-        default_rel = os.path.join("firmware", "WirelessKeyboard_OTA.wkota")
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)))
-        default_abs = os.path.join(base_dir, default_rel)
-        if os.path.isfile(default_abs):
-            self.set_selected_file(default_abs)
-        elif os.path.isfile(default_rel):
-            self.set_selected_file(os.path.abspath(default_rel))
+        # No default .wkota pre-selection: the user picks the package
+        # explicitly (also avoids frozen-app CWD surprises).
 
         # Dongle detection timer
         self.dongle_timer = QTimer(self)
@@ -534,14 +720,23 @@ class MainWindow(QWidget):
         # Header
         header_layout = QHBoxLayout()
         header_text = QVBoxLayout()
-        title = QLabel("WirelessKeyboard OTA Flasher")
+        title = QLabel(tr("title"))
         title.setStyleSheet("font-size: 20px; font-weight: bold; color: #FFFFFF;")
-        subtitle = QLabel("Utilitar de actualizare firmware prin radio 2.4GHz către RP2040")
+        subtitle = QLabel(tr("subtitle"))
         subtitle.setStyleSheet("font-size: 12px; color: #8A99AD;")
         header_text.addWidget(title)
         header_text.addWidget(subtitle)
         header_layout.addLayout(header_text)
         header_layout.addStretch()
+
+        # Language selector (EN default)
+        self.cmb_lang = QComboBox()
+        self.cmb_lang.addItems(["EN", "RU", "RO"])
+        self.cmb_lang.setCurrentText("EN")
+        self.cmb_lang.setFixedWidth(70)
+        self.cmb_lang.currentTextChanged.connect(self.on_language_changed)
+        header_layout.addWidget(QLabel(tr("lang_lbl")))
+        header_layout.addWidget(self.cmb_lang)
 
         layout.addLayout(header_layout)
 
@@ -552,15 +747,15 @@ class MainWindow(QWidget):
         file_layout.setContentsMargins(14, 12, 14, 12)
         file_layout.setSpacing(8)
 
-        lbl_file_title = QLabel("1. Selectare Fișier Firmware (.wkota)")
+        lbl_file_title = QLabel(tr("card_file"))
         lbl_file_title.setStyleSheet("font-weight: bold; font-size: 13px; color: #E1E7EF;")
         file_layout.addWidget(lbl_file_title)
 
         picker_layout = QHBoxLayout()
         self.txt_path = QLineEdit()
-        self.txt_path.setPlaceholderText("Alegeți fișierul .wkota cu firmware-ul compilat...")
+        self.txt_path.setPlaceholderText(tr("file_placeholder"))
         self.txt_path.setReadOnly(True)
-        self.btn_browse = QPushButton("📁 Răsfoiește...")
+        self.btn_browse = QPushButton(tr("btn_browse"))
         self.btn_browse.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_browse.clicked.connect(self.choose_file)
         picker_layout.addWidget(self.txt_path)
@@ -568,7 +763,7 @@ class MainWindow(QWidget):
         file_layout.addLayout(picker_layout)
 
         # Metadata badges
-        self.lbl_meta = QLabel("Niciun fișier selectat")
+        self.lbl_meta = QLabel(tr("meta_none"))
         self.lbl_meta.setStyleSheet("font-size: 11px; color: #7F8C9D;")
         file_layout.addWidget(self.lbl_meta)
         layout.addWidget(card_file)
@@ -579,12 +774,12 @@ class MainWindow(QWidget):
         dongle_layout = QHBoxLayout(card_dongle)
         dongle_layout.setContentsMargins(14, 10, 14, 10)
 
-        self.lbl_dongle_status = QLabel("⏳ Se verifică prezența Dongle-ului USB...")
+        self.lbl_dongle_status = QLabel(tr("dongle_check"))
         self.lbl_dongle_status.setStyleSheet("font-size: 12px; color: #FFAA00; font-weight: 500;")
         dongle_layout.addWidget(self.lbl_dongle_status)
         dongle_layout.addStretch()
 
-        self.btn_refresh_dongle = QPushButton("🔄 Reîmprospătează")
+        self.btn_refresh_dongle = QPushButton(tr("btn_refresh"))
         self.btn_refresh_dongle.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_refresh_dongle.clicked.connect(self.check_dongle_status)
         dongle_layout.addWidget(self.btn_refresh_dongle)
@@ -597,19 +792,19 @@ class MainWindow(QWidget):
         prog_layout.setContentsMargins(14, 14, 14, 14)
         prog_layout.setSpacing(10)
 
-        lbl_prog_title = QLabel("2. Progres Actualizare & Stare")
+        lbl_prog_title = QLabel(tr("card_prog"))
         lbl_prog_title.setStyleSheet("font-weight: bold; font-size: 13px; color: #E1E7EF;")
         prog_layout.addWidget(lbl_prog_title)
 
         self.progress_bar = CustomPercentageProgressBar()
         prog_layout.addWidget(self.progress_bar)
 
-        self.lbl_stats = QLabel("Pregătit pentru transfer")
+        self.lbl_stats = QLabel(tr("lbl_stats"))
         self.lbl_stats.setStyleSheet("font-size: 12px; color: #00F5D4; font-weight: 500;")
         prog_layout.addWidget(self.lbl_stats)
 
         # Action Button
-        self.btn_flash = QPushButton("⚡ Pornește Actualizarea OTA")
+        self.btn_flash = QPushButton(tr("btn_flash"))
         self.btn_flash.setFixedHeight(42)
         self.btn_flash.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_flash.setStyleSheet("""
@@ -642,7 +837,7 @@ class MainWindow(QWidget):
         log_layout.setContentsMargins(14, 12, 14, 12)
         log_layout.setSpacing(6)
 
-        lbl_log_title = QLabel("Jurnal Evenimente (Live Logs)")
+        lbl_log_title = QLabel(tr("log_title"))
         lbl_log_title.setStyleSheet("font-weight: bold; font-size: 12px; color: #8A99AD;")
         log_layout.addWidget(lbl_log_title)
 
@@ -698,12 +893,24 @@ class MainWindow(QWidget):
             }
         """)
 
+    def on_language_changed(self, lang):
+        global CURRENT_LANG
+        CURRENT_LANG = lang
+        self.setWindowTitle(tr("title"))
+        self.txt_path.setPlaceholderText(tr("file_placeholder"))
+        self.btn_browse.setText(tr("btn_browse"))
+        self.btn_refresh_dongle.setText(tr("btn_refresh"))
+        self.btn_flash.setText(tr("btn_flash"))
+        if not self.txt_path.text():
+            self.lbl_meta.setText(tr("meta_none"))
+        self.check_dongle_status()
+
     def choose_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Selectați Pachetul Firmware OTA",
+            tr("dlg_open_title"),
             self.txt_path.text() or os.getcwd(),
-            "WirelessKeyboard OTA (*.wkota);;Toate fișierele (*.*)"
+            tr("dlg_open_filter")
         )
         if path:
             self.set_selected_file(path)
@@ -712,17 +919,15 @@ class MainWindow(QWidget):
         try:
             info = parse_package_metadata(path)
             self.txt_path.setText(path)
-            self.lbl_meta.setText(
-                f"✓ Țintă: {info['target']} ({info['board_id']}) | "
-                f"Dimensiune: {info['size']:,} B | "
-                f"CRC32: 0x{info['crc32']:08X}"
-            )
+            self.lbl_meta.setText(tr(
+                "meta_ok", target=info['target'], board=info['board_id'],
+                size=f"{info['size']:,}", crc=info['crc32']))
             self.lbl_meta.setStyleSheet("font-size: 11px; color: #00F5D4; font-weight: 500;")
-            self.log(f"Fișier selectat: {os.path.basename(path)} (CRC32: 0x{info['crc32']:08X})")
+            self.log(tr("file_selected_log", name=os.path.basename(path), crc=info['crc32']))
             self.update_flash_button_state()
         except Exception as ex:
             self.txt_path.setText(path)
-            self.lbl_meta.setText(f"❌ Eroare pachet: {str(ex)}")
+            self.lbl_meta.setText(tr("meta_err", err=str(ex)))
             self.lbl_meta.setStyleSheet("font-size: 11px; color: #FF4D4F; font-weight: 500;")
             self.update_flash_button_state()
 
@@ -730,11 +935,11 @@ class MainWindow(QWidget):
         handle = open_receiver()
         if handle:
             k32.CloseHandle(handle)
-            self.lbl_dongle_status.setText("🟢 Dongle USB Receiver Conectat (VID 1B4F, PID 0001)")
+            self.lbl_dongle_status.setText(tr("dongle_ok"))
             self.lbl_dongle_status.setStyleSheet("font-size: 12px; color: #00F5D4; font-weight: 500;")
             self.is_dongle_connected = True
         else:
-            self.lbl_dongle_status.setText("🔴 Dongle USB Deconectat — Conectați Dongle-ul USB în PC")
+            self.lbl_dongle_status.setText(tr("dongle_off"))
             self.lbl_dongle_status.setStyleSheet("font-size: 12px; color: #FF4D4F; font-weight: 500;")
             self.is_dongle_connected = False
         self.update_flash_button_state()
@@ -751,7 +956,7 @@ class MainWindow(QWidget):
     def start_flash(self):
         file_path = self.txt_path.text()
         if not file_path or not os.path.isfile(file_path):
-            QMessageBox.warning(self, "Atenție", "Vă rugăm să alegeți un fișier .wkota valid!")
+            QMessageBox.warning(self, tr("warn_title"), tr("warn_body"))
             return
 
         self.btn_flash.setEnabled(False)
@@ -772,20 +977,19 @@ class MainWindow(QWidget):
 
     def on_worker_progress(self, pct, transferred, total, speed):
         self.progress_bar.setValue(pct)
-        self.lbl_stats.setText(
-            f"Transfer: {pct}% ({transferred:,} / {total:,} B) | "
-            f"Viteză: {speed:,.1f} B/s"
-        )
+        self.lbl_stats.setText(tr(
+            "prog_transfer", pct=pct, done=f"{transferred:,}",
+            total=f"{total:,}", speed=f"{speed:,.1f}"))
 
     def on_worker_finished(self, success, message):
         self.btn_browse.setEnabled(True)
         self.update_flash_button_state()
         if success:
             self.progress_bar.setValue(100)
-            self.lbl_stats.setText("✅ Actualizare Finalizată cu Succes (100%)!")
-            QMessageBox.information(self, "Succes", message)
+            self.lbl_stats.setText(tr("prog_done"))
+            QMessageBox.information(self, tr("ok_title"), tr("ok_body", msg=message))
         else:
-            QMessageBox.critical(self, "Eroare Actualizare", f"Actualizarea a eșuat:\n\n{message}")
+            QMessageBox.critical(self, tr("err_title"), tr("err_body", msg=message))
 
 
 def main():
