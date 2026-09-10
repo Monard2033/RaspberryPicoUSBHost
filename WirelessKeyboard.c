@@ -413,6 +413,8 @@ static uint8_t           keyboard_lock_pressed;
 static volatile bool     keyboard_led_update_pending;
 static volatile bool     keyboard_led_transfer_active;
 static volatile uint32_t keyboard_led_retry_after_ms;
+static uint32_t          keyboard_led_boot_kick_ms;
+static bool              keyboard_led_boot_kick_done;
 
 static bool              battery_tx_pending;
 static bool              battery_material_step;
@@ -748,6 +750,14 @@ static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
     }
 
     restore_interrupts(ints);
+
+    /* Re-enable the watchdog before the reboot: watchdog_disable() stops
+     * the counter, and on some boards watchdog_reboot() issued with the
+     * watchdog fully disabled leaves the chip in a powered-down wedge (no
+     * BOOTSEL, no USB) until a manual power cycle. Re-arm the 2 s window
+     * so the reboot lands back into the ROM reliably. */
+    watchdog_enable(RP2040_WATCHDOG_TIMEOUT_MS, true);
+    watchdog_update();
 
     /* 4. Reboot RP2040 into the newly installed firmware */
     watchdog_reboot(0, 0, 0);
@@ -1963,9 +1973,13 @@ static void keyboard_led_reset(void)
     keyboard_lock_pressed = 0;
     keyboard_led_update_pending = false;
     keyboard_led_retry_after_ms = 0;
+    /* One-shot boot kick (see keyboard_led_task): request the Sonix MCU
+     * to light NumLock once the keyboard has settled after mount. */
+    keyboard_led_boot_kick_ms = board_millis();
+    keyboard_led_boot_kick_done = false;
 }
 
-static void __unused keyboard_led_build_output_report(uint8_t led_state)
+static void keyboard_led_build_output_report(uint8_t led_state)
 {
     memset(keyboard_led_tx_report, 0, sizeof(keyboard_led_tx_report));
     for (uint8_t i = 0; i < 3; ++i) {
@@ -2014,9 +2028,38 @@ static void keyboard_led_toggle_on_press(
  * Never send SET_REPORT control transfers to the physical Sonix keyboard.
  * Keeping EP 0 quiet guarantees Endpoint 0x81 streams at 1000 Hz with
  * zero stalls, zero data-toggle collisions, and unlimited simultaneous keys. */
+/* One-shot boot kick: 300 ms after the keyboard mounts (all keys released,
+ * EP0 idle), send a single SET_REPORT(Output) with NumLock ON so the Sonix
+ * MCU lights the physical LED. EP1 toggle is reset host-side after the
+ * transfer completes (the CLEAR_FEATURE recovery pattern), which realigns
+ * the IN data toggle in case the SN32 restarts its toggle on control
+ * transfers. Nothing else is ever sent on EP0 at runtime. */
+static uint32_t keyboard_led_boot_kick_ms;
+static bool     keyboard_led_boot_kick_done;
+
 static void keyboard_led_task(void)
 {
     keyboard_led_update_pending = false;
+
+    if (!kbd_is_mounted || keyboard_led_boot_kick_done) return;
+
+    if ((uint32_t)(board_millis() - keyboard_led_boot_kick_ms) < 300u) return;
+    if (!keyboard_report_is_released()) return;
+    if ((uint32_t)(board_millis() - keyboard_last_report_ms) < 250u) return;
+    if (keyboard_led_transfer_active) return;
+
+    keyboard_led_build_output_report(HID_LED_NUM_LOCK);
+    if (tuh_hid_set_report(kbd_dev_addr, kbd_instance,
+                           keyboard_led_output_report_id,
+                           HID_REPORT_TYPE_OUTPUT,
+                           keyboard_led_tx_report,
+                           keyboard_led_output_report_len)) {
+        keyboard_led_transfer_active = true;
+        keyboard_led_boot_kick_done = true;
+    } else {
+        /* EP0 busy: retry on the next task pass. */
+        keyboard_led_boot_kick_ms = board_millis();
+    }
 }
 
 static void null_movement_reset(void)
@@ -3041,6 +3084,14 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
     keyboard_led_transfer_active = false;
     keyboard_led_update_pending = false;
     keyboard_last_report_ms = board_millis();
+
+    /* Re-align the host-side EP 0x81 IN toggle after the control transfer:
+     * the SN32 may restart its toggle when it services EP0, and a mismatched
+     * toggle is the leading suspect for the >= 4-key wedges seen during the
+     * LED experiments. This is the same re-alignment the CLEAR_FEATURE
+     * recovery path performs. */
+    pio_usb_host_endpoint_reset_toggle(PIO_USB_ROOT_INDEX, kbd_dev_addr,
+                                       SONIX_KEYBOARD_EP_IN);
 
     /* Cleanly re-arm keyboard interrupt-IN report after control transfer completion */
     hid_receive_rearm_pending[instance] = false;
