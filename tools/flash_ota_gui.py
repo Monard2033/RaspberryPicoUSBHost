@@ -801,6 +801,9 @@ class MainWindow(QWidget):
 
         self.lbl_stats = QLabel(tr("lbl_stats"))
         self.lbl_stats.setStyleSheet("font-size: 12px; color: #00F5D4; font-weight: 500;")
+        self.lbl_stats.setWordWrap(True)
+        self.lbl_stats.setMaximumHeight(40)
+        self.lbl_stats.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         prog_layout.addWidget(self.lbl_stats)
 
         # Action Button
@@ -830,7 +833,9 @@ class MainWindow(QWidget):
         prog_layout.addWidget(self.btn_flash)
         layout.addWidget(card_progress)
 
-        # Card 4: Detailed Log Output
+        # Card 4: Detailed Log Output. The status text stays a fixed-height
+        # band; the log area absorbs all remaining window height and grows
+        # with it.
         card_log = QFrame()
         card_log.setObjectName("Card")
         log_layout = QVBoxLayout(card_log)
@@ -839,11 +844,12 @@ class MainWindow(QWidget):
 
         lbl_log_title = QLabel(tr("log_title"))
         lbl_log_title.setStyleSheet("font-weight: bold; font-size: 12px; color: #8A99AD;")
+        lbl_log_title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         log_layout.addWidget(lbl_log_title)
 
         self.txt_log = QTextEdit()
         self.txt_log.setReadOnly(True)
-        self.txt_log.setFixedHeight(120)
+        self.txt_log.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.txt_log.setStyleSheet("""
             QTextEdit {
                 background-color: #0F1218;
@@ -855,8 +861,8 @@ class MainWindow(QWidget):
                 padding: 6px;
             }
         """)
-        log_layout.addWidget(self.txt_log)
-        layout.addWidget(card_log)
+        log_layout.addWidget(self.txt_log, 1)
+        layout.addWidget(card_log, 1)
 
     def apply_dark_theme(self):
         self.setStyleSheet("""
