@@ -700,7 +700,7 @@ static bool dfu_staged_image_vectors_valid(void)
  * multicore_reset_core1() runs in its documented core 0 direction and only
  * one core exists from here on.  The watchdog is fed inside the loop because
  * a full image swap can exceed one watchdog period. */
-static uint8_t dfu_swap_sram_buffer[64 * 1024];
+static uint8_t dfu_swap_sram_buffer[128 * 1024];
 
 static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
 {
