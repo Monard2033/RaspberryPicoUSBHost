@@ -1,0 +1,1202 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   width="2200"
+   height="1400"
+   viewBox="0 0 2200 1400"
+   style="background-color: #ffffff;"
+   version="1.1"
+   id="svg131"
+   sodipodi:docname="Wiring_Schematic_Auto.svg"
+   inkscape:version="1.4.4 (dcaf3e7, 2026-05-05)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview131"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="0.44678571"
+     inkscape:cx="884.09273"
+     inkscape:cy="576.33893"
+     inkscape:window-width="2560"
+     inkscape:window-height="1511"
+     inkscape:window-x="-9"
+     inkscape:window-y="-9"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="svg131" />
+  <defs
+     id="defs1">
+    <pattern
+       id="grid"
+       width="20"
+       height="20"
+       patternUnits="userSpaceOnUse">
+      <circle
+         cx="2"
+         cy="2"
+         r="1"
+         fill="#cbd5e1"
+         id="circle1" />
+    </pattern>
+  </defs>
+  <rect
+     width="100%"
+     height="100%"
+     fill="url(#grid)"
+     id="rect1" />
+  <text
+     x="1774.2113"
+     y="816.47198"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18px"
+     font-weight="bold"
+     fill="#334155"
+     id="text110-9">GND</text>
+  <path
+     d="m 1822.8442,1163.623 v -24.4391 -24.439 -24.439 -24.439 -24.4391 -24.4391 -24.43899 -24.43895 -24.439 -24.4391 -24.439 -24.43899 -24.43899 -24.439"
+     fill="none"
+     stroke="#0f172a"
+     stroke-width="6.63251"
+     stroke-linejoin="round"
+     id="path33-2-8" />
+  <path
+     d="m 1825.6212,824.87452 -7.057,-0.0777 -7.0571,-0.0777 -7.0571,-0.0777 -7.0572,-0.0777 -7.0569,-0.0777 -7.0573,-0.0777 -7.057,-0.0777 -7.057,-0.0777 -7.0573,-0.0777 -7.0569,-0.0777 -7.0572,-0.0777 -7.0571,-0.0777 -7.0571,-0.0777 -7.057,-0.0777"
+     fill="none"
+     stroke="#0f172a"
+     stroke-width="5.9039"
+     stroke-linejoin="round"
+     id="path33-2-8-9" />
+  <path
+     d="m 1200.4844,520.26859 h 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20"
+     fill="none"
+     stroke="#eab308"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path20-2" />
+  <text
+     x="859.11609"
+     y="1054.6807"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18px"
+     font-weight="bold"
+     fill="#334155"
+     id="text107-1">GND</text>
+  <path
+     d="M 900.81375,1060.2022 H 879.21503 857.61631 836.01759 814.41887 792.82014 771.22142 749.6227 728.02398 706.42526 684.82654 663.22782 641.6291 620.03038 598.43166"
+     fill="none"
+     stroke="#0f172a"
+     stroke-width="6.2352"
+     stroke-linejoin="round"
+     id="path33-2" />
+  <path
+     d="m 1261.8384,161.68778 h -44.2557 -44.2557 -44.2557 -44.2557 -44.2557 -44.25559 -44.25569 -44.25568 -44.25569 -44.25568 -44.25568 -44.2557 -44.25567 -44.25569 -44.25568 -44.25568 -44.2557 -44.25567 -44.25568 -44.25569"
+     fill="none"
+     stroke="#f97316"
+     stroke-width="8.92525"
+     stroke-linejoin="round"
+     id="path16-4" />
+  <rect
+     x="100"
+     y="300"
+     width="160"
+     height="280"
+     rx="12"
+     fill="#f8fafc"
+     stroke="#475569"
+     stroke-width="4"
+     id="rect2" />
+  <rect
+     x="400"
+     y="300"
+     width="200"
+     height="280"
+     rx="12"
+     fill="#f8fafc"
+     stroke="#475569"
+     stroke-width="4"
+     id="rect3" />
+  <rect
+     x="740"
+     y="200"
+     width="120"
+     height="80"
+     rx="12"
+     fill="#f8fafc"
+     stroke="#475569"
+     stroke-width="4"
+     id="rect4" />
+  <line
+     x1="823.70868"
+     y1="266.41327"
+     x2="853.70868"
+     y2="266.41327"
+     stroke="#111111"
+     stroke-width="5"
+     stroke-linecap="round"
+     id="line15-6" />
+  <line
+     x1="745.4892"
+     y1="266.88483"
+     x2="775.4892"
+     y2="266.88483"
+     stroke="#111111"
+     stroke-width="5"
+     stroke-linecap="round"
+     id="line15" />
+  <line
+     x1="777.20459"
+     y1="266.03931"
+     x2="817.20459"
+     y2="246.03928"
+     stroke="#111111"
+     stroke-width="5"
+     stroke-linecap="round"
+     id="line17" />
+  <rect
+     x="400"
+     y="700"
+     width="200"
+     height="180"
+     rx="12"
+     fill="#f8fafc"
+     stroke="#475569"
+     stroke-width="4"
+     id="rect5" />
+  <rect
+     x="400"
+     y="920"
+     width="200"
+     height="160"
+     rx="12"
+     fill="#f8fafc"
+     stroke="#475569"
+     stroke-width="4"
+     id="rect6" />
+  <rect
+     x="900"
+     y="300"
+     width="300"
+     height="800"
+     rx="16"
+     fill="#f8fafc"
+     stroke="#0f172a"
+     stroke-width="4"
+     id="rect7" />
+  <circle
+     cx="900.5"
+     cy="1060.5"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle55-5" />
+  <rect
+     x="1500"
+     y="460"
+     width="240"
+     height="440"
+     rx="16"
+     fill="#f8fafc"
+     stroke="#0f172a"
+     stroke-width="4"
+     id="rect8" />
+  <circle
+     cx="1739.7195"
+     cy="822.67346"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle52-6" />
+  <rect
+     x="1900"
+     y="500"
+     width="160"
+     height="160"
+     rx="12"
+     fill="#f8fafc"
+     stroke="#475569"
+     stroke-width="4"
+     stroke-dasharray="12 8"
+     id="rect9" />
+  <line
+     x1="200"
+     y1="1160"
+     x2="2000"
+     y2="1160"
+     stroke="#0f172a"
+     stroke-width="12"
+     stroke-linecap="round"
+     id="line9" />
+  <path
+     d="M 260 400 L 280 400 L 300 400 L 320 400 L 340 400 L 360 400 L 380 400 L 400 400"
+     fill="none"
+     stroke="#ef4444"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path9" />
+  <path
+     d="M 600 400 L 620 400 L 640 400 L 660 400 L 680 400 L 700 400 L 720 400 L 720 380 L 720 360 L 720 340 L 720 320 L 720 300 L 720 280 L 720 260 L 720 240 L 740 240"
+     fill="none"
+     stroke="#ef4444"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path10" />
+  <path
+     d="M 1200 440 L 1220 440"
+     fill="none"
+     stroke="#ef4444"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path11" />
+  <path
+     d="M 1220 440 L 1220 420 L 1220 400 L 1220 380 L 1220 360 L 1220 340 L 1220 320 L 1220 300 L 1220 280 L 1220 260 L 1220 240"
+     fill="none"
+     stroke="#ef4444"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path12" />
+  <path
+     d="m 1223.9169,240 h -20.2176 -20.2176 -20.2176 -20.2176 -20.2177 -20.2176 -20.2176 -20.2176 -20.2176 -20.2176 -20.2176 -20.21758 -20.2176 -20.21761 -20.2176 -20.2176 H 880.2176 860"
+     fill="none"
+     stroke="#ef4444"
+     stroke-width="6.03255"
+     stroke-linejoin="round"
+     id="path13" />
+  <path
+     d="m 600.05283,740.05418 h 18.56893 18.56894 18.56894 18.56894 18.56893 18.56894 18.56894 18.56893 18.56894 18.56894 18.56894 18.56893 18.56894 18.56894 V 720.04982 700.04546 680.0411 660.03674 640.03237 620.02801 600.02365 580.01929 560.01493 540.01057 520.00621 500.00185 479.99749 459.99313 439.98877 419.98441 399.98005 379.97569 359.97133 339.96697 319.96261 299.95825 279.95389 259.94953 239.94517"
+     fill="none"
+     stroke="#ef4444"
+     stroke-width="5.78199"
+     stroke-linejoin="round"
+     id="path14" />
+  <path
+     d="M 1200 600 L 1220 600 L 1240 600 L 1260 600"
+     fill="none"
+     stroke="#f97316"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path15" />
+  <path
+     d="M 1260,602.79776 V 580.52108 558.24441 535.96773 513.69105 491.41437 469.13769 446.86102 424.58433 402.30766 380.03097 357.7543 335.47761 313.20095 290.92426 268.64759 246.3709 224.09422 201.81755 179.54087 157.26419"
+     fill="none"
+     stroke="#f97316"
+     stroke-width="6.3323"
+     stroke-linejoin="round"
+     id="path16" />
+  <path
+     d="m 380,163.6291 v 23.63709 23.63709 23.63709 23.63709 23.63709 23.63709 23.63709 23.63709 23.63709 V 400"
+     fill="none"
+     stroke="#f97316"
+     stroke-width="6.52279"
+     stroke-linejoin="round"
+     id="path18" />
+  <path
+     d="m 1200,718.8809 h 20 20 20 20 20 20 20 20 20 20 20 20 20 20 20"
+     fill="none"
+     stroke="#3b82f6"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path19" />
+  <path
+     d="M 1200 760 L 1220 760 L 1240 760 L 1260 760 L 1280 760 L 1300 760 L 1320 760 L 1340 760 L 1360 760 L 1380 760 L 1400 760 L 1420 760 L 1440 760 L 1460 760 L 1480 760 L 1500 760"
+     fill="none"
+     stroke="#eab308"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path20" />
+  <path
+     d="M 1200 800 L 1220 800 L 1240 800 L 1260 800 L 1280 800 L 1300 800 L 1320 800 L 1340 800 L 1360 800 L 1380 800 L 1400 800 L 1420 800 L 1440 800 L 1460 800 L 1480 800 L 1500 800"
+     fill="none"
+     stroke="#22c55e"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path21" />
+  <path
+     d="M 1200 840 L 1220 840 L 1240 840 L 1260 840 L 1280 840 L 1300 840 L 1320 840 L 1340 840 L 1360 840 L 1380 840 L 1400 840 L 1420 840 L 1440 840 L 1460 840 L 1480 840 L 1500 840"
+     fill="none"
+     stroke="#a855f7"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path22" />
+  <path
+     d="M 900 780 L 880 780 L 860 780 L 840 780 L 820 780 L 800 780 L 780 780 L 760 780 L 740 780 L 720 780 L 700 780 L 680 780 L 660 780 L 640 780 L 620 780 L 600 780"
+     fill="none"
+     stroke="#8b5a2b"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path23" />
+  <path
+     d="M 900 820 L 880 820 L 860 820 L 840 820 L 820 820 L 800 820 L 780 820 L 760 820 L 740 820 L 720 820 L 700 820 L 680 820 L 660 820 L 640 820 L 620 820 L 600 820"
+     fill="none"
+     stroke="#64748b"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path24" />
+  <path
+     d="M 900 940 L 880 940 L 860 940 L 840 940 L 820 940 L 800 940 L 780 940 L 760 940 L 740 940 L 720 940 L 700 940 L 680 940 L 660 940 L 640 940 L 620 940 L 600 940"
+     fill="none"
+     stroke="#ef4444"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path25" />
+  <path
+     d="M 900 980 L 880 980 L 860 980 L 840 980 L 820 980 L 800 980 L 780 980 L 760 980 L 740 980 L 720 980 L 700 980 L 680 980 L 660 980 L 640 980 L 620 980 L 600 980"
+     fill="none"
+     stroke="#22c55e"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path26" />
+  <path
+     d="M 900 1020 L 880 1020 L 860 1020 L 840 1020 L 820 1020 L 800 1020 L 780 1020 L 760 1020 L 740 1020 L 720 1020 L 700 1020 L 680 1020 L 660 1020 L 640 1020 L 620 1020 L 600 1020"
+     fill="none"
+     stroke="#3b82f6"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path27" />
+  <path
+     d="M 260 440 L 280 440 L 280 460 L 280 480 L 280 500 L 280 520 L 280 540 L 280 560 L 280 580 L 280 600 L 280 620 L 280 640 L 280 660 L 280 680 L 280 700 L 280 720 L 280 740 L 280 760 L 280 780 L 280 800 L 280 820 L 280 840 L 280 860 L 280 880 L 280 900 L 280 920 L 280 940 L 280 960 L 280 980 L 280 1000 L 280 1020 L 280 1040 L 280 1060 L 280 1080 L 280 1100 L 280 1120 L 280 1140 L 280 1160"
+     fill="none"
+     stroke="#0f172a"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path28" />
+  <path
+     d="M 400 440 L 380 440 L 360 440 L 340 440 L 320 440 L 300 440 L 280 440"
+     fill="none"
+     stroke="#0f172a"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path29" />
+  <path
+     d="M 600 440 L 620 440 L 620 460 L 620 480 L 620 500 L 620 520 L 620 540 L 620 560 L 620 580 L 620 600 L 600 600 L 580 600 L 560 600 L 540 600 L 520 600 L 500 600 L 480 600 L 460 600 L 440 600 L 420 600 L 400 600 L 380 600 L 360 600 L 340 600 L 320 600 L 300 600 L 280 600"
+     fill="none"
+     stroke="#0f172a"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path30" />
+  <path
+     d="M 600 860 L 620 860 L 620 880 L 620 900 L 600 900 L 580 900 L 560 900 L 540 900 L 520 900 L 500 900 L 480 900 L 460 900 L 440 900 L 420 900 L 400 900 L 380 900 L 360 900 L 340 900 L 320 900 L 300 900 L 280 900"
+     fill="none"
+     stroke="#0f172a"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path31" />
+  <path
+     d="M 900 860 L 880 860 L 860 860 L 840 860 L 820 860 L 800 860 L 780 860 L 760 860 L 740 860 L 720 860 L 700 860 L 680 860 L 660 860 L 640 860 L 620 860"
+     fill="none"
+     stroke="#0f172a"
+     stroke-width="6"
+     stroke-linejoin="round"
+     id="path33" />
+  <circle
+     cx="260"
+     cy="400"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle34" />
+  <circle
+     cx="260"
+     cy="440"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle35" />
+  <circle
+     cx="400"
+     cy="400"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle36" />
+  <circle
+     cx="400"
+     cy="440"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle37" />
+  <circle
+     cx="600"
+     cy="400"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle38" />
+  <circle
+     cx="600"
+     cy="440"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle39" />
+  <circle
+     cx="740"
+     cy="240"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle40" />
+  <circle
+     cx="860"
+     cy="240"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle41" />
+  <circle
+     cx="600"
+     cy="740"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle42" />
+  <circle
+     cx="600"
+     cy="780"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle43" />
+  <circle
+     cx="600"
+     cy="820"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle44" />
+  <circle
+     cx="600"
+     cy="860"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle45" />
+  <circle
+     cx="600"
+     cy="940"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle46" />
+  <circle
+     cx="600"
+     cy="980"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle47" />
+  <circle
+     cx="600"
+     cy="1020"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle48" />
+  <circle
+     cx="600"
+     cy="1060"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle49" />
+  <circle
+     cx="900"
+     cy="780"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle50" />
+  <circle
+     cx="900"
+     cy="820"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle51" />
+  <circle
+     cx="900"
+     cy="860"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle52" />
+  <circle
+     cx="900"
+     cy="940"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle53" />
+  <circle
+     cx="900"
+     cy="980"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle54" />
+  <circle
+     cx="900"
+     cy="1020"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle55" />
+  <circle
+     cx="1200"
+     cy="440"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle56" />
+  <circle
+     cx="1200"
+     cy="520"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle57" />
+  <circle
+     cx="1200"
+     cy="600"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle58" />
+  <circle
+     cx="1200"
+     cy="720"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle59" />
+  <circle
+     cx="1200"
+     cy="760"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle60" />
+  <circle
+     cx="1200"
+     cy="800"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle61" />
+  <circle
+     cx="1200"
+     cy="840"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle62" />
+  <circle
+     cx="1500"
+     cy="520"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle63" />
+  <circle
+     cx="1500"
+     cy="720"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle64" />
+  <circle
+     cx="1500"
+     cy="760"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle65" />
+  <circle
+     cx="1500"
+     cy="800"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle66" />
+  <circle
+     cx="1500"
+     cy="840"
+     r="6"
+     fill="#ffffff"
+     stroke="#334155"
+     stroke-width="3"
+     id="circle67" />
+  <circle
+     cx="380"
+     cy="400"
+     r="7"
+     fill="#f97316"
+     id="circle70" />
+  <circle
+     cx="280"
+     cy="1160"
+     r="7"
+     fill="#0f172a"
+     id="circle71" />
+  <circle
+     cx="280"
+     cy="440"
+     r="7"
+     fill="#0f172a"
+     id="circle72" />
+  <circle
+     cx="280"
+     cy="600"
+     r="7"
+     fill="#0f172a"
+     id="circle73" />
+  <circle
+     cx="280"
+     cy="900"
+     r="7"
+     fill="#0f172a"
+     id="circle74" />
+  <circle
+     cx="620"
+     cy="1160"
+     r="7"
+     fill="#0f172a"
+     id="circle75" />
+  <circle
+     cx="620"
+     cy="860"
+     r="7"
+     fill="#0f172a"
+     id="circle76" />
+  <circle
+     cx="1500"
+     cy="1160"
+     r="7"
+     fill="#0f172a"
+     id="circle77" />
+  <text
+     x="180"
+     y="340"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="24"
+     font-weight="bold"
+     fill="#1e293b"
+     id="text77">BATTERY</text>
+  <text
+     x="180"
+     y="370"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="18"
+     fill="#334155"
+     id="text78">LiPo 1S</text>
+  <text
+     x="500"
+     y="340"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="24"
+     font-weight="bold"
+     fill="#1e293b"
+     id="text79">J5019</text>
+  <text
+     x="500"
+     y="370"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="18"
+     fill="#334155"
+     id="text80">Boost Reg.</text>
+  <text
+     x="800"
+     y="240"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="24"
+     font-weight="bold"
+     fill="#1e293b"
+     id="text81">SPST</text>
+  <text
+     x="500"
+     y="740"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="24"
+     font-weight="bold"
+     fill="#1e293b"
+     id="text82">USB-C</text>
+  <text
+     x="500"
+     y="770"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="18"
+     fill="#334155"
+     id="text83">Host Port</text>
+  <text
+     x="500"
+     y="960"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="24"
+     font-weight="bold"
+     fill="#1e293b"
+     id="text84">RGB LED</text>
+  <text
+     x="500"
+     y="990"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="18"
+     fill="#334155"
+     id="text85">Common Cathode</text>
+  <text
+     x="1050"
+     y="340"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="24"
+     font-weight="bold"
+     fill="#1e293b"
+     id="text86">RP2040</text>
+  <text
+     x="1050"
+     y="370"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="18"
+     fill="#334155"
+     id="text87">WeAct Studio</text>
+  <text
+     x="1620"
+     y="500"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="24"
+     font-weight="bold"
+     fill="#1e293b"
+     id="text88">Nice!Nano</text>
+  <text
+     x="1620"
+     y="530"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="18"
+     fill="#334155"
+     id="text89">nRF52840</text>
+  <text
+     x="1980"
+     y="540"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="24"
+     font-weight="bold"
+     fill="#1e293b"
+     id="text90">DONGLE</text>
+  <text
+     x="1980"
+     y="570"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="18"
+     fill="#334155"
+     id="text91">Receiver</text>
+  <text
+     x="272"
+     y="395"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text92">BAT+</text>
+  <text
+     x="272"
+     y="435"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text93">BAT-</text>
+  <text
+     x="388"
+     y="395"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text94">BAT+</text>
+  <text
+     x="388"
+     y="435"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text95">BAT-</text>
+  <text
+     x="612"
+     y="395"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text96">VOUT+</text>
+  <text
+     x="612"
+     y="435"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text97">VOUT-</text>
+  <text
+     x="728"
+     y="235"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text98">IN</text>
+  <text
+     x="872"
+     y="235"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text99">OUT</text>
+  <text
+     x="612"
+     y="735"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text100">5V</text>
+  <text
+     x="612"
+     y="775"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text101">D+</text>
+  <text
+     x="612"
+     y="815"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text102">D-</text>
+  <text
+     x="612"
+     y="855"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text103">GND</text>
+  <text
+     x="612"
+     y="935"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text104">R</text>
+  <text
+     x="612"
+     y="975"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text105">G</text>
+  <text
+     x="612"
+     y="1015"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text106">B</text>
+  <text
+     x="612"
+     y="1055"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text107">GND</text>
+  <text
+     x="888"
+     y="775"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text108">GP4</text>
+  <text
+     x="888"
+     y="815"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text109">GP5</text>
+  <text
+     x="888"
+     y="855"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text110">GND</text>
+  <text
+     x="888"
+     y="935"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text111">GP7</text>
+  <text
+     x="888"
+     y="975"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text112">GP8</text>
+  <text
+     x="888"
+     y="1015"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text113">GP9</text>
+  <text
+     x="1212"
+     y="435"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text114">VSYS</text>
+  <text
+     x="1212"
+     y="515"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text115">3V3</text>
+  <text
+     x="1212"
+     y="595"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text116">GP28</text>
+  <text
+     x="1212"
+     y="715"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text117">GP19</text>
+  <text
+     x="1212"
+     y="755"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text118">GP18</text>
+  <text
+     x="1212"
+     y="795"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text119">GP17</text>
+  <text
+     x="1212"
+     y="835"
+     text-anchor="start"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text120">GP16</text>
+  <text
+     x="1488"
+     y="515"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text121">VCC</text>
+  <text
+     x="1488"
+     y="715"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text122">P0.20</text>
+  <text
+     x="1488"
+     y="755"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text123">P0.17</text>
+  <text
+     x="1488"
+     y="795"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text124">P0.22</text>
+  <text
+     x="1488"
+     y="835"
+     text-anchor="end"
+     font-family="Consolas"
+     font-size="18"
+     font-weight="bold"
+     fill="#334155"
+     id="text125">P0.08</text>
+  <text
+     x="1100"
+     y="1190"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-weight="bold"
+     font-size="16"
+     fill="#0f172a"
+     id="text127">COMMON GROUND BUS</text>
+  <text
+     x="1100"
+     y="80"
+     text-anchor="middle"
+     font-family="Segoe UI"
+     font-size="42"
+     font-weight="bold"
+     fill="#0f172a"
+     letter-spacing="1px"
+     id="text128">WIRELESS KEYBOARD WIRING SCHEMATIC (AUTO-ROUTED)</text>
+  <rect
+     x="50"
+     y="1250"
+     width="2100"
+     height="120"
+     rx="10"
+     fill="#f8fafc"
+     stroke="#334155"
+     stroke-width="3"
+     id="rect128" />
+  <text
+     x="80"
+     y="1290"
+     font-family="Segoe UI"
+     font-weight="bold"
+     font-size="20"
+     id="text129">LEGENDĂ &amp; NOTE DE ASAMBLARE:</text>
+  <text
+     x="80"
+     y="1320"
+     font-family="Segoe UI"
+     font-size="16"
+     id="text130">1. Traseele au fost generate folosind algoritmul A* pe o matrice NxN, evitând strict suprapunerea firelor.</text>
+  <text
+     x="80"
+     y="1345"
+     font-family="Segoe UI"
+     font-size="16"
+     id="text131">2. Pinii SPI0 (GP16-GP19) sunt aliniați perfect orizontal către destinație pentru a facilita o lipire paralelă (zero încrucișări).</text>
+</svg>
