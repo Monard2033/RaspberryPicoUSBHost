@@ -60,10 +60,10 @@ This firmware is part of the 3-tier custom wireless keyboard project:
 
 | RP2040 Pin | nRF52840 ProMicro Pin | Signal Name | Description |
 | :---: | :---: | :---: | :--- |
-| **`GP6`** | **`P0.17`** | **`SPI SCK`** | 8 MHz SPI Clock from RP2040 |
-| **`GP7`** | **`P0.20`** | **`SPI MOSI`** | Serial Data from RP2040 to Transmitter |
-| **`GP8`** | **`P0.08`** | **`SPI MISO`** | Reverse ACK / LED Status from Transmitter |
-| **`GP9`** | **`P0.22`** | **`SPI CSN`** | Active-Low Chip Select & Hardware Wake Sense |
+| **`GP16`** | **`P0.08`** | **`SPI SCK`** | 8 MHz SPI Clock from RP2040 |
+| **`GP17`** | **`P0.22`** | **`SPI MOSI`** | Serial Data from RP2040 to Transmitter |
+| **`GP18`** | **`P0.17`** | **`SPI MISO`** | Reverse ACK / LED Status from Transmitter |
+| **`GP19`** | **`P0.20`** | **`SPI CSN`** | Active-Low Chip Select & Hardware Wake Sense |
 | **`3V3 (OUT)`** | **`VCC / 3V3`** | **`3.3V Power`** | Regulated 3.3V power rail for nRF52840 |
 | **`GND`** | **`GND`** | **`Ground`** | Common Ground Reference |
 
@@ -74,9 +74,9 @@ This firmware is part of the 3-tier custom wireless keyboard project:
 
 | Component | RP2040 Pin | Configuration & Notes |
 | :---: | :---: | :--- |
-| **RGB Red** | **`GP21`** | PWM Red Channel (through 220–330 Ω resistor) |
-| **RGB Green** | **`GP20`** | PWM Green Channel (through 220–330 Ω resistor) |
-| **RGB Blue** | **`GP19`** | PWM Blue Channel (through 220–330 Ω resistor) |
+| **RGB Red** | **`GP7`** | PWM Red Channel (through 220–330 Ω resistor) |
+| **RGB Green** | **`GP8`** | PWM Green Channel (through 220–330 Ω resistor) |
+| **RGB Blue** | **`GP9`** | PWM Blue Channel (through 220–330 Ω resistor) |
 | **RGB Common** | **`GND`** | Default Common-Cathode configuration (`LED_COMMON_ANODE=0`) |
 | **Battery (+) Tap** | **`GP28 / ADC2`** | Voltage divider: 200 kΩ to Vbat (+), 100 kΩ to GND ($V_{meas} = V_{batt} / 3$) |
 | **Battery (-)** | **`GND`** | Li-Ion Cell Ground Reference |
