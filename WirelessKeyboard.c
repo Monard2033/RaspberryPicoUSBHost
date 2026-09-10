@@ -702,6 +702,15 @@ static bool dfu_staged_image_vectors_valid(void)
  * a full image swap can exceed one watchdog period. */
 static uint8_t dfu_swap_sram_buffer[128 * 1024];
 
+/* IMPORTANT: erase/program of Slot 0 (flash offset 0) destroys the running
+ * image's own XIP content. Every instruction executed while Slot 0 is
+ * erased/rewritten must live in SRAM. watchdog_update() sits in .text
+ * (XIP flash), so calling it here would jump into erased flash. The 2 s
+ * watchdog is disabled BEFORE the first erase and the whole swap runs
+ * watchdog-free; erase+program of 128 KB completes well within a single
+ * transaction with interrupts masked. flash_range_erase/program are
+ * RAM-resident SDK functions. */
+
 static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
 {
     /* 0. Stop Core 1 completely to prevent XIP instruction fetch collisions */
@@ -719,20 +728,24 @@ static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
         dfu_swap_sram_buffer[i] = src_xip[i];
     }
 
+    /* Disable the watchdog: its update function lives in XIP flash, which
+     * is about to be erased. From here on no XIP fetch may occur. */
+    watchdog_disable();
+
     uint32_t const ints = save_and_disable_interrupts();
     (void)ints;
 
     /* 2. Erase Slot A (active application starting at offset 0) */
     for (uint32_t off = 0; off < aligned_size; off += FLASH_SECTOR_SIZE) {
-        watchdog_update();
         flash_range_erase(off, FLASH_SECTOR_SIZE);
     }
 
     /* 3. Program Slot A directly from SRAM */
     for (uint32_t off = 0; off < aligned_size; off += FLASH_PAGE_SIZE) {
-        watchdog_update();
         flash_range_program(off, dfu_swap_sram_buffer + off, FLASH_PAGE_SIZE);
     }
+
+    restore_interrupts(ints);
 
     /* 4. Reboot RP2040 into the newly installed firmware */
     watchdog_reboot(0, 0, 0);
