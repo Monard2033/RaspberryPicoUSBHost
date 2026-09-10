@@ -92,9 +92,31 @@ This firmware is part of the 3-tier custom wireless keyboard project:
 3. Drag and drop [`firmware/WirelessKeyboard.uf2`](firmware/WirelessKeyboard.uf2) onto the drive.
 4. The RP2040 will flash immediately and reboot into wireless keyboard mode.
 
-### Wireless OTA Flashing (via Receiver Dongle):
+### Wireless OTA Flashing (GUI — recommended):
 
-To update the RP2040 over the air without opening the keyboard enclosure:
+Run the graphical flasher (`tools/Flash_Ota.exe`, or rebuild it with `tools/build_ota_flasher.ps1`). It detects the Receiver Dongle automatically, lets you pick the firmware package, streams it over the 2.4 GHz radio with per-chunk sequence protection (idempotent recovery), verifies the staging CRC before activation, and shows the live event log:
+
+![WirelessKeyboard OTA Flasher GUI](docs/ota_flasher_gui.png)
+
+UI is available in EN/RU/RO (default EN). The command-line variant does the same thing without a window:
+
+```powershell
+# GUI (recommended)
+.\tools\Flash_Ota.exe
+
+# CLI
+.\tools\flash_ota_cmd.exe firmware\WirelessKeyboard_OTA.wkota
+```
+
+Notes:
+- The transfer runs at the stable ~2 KB/s ESB ACK-payload throughput (~35 s for a 74 KB image); typing on the keyboard during the transfer is tolerated — duplicated/out-of-order chunks are dropped device-side by the chunk-sequence protocol.
+- After the swap the RP2040 reboots into the new firmware and reports `BOOT_OK` over the radio; no BOOTSEL cable access is needed for routine updates.
+- A last-known-good package is kept at `firmware/WirelessKeyboard_OTA_WORKING_BACKUP.wkota` — flashing it over the air instantly reverts to the validated working state.
+
+### Wireless OTA Flashing (legacy CLI):
+
+The original streaming CLI remains available for scripted updates:
+
 ```powershell
 .\tools\flash_ota.exe firmware\WirelessKeyboard_OTA.wkota
 ```
@@ -125,3 +147,4 @@ A dedicated lightweight Windows utility is available in [`tools/WirelessKeyboard
 - ⚡ **Charging & Power State Display**: Real-time status indicator for *Discharging*, *Charging (CC/CV)*, and *Full*.
 - 🕒 **Telemetry Age & Liveness**: Monitors telemetry freshness with an instant manual *Refresh now* action.
 - 🖥️ **System Tray Integration**: Native Windows notification area icon, low-battery alert popups, and *Start with Windows* autostart support.
+
