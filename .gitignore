@@ -1,2 +1,9 @@
 build
 !.vscode/*
+
+tools/_pyi_build/
+tools/__pycache__/
+tools/dist/
+tools/backup_cmd_latest/
+tools/build_pyinstaller/
+tools/.venv-ota/

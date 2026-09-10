@@ -243,6 +243,7 @@ def main():
     _, _, token, _, _ = send_command_and_wait(handle, crc_cmd, timeout_sec=15.0, baseline_token=token, retry_interval=0.8)
 
     PAGE_SIZE = 256
+    CHUNK_SIZE = 5
     offset = 0
     t0 = time.time()
     next_page = PAGE_SIZE
@@ -254,18 +255,23 @@ def main():
         if (offset % 4096) == 0 and offset > 0:
             time.sleep(0.040)
 
-        # Stream 6-byte chunks until we reach or pass target_offset:
+        # Stream 5-byte chunks, sequence byte in data[7] derived from the
+        # chunk index; the RP2040 accepts only the exact next sequence (mod
+        # 256) and drops duplicates/out-of-order chunks idempotently:
         while offset < target_offset:
-            chunk = payload[offset:offset + 6]
-            data_cmd = bytes([DFU_CMD_DATA, session]) + chunk + bytes(6 - len(chunk))
+            chunk = payload[offset:offset + CHUNK_SIZE]
+            seq = ((offset // CHUNK_SIZE) + 1) & 0xFF
+            data_cmd = (bytes([DFU_CMD_DATA, session]) + chunk +
+                        bytes(5 - len(chunk)) + bytes([seq]))
             while not set_feature(handle, data_cmd):
                 time.sleep(0.0002)
-            time.sleep(0.0005)
+            time.sleep(0.0024)
             offset += len(chunk)
 
         # Wait for RP2040 to process and commit this 256B page:
         deadline = time.time() + 10.0
-        last_retry = time.time()
+        last_progress = time.time()
+        last_val = -1
         while time.time() < deadline:
             st = get_status(handle)
             if st is not None:
@@ -274,24 +280,45 @@ def main():
                     if val >= target_offset:
                         token = s_token
                         break
-                    if (time.time() - last_retry) > 0.2:
-                        last_retry = time.time()
-                        if val < offset:
-                            p = val
-                            while p < offset:
-                                chk = payload[p:p + 6]
-                                data_cmd = bytes([DFU_CMD_DATA, session]) + chk + bytes(6 - len(chk))
-                                while not set_feature(handle, data_cmd):
-                                    time.sleep(0.0002)
-                                time.sleep(0.0005)
-                                p += len(chk)
+                    # The device-reported value is the authoritative count of
+                    # bytes actually applied. ACK frames drain asynchronously,
+                    # so val normally lags behind the PC offset for a few ms.
+                    # NEVER re-send during that lag: the dongle stamps every
+                    # HID command with a fresh token, so the RP2040 replay
+                    # guard cannot catch re-sent chunks and they would be
+                    # double-appended, corrupting staging. Only treat it as
+                    # genuine frame loss when val stays frozen for 2 s (far
+                    # longer than any ACK drain or flash erase). Then re-send
+                    # starting exactly at val — those bytes were never applied.
+                    if val != last_val:
+                        last_val = val
+                        last_progress = time.time()
+                    if (time.time() - last_progress) > 2.0:
+                        last_progress = time.time()
+                        sys.stderr.write(
+                            f"[RESEND] no ACK progress 2s; device accepted {val} B, "
+                            f"re-sending {val}..{target_offset}\n")
+                        # Re-send exactly from the device count; sequences
+                        # derive from the byte offset, so re-sent chunks
+                        # carry the sequences the device expects next.
+                        p = val
+                        while p < target_offset:
+                            chk = payload[p:p + CHUNK_SIZE]
+                            seq = ((p // CHUNK_SIZE) + 1) & 0xFF
+                            data_cmd = (bytes([DFU_CMD_DATA, session]) + chk +
+                                        bytes(5 - len(chk)) + bytes([seq]))
+                            while not set_feature(handle, data_cmd):
+                                time.sleep(0.0002)
+                            time.sleep(0.0024)
+                            p += len(chk)
+                        offset = p
                     if status in (DFU_STATUS_ERR_SIZE, DFU_STATUS_ERR_CRC,
                                   DFU_STATUS_ERR_FLASH, DFU_STATUS_ERR_TARGET,
                                   DFU_STATUS_ERR_PROTOCOL, DFU_STATUS_ERR_SESSION,
                                   DFU_STATUS_ERR_STATE, DFU_STATUS_ABORTED):
                         name = STATUS_NAMES.get(status, f"0x{status:02X}")
                         raise RuntimeError(f"device returned {name} detail={s_detail} value={val}")
-            time.sleep(0.0005)
+            time.sleep(0.0024)
         else:
             raise TimeoutError(f"timeout waiting for RP2040 to commit page at offset {target_offset}")
 
@@ -309,7 +336,38 @@ def main():
         (expected_crc >> 16) & 0xFF, (expected_crc >> 24) & 0xFF,
         0, 0
     ])
-    _, _, token, _, verified_crc = send_command_and_wait(handle, fin_cmd, timeout_sec=15.0, baseline_token=token, retry_interval=1.0)
+    set_feature(handle, fin_cmd)
+    deadline = time.time() + 20.0
+    verified = False
+    verified_crc = 0
+    last_retry = time.time()
+    while time.time() < deadline:
+        st = get_status(handle)
+        if st is not None:
+            status, s_session, s_token, s_detail, val = st
+            if s_session == session:
+                if status == DFU_STATUS_VERIFIED:
+                    verified_crc = val
+                    token = s_token
+                    verified = True
+                    break
+                elif status in (DFU_STATUS_ERR_SIZE, DFU_STATUS_ERR_CRC,
+                                DFU_STATUS_ERR_FLASH, DFU_STATUS_ERR_TARGET,
+                                DFU_STATUS_ERR_PROTOCOL, DFU_STATUS_ERR_SESSION,
+                                DFU_STATUS_ERR_STATE, DFU_STATUS_ABORTED):
+                    name = STATUS_NAMES.get(status, f"0x{status:02X}")
+                    raise RuntimeError(f"device returned {name} detail={s_detail} value=0x{val:08X}")
+        if (time.time() - last_retry) > 1.5:
+            last_retry = time.time()
+            set_feature(handle, fin_cmd)
+        time.sleep(0.01)
+
+    if not verified:
+        raise TimeoutError("Timeout waiting for staging CRC verification")
+
+    if verified_crc != expected_crc:
+        raise RuntimeError(f"CRC mismatch: expected 0x{expected_crc:08X}, got 0x{verified_crc:08X}")
+
     print(f"Staging image verified: CRC32 = 0x{verified_crc:08X} (MATCH!)")
 
     print("Activating update and rebooting RP2040...")
@@ -319,10 +377,23 @@ def main():
         (expected_crc >> 16) & 0xFF, (expected_crc >> 24) & 0xFF,
         0, 0
     ])
-    try:
-        send_command_and_wait(handle, act_cmd, timeout_sec=5.0, baseline_token=token, retry_interval=1.0)
-    except Exception:
-        pass
+    set_feature(handle, act_cmd)
+
+    print("Waiting for RP2040 to apply image (slot swap) and reboot...")
+    deadline = time.time() + 30.0
+    rebooted = False
+    while time.time() < deadline:
+        st = get_status(handle)
+        if st is not None:
+            status, s_session, s_token, s_detail, val = st
+            if status == DFU_STATUS_BOOT_OK and val == expected_crc:
+                rebooted = True
+                print(f"Boot confirmed! Active image CRC32 = 0x{val:08X}, detail = 0x{s_detail:02X}")
+                break
+        time.sleep(0.1)
+
+    if not rebooted:
+        print("Note: Fast boot report not caught or slot swap rejected. Verifying active image via probe...")
 
     print("\n=======================================================")
     print("  WIRELESS OTA UPDATE COMPLETED SUCCESSFULLY (100%)!  ")

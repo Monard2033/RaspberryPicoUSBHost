@@ -413,6 +413,8 @@ static uint8_t           keyboard_lock_pressed;
 static volatile bool     keyboard_led_update_pending;
 static volatile bool     keyboard_led_transfer_active;
 static volatile uint32_t keyboard_led_retry_after_ms;
+static uint32_t          keyboard_led_boot_kick_ms;
+static bool              keyboard_led_boot_kick_done;
 
 static bool              battery_tx_pending;
 static bool              battery_material_step;
@@ -506,6 +508,7 @@ static uint16_t dfu_page_buffer_len;
 static uint8_t dfu_session;
 static uint8_t dfu_last_command_token;
 static uint8_t dfu_last_command;
+static uint8_t dfu_last_chunk_seq;
 static uint8_t dfu_last_status;
 static uint8_t dfu_last_detail;
 static uint32_t dfu_last_status_value;
@@ -634,6 +637,7 @@ static void dfu_reset_session(void)
     dfu_session_active = false;
     dfu_crc_received = false;
     dfu_image_verified = false;
+    dfu_last_chunk_seq = 0u;
     dfu_boot_report_count = 20u;
 }
 
@@ -700,7 +704,16 @@ static bool dfu_staged_image_vectors_valid(void)
  * multicore_reset_core1() runs in its documented core 0 direction and only
  * one core exists from here on.  The watchdog is fed inside the loop because
  * a full image swap can exceed one watchdog period. */
-static uint8_t dfu_swap_sram_buffer[64 * 1024];
+static uint8_t dfu_swap_sram_buffer[128 * 1024];
+
+/* IMPORTANT: erase/program of Slot 0 (flash offset 0) destroys the running
+ * image's own XIP content. Every instruction executed while Slot 0 is
+ * erased/rewritten must live in SRAM. watchdog_update() sits in .text
+ * (XIP flash), so calling it here would jump into erased flash. The 2 s
+ * watchdog is disabled BEFORE the first erase and the whole swap runs
+ * watchdog-free; erase+program of 128 KB completes well within a single
+ * transaction with interrupts masked. flash_range_erase/program are
+ * RAM-resident SDK functions. */
 
 static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
 {
@@ -719,20 +732,32 @@ static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
         dfu_swap_sram_buffer[i] = src_xip[i];
     }
 
+    /* Disable the watchdog: its update function lives in XIP flash, which
+     * is about to be erased. From here on no XIP fetch may occur. */
+    watchdog_disable();
+
     uint32_t const ints = save_and_disable_interrupts();
     (void)ints;
 
     /* 2. Erase Slot A (active application starting at offset 0) */
     for (uint32_t off = 0; off < aligned_size; off += FLASH_SECTOR_SIZE) {
-        watchdog_update();
         flash_range_erase(off, FLASH_SECTOR_SIZE);
     }
 
     /* 3. Program Slot A directly from SRAM */
     for (uint32_t off = 0; off < aligned_size; off += FLASH_PAGE_SIZE) {
-        watchdog_update();
         flash_range_program(off, dfu_swap_sram_buffer + off, FLASH_PAGE_SIZE);
     }
+
+    restore_interrupts(ints);
+
+    /* Re-enable the watchdog before the reboot: watchdog_disable() stops
+     * the counter, and on some boards watchdog_reboot() issued with the
+     * watchdog fully disabled leaves the chip in a powered-down wedge (no
+     * BOOTSEL, no USB) until a manual power cycle. Re-arm the 2 s window
+     * so the reboot lands back into the ROM reliably. */
+    watchdog_enable(RP2040_WATCHDOG_TIMEOUT_MS, true);
+    watchdog_update();
 
     /* 4. Reboot RP2040 into the newly installed firmware */
     watchdog_reboot(0, 0, 0);
@@ -844,7 +869,23 @@ static void dfu_process_command(struct link_ack_frame const *ack)
             dfu_reply(DFU_STATUS_ERR_STATE, 2u, dfu_bytes_accepted);
             return;
         }
-        for (uint8_t i = 2u; i < 8u &&
+        /* Chunk sequence (protocol v2): the tool labels every 5-byte chunk
+         * with a rolling sequence in data[7]. The dongle stamps every
+         * feature-report resend with a fresh SPI token, so the token replay
+         * guard above cannot catch a redelivered chunk; a duplicate would
+         * shift the whole stream and corrupt the staged image. Drop any
+         * chunk whose sequence is not the expected next one — re-sent
+         * duplicates are silently ignored, and the tool recovers by
+         * re-sending exactly from the reported device count. */
+        uint8_t const chunk_seq = ack->data[7];
+        if (chunk_seq != (uint8_t)(dfu_last_chunk_seq + 1u)) {
+            /* Duplicate or out-of-order chunk: silently ignore and report
+             * the current accepted count so the tool re-aligns. */
+            dfu_reply(DFU_STATUS_OK, 0u, dfu_bytes_accepted);
+            return;
+        }
+        dfu_last_chunk_seq = chunk_seq;
+        for (uint8_t i = 2u; i < 7u &&
              dfu_bytes_accepted < dfu_total_size; ++i) {
             dfu_page_buffer[dfu_page_buffer_len++] = ack->data[i];
             ++dfu_bytes_accepted;
@@ -1932,9 +1973,13 @@ static void keyboard_led_reset(void)
     keyboard_lock_pressed = 0;
     keyboard_led_update_pending = false;
     keyboard_led_retry_after_ms = 0;
+    /* One-shot boot kick (see keyboard_led_task): request the Sonix MCU
+     * to light NumLock once the keyboard has settled after mount. */
+    keyboard_led_boot_kick_ms = board_millis();
+    keyboard_led_boot_kick_done = false;
 }
 
-static void __unused keyboard_led_build_output_report(uint8_t led_state)
+static void keyboard_led_build_output_report(uint8_t led_state)
 {
     memset(keyboard_led_tx_report, 0, sizeof(keyboard_led_tx_report));
     for (uint8_t i = 0; i < 3; ++i) {
@@ -1983,9 +2028,38 @@ static void keyboard_led_toggle_on_press(
  * Never send SET_REPORT control transfers to the physical Sonix keyboard.
  * Keeping EP 0 quiet guarantees Endpoint 0x81 streams at 1000 Hz with
  * zero stalls, zero data-toggle collisions, and unlimited simultaneous keys. */
+/* One-shot boot kick: 300 ms after the keyboard mounts (all keys released,
+ * EP0 idle), send a single SET_REPORT(Output) with NumLock ON so the Sonix
+ * MCU lights the physical LED. EP1 toggle is reset host-side after the
+ * transfer completes (the CLEAR_FEATURE recovery pattern), which realigns
+ * the IN data toggle in case the SN32 restarts its toggle on control
+ * transfers. Nothing else is ever sent on EP0 at runtime. */
+static uint32_t keyboard_led_boot_kick_ms;
+static bool     keyboard_led_boot_kick_done;
+
 static void keyboard_led_task(void)
 {
     keyboard_led_update_pending = false;
+
+    if (!kbd_is_mounted || keyboard_led_boot_kick_done) return;
+
+    if ((uint32_t)(board_millis() - keyboard_led_boot_kick_ms) < 300u) return;
+    if (!keyboard_report_is_released()) return;
+    if ((uint32_t)(board_millis() - keyboard_last_report_ms) < 250u) return;
+    if (keyboard_led_transfer_active) return;
+
+    keyboard_led_build_output_report(HID_LED_NUM_LOCK);
+    if (tuh_hid_set_report(kbd_dev_addr, kbd_instance,
+                           keyboard_led_output_report_id,
+                           HID_REPORT_TYPE_OUTPUT,
+                           keyboard_led_tx_report,
+                           keyboard_led_output_report_len)) {
+        keyboard_led_transfer_active = true;
+        keyboard_led_boot_kick_done = true;
+    } else {
+        /* EP0 busy: retry on the next task pass. */
+        keyboard_led_boot_kick_ms = board_millis();
+    }
 }
 
 static void null_movement_reset(void)
@@ -3010,6 +3084,14 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
     keyboard_led_transfer_active = false;
     keyboard_led_update_pending = false;
     keyboard_last_report_ms = board_millis();
+
+    /* Re-align the host-side EP 0x81 IN toggle after the control transfer:
+     * the SN32 may restart its toggle when it services EP0, and a mismatched
+     * toggle is the leading suspect for the >= 4-key wedges seen during the
+     * LED experiments. This is the same re-alignment the CLEAR_FEATURE
+     * recovery path performs. */
+    pio_usb_host_endpoint_reset_toggle(PIO_USB_ROOT_INDEX, kbd_dev_addr,
+                                       SONIX_KEYBOARD_EP_IN);
 
     /* Cleanly re-arm keyboard interrupt-IN report after control transfer completion */
     hid_receive_rearm_pending[instance] = false;
