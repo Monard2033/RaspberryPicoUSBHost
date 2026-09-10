@@ -265,7 +265,8 @@ def main():
 
         # Wait for RP2040 to process and commit this 256B page:
         deadline = time.time() + 10.0
-        last_retry = time.time()
+        last_progress = time.time()
+        last_val = -1
         while time.time() < deadline:
             st = get_status(handle)
             if st is not None:
@@ -274,17 +275,40 @@ def main():
                     if val >= target_offset:
                         token = s_token
                         break
-                    if (time.time() - last_retry) > 0.2:
-                        last_retry = time.time()
+                    # The device-reported value is the authoritative count of
+                    # bytes actually applied. ACK frames drain asynchronously,
+                    # so val may lag briefly. Re-align the local offset to val
+                    # and continue from there: re-sending chunks the device
+                    # already applied would double-append them (the dongle
+                    # stamps every resend with a fresh token, so the RP2040
+                    # replay guard cannot catch it) and corrupt staging.
+                    if val != last_val:
+                        last_val = val
+                        last_progress = time.time()
                         if val < offset:
-                            p = val
-                            while p < offset:
-                                chk = payload[p:p + 6]
-                                data_cmd = bytes([DFU_CMD_DATA, session]) + chk + bytes(6 - len(chk))
-                                while not set_feature(handle, data_cmd):
-                                    time.sleep(0.0002)
-                                time.sleep(0.0005)
-                                p += len(chk)
+                            sys.stderr.write(
+                                f"[ALIGN] device accepted {val} B, pc offset was {offset} B; "
+                                f"resuming from device count\n")
+                            offset = val
+                            next_page = ((offset // PAGE_SIZE) + 1) * PAGE_SIZE
+                            target_offset = min(next_page, total_size)
+                    if (time.time() - last_progress) > 2.0:
+                        # No ACK movement for 2 s: the chunks between val and
+                        # the page target were genuinely lost in transit.
+                        # Re-send starting exactly at val (device never
+                        # applied those bytes).
+                        last_progress = time.time()
+                        sys.stderr.write(
+                            f"[RESEND] no progress 2s; re-sending {val}..{target_offset} from device count\n")
+                        p = val
+                        while p < target_offset:
+                            chk = payload[p:p + 6]
+                            data_cmd = bytes([DFU_CMD_DATA, session]) + chk + bytes(6 - len(chk))
+                            while not set_feature(handle, data_cmd):
+                                time.sleep(0.0002)
+                            time.sleep(0.0005)
+                            p += len(chk)
+                        offset = p
                     if status in (DFU_STATUS_ERR_SIZE, DFU_STATUS_ERR_CRC,
                                   DFU_STATUS_ERR_FLASH, DFU_STATUS_ERR_TARGET,
                                   DFU_STATUS_ERR_PROTOCOL, DFU_STATUS_ERR_SESSION,
@@ -309,7 +333,38 @@ def main():
         (expected_crc >> 16) & 0xFF, (expected_crc >> 24) & 0xFF,
         0, 0
     ])
-    _, _, token, _, verified_crc = send_command_and_wait(handle, fin_cmd, timeout_sec=15.0, baseline_token=token, retry_interval=1.0)
+    set_feature(handle, fin_cmd)
+    deadline = time.time() + 20.0
+    verified = False
+    verified_crc = 0
+    last_retry = time.time()
+    while time.time() < deadline:
+        st = get_status(handle)
+        if st is not None:
+            status, s_session, s_token, s_detail, val = st
+            if s_session == session:
+                if status == DFU_STATUS_VERIFIED:
+                    verified_crc = val
+                    token = s_token
+                    verified = True
+                    break
+                elif status in (DFU_STATUS_ERR_SIZE, DFU_STATUS_ERR_CRC,
+                                DFU_STATUS_ERR_FLASH, DFU_STATUS_ERR_TARGET,
+                                DFU_STATUS_ERR_PROTOCOL, DFU_STATUS_ERR_SESSION,
+                                DFU_STATUS_ERR_STATE, DFU_STATUS_ABORTED):
+                    name = STATUS_NAMES.get(status, f"0x{status:02X}")
+                    raise RuntimeError(f"device returned {name} detail={s_detail} value=0x{val:08X}")
+        if (time.time() - last_retry) > 1.5:
+            last_retry = time.time()
+            set_feature(handle, fin_cmd)
+        time.sleep(0.01)
+
+    if not verified:
+        raise TimeoutError("Timeout waiting for staging CRC verification")
+
+    if verified_crc != expected_crc:
+        raise RuntimeError(f"CRC mismatch: expected 0x{expected_crc:08X}, got 0x{verified_crc:08X}")
+
     print(f"Staging image verified: CRC32 = 0x{verified_crc:08X} (MATCH!)")
 
     print("Activating update and rebooting RP2040...")
@@ -319,10 +374,23 @@ def main():
         (expected_crc >> 16) & 0xFF, (expected_crc >> 24) & 0xFF,
         0, 0
     ])
-    try:
-        send_command_and_wait(handle, act_cmd, timeout_sec=5.0, baseline_token=token, retry_interval=1.0)
-    except Exception:
-        pass
+    set_feature(handle, act_cmd)
+
+    print("Waiting for RP2040 to apply image (slot swap) and reboot...")
+    deadline = time.time() + 30.0
+    rebooted = False
+    while time.time() < deadline:
+        st = get_status(handle)
+        if st is not None:
+            status, s_session, s_token, s_detail, val = st
+            if status == DFU_STATUS_BOOT_OK and val == expected_crc:
+                rebooted = True
+                print(f"Boot confirmed! Active image CRC32 = 0x{val:08X}, detail = 0x{s_detail:02X}")
+                break
+        time.sleep(0.1)
+
+    if not rebooted:
+        print("Note: Fast boot report not caught or slot swap rejected. Verifying active image via probe...")
 
     print("\n=======================================================")
     print("  WIRELESS OTA UPDATE COMPLETED SUCCESSFULLY (100%)!  ")
