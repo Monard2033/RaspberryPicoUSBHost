@@ -7,3 +7,6 @@ tools/dist/
 tools/backup_cmd_latest/
 tools/build_pyinstaller/
 tools/.venv-ota/
+
+build-release-ninja/
+build-*/
