@@ -179,6 +179,10 @@
 #define SPI_LINK_TEST_MODE 0   /* 1 = send 0xAA+counter pattern every 1s (diagnostic only) */
 #endif
 
+#ifndef USB_HOST_EVENT_OVERFLOW_SELFTEST
+#define USB_HOST_EVENT_OVERFLOW_SELFTEST 0   /* 1 = probe the SPSC ring overflow path at boot */
+#endif
+
 #ifndef HOT_PATH_DEBUG
 #define HOT_PATH_DEBUG    0   /* Per-report UART logging breaks 1 kHz operation. */
 #endif
@@ -302,10 +306,16 @@ static uint16_t hid_activity_len[CFG_TUH_HID];
 static bool hid_activity_valid[CFG_TUH_HID];
 static bool hid_receive_rearm_pending[CFG_TUH_HID];
 
-/* PIO-USB is timing-sensitive: core 1 owns TinyUSB/PIO and writes this
- * single-producer/single-consumer ring, while core 0 owns SPI/radio.  No
- * callback may wait for SPI or issue radio traffic.  At 1 kHz this leaves
- * 64 complete keyboard states (64 ms) of headroom without allocation/locks. */
+/* PIO-USB is timing-sensitive: core 0 owns the TinyUSB/PIO-USB host callbacks
+ * and is the sole producer into this lock-free ring; core 1 owns SPI/radio and
+ * is the sole consumer (usb_host_event_task).  No callback may wait for SPI or
+ * issue radio traffic.  At 1 kHz this leaves 64 complete keyboard states
+ * (64 ms) of headroom without allocation or locks.
+ *
+ * SPSC invariant: usb_host_event_head is written only by the producer and
+ * usb_host_event_tail only by the consumer, so neither index needs an atomic
+ * read-modify-write.  usb_host_event_push() must therefore never touch
+ * usb_host_event_tail; on a full ring it drops the newest event (see below). */
 #define USB_HOST_EVENT_QUEUE_DEPTH 64u
 _Static_assert((USB_HOST_EVENT_QUEUE_DEPTH &
                 (USB_HOST_EVENT_QUEUE_DEPTH - 1u)) == 0,
@@ -325,9 +335,9 @@ struct usb_host_event {
     uint8_t data[KBD_REPORT_LEN];
 };
 static struct usb_host_event usb_host_event_queue[USB_HOST_EVENT_QUEUE_DEPTH];
-static volatile uint8_t usb_host_event_head;
-static volatile uint8_t usb_host_event_tail;
-static volatile uint32_t usb_host_event_overruns;
+static volatile uint8_t usb_host_event_head;      /* producer (core 0) only */
+static volatile uint8_t usb_host_event_tail;      /* consumer (core 1) only */
+static volatile uint32_t usb_host_event_overruns; /* producer (core 0) only */
 
 static bool usb_host_event_push(uint8_t type, uint8_t dev_addr,
                                 uint8_t instance, uint8_t const *data)
@@ -336,12 +346,19 @@ static bool usb_host_event_push(uint8_t type, uint8_t dev_addr,
     uint8_t const next = (uint8_t)((head + 1u) &
                                    (USB_HOST_EVENT_QUEUE_DEPTH - 1u));
     if (next == usb_host_event_tail) {
-        /* Keyboard reports are absolute state snapshots.  Prefer the newest
-         * state to an old one, so a saturated queue can never leave a key
-         * logically held.  Normal operation never reaches this path. */
-        usb_host_event_tail = (uint8_t)((usb_host_event_tail + 1u) &
-                                        (USB_HOST_EVENT_QUEUE_DEPTH - 1u));
+        /* Ring full: drop the NEWEST event.  Advancing the tail here would
+         * make the producer a second writer of the consumer's read cursor;
+         * pop()'s read-modify-write could then lose an update and skew
+         * head/tail permanently for that mount (stale ghost key, or input
+         * seen as empty and dropped).  Dropping the newest keeps exactly one
+         * writer per index.  The ring retains the oldest DEPTH-1 events;
+         * because every KEYBOARD_REPORT is an absolute snapshot, the next
+         * report the keyboard sends on any state change re-syncs the consumer,
+         * so a deferred report cannot leave a key latched.  Only reachable
+         * when the consumer is starved (e.g. the 1-2 s dfu_flash_* spins
+         * during OTA); normal operation never reaches it. */
         ++usb_host_event_overruns;
+        return false;
     }
 
     struct usb_host_event *event = &usb_host_event_queue[head];
@@ -370,6 +387,56 @@ static bool usb_host_event_pop(struct usb_host_event *event)
                                     (USB_HOST_EVENT_QUEUE_DEPTH - 1u));
     return true;
 }
+
+#if USB_HOST_EVENT_OVERFLOW_SELFTEST
+/* Diagnostic (default off).  Exercises the overflow path deterministically on
+ * core 0 before core 1 is launched: fill the ring past capacity, verify the
+ * producer dropped the newest events and counted each drop, then drain and
+ * confirm FIFO order plus an empty ring (head == tail proves no index skew).
+ * The result is kept in a volatile and a failure panics, so the probe stays
+ * observable even when the release build compiles printf() away
+ * (RUNTIME_LOGGING == 0). */
+static volatile bool usb_host_event_selftest_ok;
+
+static void usb_host_event_overflow_selftest(void)
+{
+    uint32_t const limit = USB_HOST_EVENT_QUEUE_DEPTH + 10u;
+    uint32_t accepted = 0;
+    uint32_t const overruns_before = usb_host_event_overruns;
+
+    for (uint32_t i = 0; i < limit; ++i) {
+        uint8_t data[KBD_REPORT_LEN] = { 0 };
+        data[0] = (uint8_t)i;
+        if (usb_host_event_push(USB_HOST_EVENT_KEYBOARD_REPORT, 1, 0, data)) {
+            ++accepted;
+        }
+    }
+
+    uint32_t const overruns = usb_host_event_overruns - overruns_before;
+    bool ok = (accepted == USB_HOST_EVENT_QUEUE_DEPTH - 1u) &&
+              (overruns == (limit - accepted));
+
+    struct usb_host_event event;
+    uint32_t drained = 0;
+    while (usb_host_event_pop(&event)) {
+        if (event.type != USB_HOST_EVENT_KEYBOARD_REPORT ||
+            event.data[0] != (uint8_t)drained) {
+            ok = false;
+        }
+        ++drained;
+    }
+    if (drained != accepted || usb_host_event_tail != usb_host_event_head) {
+        ok = false;
+    }
+
+    usb_host_event_selftest_ok = ok;
+    printf("[SELFTEST] usb_host_event overflow: accepted=%u overruns=%u "
+           "drained=%u %s\n",
+           (unsigned)accepted, (unsigned)overruns, (unsigned)drained,
+           ok ? "PASS" : "FAIL");
+    if (!ok) panic("usb_host_event overflow selftest failed");
+}
+#endif
 
 struct pending_radio_input {
     uint8_t type;
@@ -2028,18 +2095,35 @@ static void keyboard_led_toggle_on_press(
  * Never send SET_REPORT control transfers to the physical Sonix keyboard.
  * Keeping EP 0 quiet guarantees Endpoint 0x81 streams at 1000 Hz with
  * zero stalls, zero data-toggle collisions, and unlimited simultaneous keys. */
-/* One-shot boot kick: 300 ms after the keyboard mounts (all keys released,
- * EP0 idle), send a single SET_REPORT(Output) with NumLock ON so the Sonix
- * MCU lights the physical LED. EP1 toggle is reset host-side after the
- * transfer completes (the CLEAR_FEATURE recovery pattern), which realigns
- * the IN data toggle in case the SN32 restarts its toggle on control
- * transfers. Nothing else is ever sent on EP0 at runtime. */
+/* KEYBOARD LED SYNC - DISABLED 2026-09-13.
+ *
+ * Root cause of the random "keyboard dies, media keys still work" freeze:
+ * the one-shot SET_REPORT(Output, NumLock) below is issued ~300 ms AFTER
+ * mount, i.e. while EP 0x81 is already streaming at 1 kHz. The Sonix SN32
+ * accepts a control transfer on EP0 only while it is still idle during
+ * enumeration; issued at runtime it poisons the keyboard's EP1, which then
+ * tolerates up to 3 simultaneous keys and freezes permanently on a >=4-key
+ * rollover burst (the reported "AWDVA" case). Symptom fit is exact: only
+ * the keyboard endpoint dies, the Consumer/media endpoint keeps working,
+ * and there is no recovery in this firmware (CLEAR_FEATURE is dead code -
+ * keyboard_halt_recovery_pending is only ever assigned false - and
+ * pio_usb_host_endpoint_reset_toggle() returns early whenever EP1 already
+ * has a transfer armed).
+ *
+ * This kick is also redundant: the Sonix MCU lights NumLock ON by itself at
+ * power-up. Set to 1 only for deliberate LED experiments, never in a daily
+ * build. With 0 the rest of this function is unreachable but still compiled,
+ * so no helper loses its last reference (-Wunused-function stays quiet). */
+#define KEYBOARD_LED_SYNC_ENABLED 0
+
 static uint32_t keyboard_led_boot_kick_ms;
 static bool     keyboard_led_boot_kick_done;
 
 static void keyboard_led_task(void)
 {
     keyboard_led_update_pending = false;
+
+    if (!KEYBOARD_LED_SYNC_ENABLED) return;
 
     if (!kbd_is_mounted || keyboard_led_boot_kick_done) return;
 
@@ -3348,6 +3432,9 @@ int main(void)
         LINK_CONTROL_SESSION_RESET, 0, 0, 0, 0, 0, 0, 0
     };
     (void)spi_queue_input(LINK_TYPE_CONTROL, session_reset);
+#if USB_HOST_EVENT_OVERFLOW_SELFTEST
+    usb_host_event_overflow_selftest();
+#endif
     multicore_reset_core1();
     multicore_launch_core1(worker_core1_main);
     printf("[INIT] SPI/battery/RGB worker initialized on core 1\n");

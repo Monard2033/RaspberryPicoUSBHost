@@ -15,6 +15,8 @@ endif()
 set(PICO_BOARD pico CACHE STRING "Board type")
 option(WIRELESS_KEYBOARD_UART_DIAGNOSTIC
        "Enable bounded DAPLink UART diagnostics in WirelessKeyboard" OFF)
+option(USB_HOST_EVENT_OVERFLOW_SELFTEST
+       "Run the usb_host_event SPSC ring overflow self-test at boot (diagnostic)" OFF)
 set(POWER_SAVING_DIAGNOSTIC_IDLE_MS "" CACHE STRING
     "Override radio inactivity timeout for a diagnostic build only")
 
@@ -56,6 +58,12 @@ target_compile_definitions(WirelessKeyboard PRIVATE
 if(POWER_SAVING_DIAGNOSTIC_IDLE_MS)
     target_compile_definitions(WirelessKeyboard PRIVATE
         RADIO_INACTIVITY_MS=${POWER_SAVING_DIAGNOSTIC_IDLE_MS}
+    )
+endif()
+
+if(USB_HOST_EVENT_OVERFLOW_SELFTEST)
+    target_compile_definitions(WirelessKeyboard PRIVATE
+        USB_HOST_EVENT_OVERFLOW_SELFTEST=1
     )
 endif()
 

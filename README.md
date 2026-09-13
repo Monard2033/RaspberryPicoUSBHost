@@ -38,7 +38,54 @@ This firmware is part of the 3-tier custom wireless keyboard project:
    - After 5 minutes of idle time with all keys released, queues `LINK_CONTROL_SYSTEM_OFF` to place the transmitter into $0.5\ \mu A$ deep sleep, signaled by 4 blue LED pulses.
    - First physical keypress wakes the transmitter via active-low CSN pulse without losing the wake-up key stroke.
 5. **Dual-Bank 4MB Wireless OTA DFU**:
-   - Integrated dual-bank flash partition layout with 32-bit CRC32 verification and hardware target locks for over-the-air firmware updates via `flash_ota.exe`.
+   - Integrated dual-bank flash partition layout with 32-bit CRC32 verification and hardware target locks for over-the-air firmware updates via `tools/FLASH_OTA.exe`.
+
+---
+
+## PROHIBITED IMPLEMENTATIONS (hard-won rules - do not reintroduce)
+
+### 1. NEVER send a runtime `SET_REPORT` / EP0 control transfer to the physical keyboard
+
+**Rule:** after enumeration completes and the keyboard's interrupt IN endpoint (EP `0x81`)
+starts streaming, EP0 must stay silent for the whole session. No `SET_REPORT`, no
+`SET_PROTOCOL`, no LED sync, no "one-shot boot kick", not even while all keys are released.
+
+**Why (2026-09-13, confirmed on hardware):** `tuh_hid_set_report(..., HID_REPORT_TYPE_OUTPUT, ...)`
+issued ~300 ms after mount - i.e. *after* 1 kHz streaming had already started - poisons the
+Sonix SN32 keyboard's EP1. After that transfer the keyboard accepts up to 3 simultaneous keys
+and **freezes permanently on a >=4-key rollover burst**. Observed pattern: type fast and
+continuously right after boot -> fine; stop for ~5 s, then press >=4 keys (e.g. `AWDVA`) ->
+the keyboard dies until a power cycle.
+
+**Exact symptom (use it to recognise this bug):** only the keyboard endpoint stops. Consumer /
+media keys keep working (volume, play/pause), the RGB battery indication and the nRF sleep
+blink are normal, and there is **no USB re-enumeration**. The RP2040 itself has not crashed.
+
+**There is no recovery in this firmware, by design of the current code:**
+- `keyboard_halt_recovery_pending` is only ever assigned `false`, so
+  `CLEAR_FEATURE(ENDPOINT_HALT)` is never sent and a genuine EP halt is permanent.
+- `pio_usb_host_endpoint_reset_toggle()` returns `false` whenever the endpoint already has a
+  transfer armed (`Pico-PIO-USB/src/pio_usb_host.c`), i.e. always, while streaming. "Realigning
+  the toggle after SET_REPORT" therefore does nothing.
+- TinyUSB reports a STALL as a normal zero-length completion, so the HID callback just re-arms
+  in a loop instead of surfacing an error.
+
+**It is also unnecessary:** the Sonix MCU lights NumLock by itself at power-up. The physical LED
+is already correct without any host involvement. If LED sync is ever attempted again, it must not
+touch EP0 at runtime (see `skills/sonix-led-quiesce-sync/SKILL.md` for the full record).
+
+**Status:** guard `#define KEYBOARD_LED_SYNC_ENABLED 0` at the top of `keyboard_led_task()`
+(`WirelessKeyboard.c`). Keep it 0. Do not "fix" it back on because the physical NumLock LED
+looks off - the SN32 owns that LED.
+
+### 2. Look-alike freeze: nRF SPI slave not arming MISO has no recovery either
+
+If the nRF52840 SPI slave stops arming MISO while the RP2040 is in `RADIO_AWAKE`,
+`spi_write_frame()` sees `slave_armed == false` for every frame, each frame burns its 8 retries
+and is dropped forever - keys never transmit again until a power cycle. **Distinguish it from
+rule 1:** with a dead SPI/ESB link the Consumer/media keys are dead too, and there is no nRF
+sleep blink. There is no SPI re-init / link watchdog in the firmware yet; only
+`spi_frames_lost` / `spi_miso_retries` record it.
 
 ---
 
@@ -94,7 +141,7 @@ This firmware is part of the 3-tier custom wireless keyboard project:
 
 ### Wireless OTA Flashing (GUI — recommended):
 
-Run the graphical flasher (`tools/Flash_Ota.exe`, or rebuild it with `tools/build_ota_flasher.ps1`). It detects the Receiver Dongle automatically, lets you pick the firmware package, streams it over the 2.4 GHz radio with per-chunk sequence protection (idempotent recovery), verifies the staging CRC before activation, and shows the live event log:
+Run the graphical flasher (`tools/FLASH_OTA.exe`, or rebuild it with `tools/build_ota_flasher.ps1`). It detects the Receiver Dongle automatically, lets you pick the firmware package, streams it over the 2.4 GHz radio with per-chunk sequence protection (idempotent recovery), verifies the staging CRC before activation, and shows the live event log:
 
 ![WirelessKeyboard OTA Flasher GUI](docs/ota_flasher_gui.png)
 
@@ -102,13 +149,14 @@ UI is available in EN/RU/RO (default EN). The command-line variant does the same
 
 ```powershell
 # GUI (recommended)
-.\tools\Flash_Ota.exe
+.\tools\FLASH_OTA.exe
 
 # CLI
 .\tools\flash_ota_cmd.exe firmware\WirelessKeyboard_OTA.wkota
 ```
 
 Notes:
+- Use ONLY `tools\FLASH_OTA.exe` (GUI, i18n EN/RU/RO) or `tools\flash_ota_cmd.exe`. The old root-level `Flash_Ota.exe` was a protocol **v1** build with a Romanian-only UI; flashing with it against current firmware aborts after 2 s per page with `[RESEND] no ACK progress` / `EROARE: Timeout la confirmarea paginii la offset-ul 256`. It has been deleted from the repository. If you see Romanian-only status lines, you are running v1 - stop and use the tools\ binaries.
 - The transfer runs at the stable ~2 KB/s ESB ACK-payload throughput (~35 s for a 74 KB image); typing on the keyboard during the transfer is tolerated — duplicated/out-of-order chunks are dropped device-side by the chunk-sequence protocol.
 - After the swap the RP2040 reboots into the new firmware and reports `BOOT_OK` over the radio; no BOOTSEL cable access is needed for routine updates.
 - A last-known-good package is kept at `firmware/WirelessKeyboard_OTA_WORKING_BACKUP.wkota` — flashing it over the air instantly reverts to the validated working state.
@@ -118,7 +166,7 @@ Notes:
 The original streaming CLI remains available for scripted updates:
 
 ```powershell
-.\tools\flash_ota.exe firmware\WirelessKeyboard_OTA.wkota
+& "$env:USERPROFILE\.pico-sdk\python\3.13.7\python.exe" tools\flash_ota.py firmware\WirelessKeyboard_OTA.wkota
 ```
 
 ---
