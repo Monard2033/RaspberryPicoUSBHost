@@ -141,7 +141,7 @@ sleep blink. There is no SPI re-init / link watchdog in the firmware yet; only
 
 ### Wireless OTA Flashing (GUI — recommended):
 
-Run the graphical flasher (`tools/Flash_Ota.exe`, or rebuild it with `tools/build_ota_flasher.ps1`). It detects the Receiver Dongle automatically, lets you pick the firmware package, streams it over the 2.4 GHz radio with per-chunk sequence protection (idempotent recovery), verifies the staging CRC before activation, and shows the live event log:
+Run the graphical flasher (`tools/FLASH_OTA.exe`, or rebuild it with `tools/build_ota_flasher.ps1`). It detects the Receiver Dongle automatically, lets you pick the firmware package, streams it over the 2.4 GHz radio with per-chunk sequence protection (idempotent recovery), verifies the staging CRC before activation, and shows the live event log:
 
 ![WirelessKeyboard OTA Flasher GUI](docs/ota_flasher_gui.png)
 
@@ -149,13 +149,14 @@ UI is available in EN/RU/RO (default EN). The command-line variant does the same
 
 ```powershell
 # GUI (recommended)
-.\tools\Flash_Ota.exe
+.\tools\FLASH_OTA.exe
 
 # CLI
 .\tools\flash_ota_cmd.exe firmware\WirelessKeyboard_OTA.wkota
 ```
 
 Notes:
+- Use ONLY `tools\FLASH_OTA.exe` (GUI, i18n EN/RU/RO) or `tools\flash_ota_cmd.exe`. The old root-level `Flash_Ota.exe` was a protocol **v1** build with a Romanian-only UI; flashing with it against current firmware aborts after 2 s per page with `[RESEND] no ACK progress` / `EROARE: Timeout la confirmarea paginii la offset-ul 256`. It has been deleted from the repository. If you see Romanian-only status lines, you are running v1 - stop and use the tools\ binaries.
 - The transfer runs at the stable ~2 KB/s ESB ACK-payload throughput (~35 s for a 74 KB image); typing on the keyboard during the transfer is tolerated — duplicated/out-of-order chunks are dropped device-side by the chunk-sequence protocol.
 - After the swap the RP2040 reboots into the new firmware and reports `BOOT_OK` over the radio; no BOOTSEL cable access is needed for routine updates.
 - A last-known-good package is kept at `firmware/WirelessKeyboard_OTA_WORKING_BACKUP.wkota` — flashing it over the air instantly reverts to the validated working state.
@@ -165,7 +166,7 @@ Notes:
 The original streaming CLI remains available for scripted updates:
 
 ```powershell
-.\tools\flash_ota.exe firmware\WirelessKeyboard_OTA.wkota
+& "$env:USERPROFILE\.pico-sdk\python\3.13.7\python.exe" tools\flash_ota.py firmware\WirelessKeyboard_OTA.wkota
 ```
 
 ---
