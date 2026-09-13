@@ -42,6 +42,53 @@ This firmware is part of the 3-tier custom wireless keyboard project:
 
 ---
 
+## PROHIBITED IMPLEMENTATIONS (hard-won rules - do not reintroduce)
+
+### 1. NEVER send a runtime `SET_REPORT` / EP0 control transfer to the physical keyboard
+
+**Rule:** after enumeration completes and the keyboard's interrupt IN endpoint (EP `0x81`)
+starts streaming, EP0 must stay silent for the whole session. No `SET_REPORT`, no
+`SET_PROTOCOL`, no LED sync, no "one-shot boot kick", not even while all keys are released.
+
+**Why (2026-09-13, confirmed on hardware):** `tuh_hid_set_report(..., HID_REPORT_TYPE_OUTPUT, ...)`
+issued ~300 ms after mount - i.e. *after* 1 kHz streaming had already started - poisons the
+Sonix SN32 keyboard's EP1. After that transfer the keyboard accepts up to 3 simultaneous keys
+and **freezes permanently on a >=4-key rollover burst**. Observed pattern: type fast and
+continuously right after boot -> fine; stop for ~5 s, then press >=4 keys (e.g. `AWDVA`) ->
+the keyboard dies until a power cycle.
+
+**Exact symptom (use it to recognise this bug):** only the keyboard endpoint stops. Consumer /
+media keys keep working (volume, play/pause), the RGB battery indication and the nRF sleep
+blink are normal, and there is **no USB re-enumeration**. The RP2040 itself has not crashed.
+
+**There is no recovery in this firmware, by design of the current code:**
+- `keyboard_halt_recovery_pending` is only ever assigned `false`, so
+  `CLEAR_FEATURE(ENDPOINT_HALT)` is never sent and a genuine EP halt is permanent.
+- `pio_usb_host_endpoint_reset_toggle()` returns `false` whenever the endpoint already has a
+  transfer armed (`Pico-PIO-USB/src/pio_usb_host.c`), i.e. always, while streaming. "Realigning
+  the toggle after SET_REPORT" therefore does nothing.
+- TinyUSB reports a STALL as a normal zero-length completion, so the HID callback just re-arms
+  in a loop instead of surfacing an error.
+
+**It is also unnecessary:** the Sonix MCU lights NumLock by itself at power-up. The physical LED
+is already correct without any host involvement. If LED sync is ever attempted again, it must not
+touch EP0 at runtime (see `skills/sonix-led-quiesce-sync/SKILL.md` for the full record).
+
+**Status:** guard `#define KEYBOARD_LED_SYNC_ENABLED 0` at the top of `keyboard_led_task()`
+(`WirelessKeyboard.c`). Keep it 0. Do not "fix" it back on because the physical NumLock LED
+looks off - the SN32 owns that LED.
+
+### 2. Look-alike freeze: nRF SPI slave not arming MISO has no recovery either
+
+If the nRF52840 SPI slave stops arming MISO while the RP2040 is in `RADIO_AWAKE`,
+`spi_write_frame()` sees `slave_armed == false` for every frame, each frame burns its 8 retries
+and is dropped forever - keys never transmit again until a power cycle. **Distinguish it from
+rule 1:** with a dead SPI/ESB link the Consumer/media keys are dead too, and there is no nRF
+sleep blink. There is no SPI re-init / link watchdog in the firmware yet; only
+`spi_frames_lost` / `spi_miso_retries` record it.
+
+---
+
 ## Active Hardware Pinout & Wiring
 
 <p align="center">
