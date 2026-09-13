@@ -2028,35 +2028,18 @@ static void keyboard_led_toggle_on_press(
  * Never send SET_REPORT control transfers to the physical Sonix keyboard.
  * Keeping EP 0 quiet guarantees Endpoint 0x81 streams at 1000 Hz with
  * zero stalls, zero data-toggle collisions, and unlimited simultaneous keys. */
-/* KEYBOARD LED SYNC - DISABLED 2026-09-13.
- *
- * Root cause of the random "keyboard dies, media keys still work" freeze:
- * the one-shot SET_REPORT(Output, NumLock) below is issued ~300 ms AFTER
- * mount, i.e. while EP 0x81 is already streaming at 1 kHz. The Sonix SN32
- * accepts a control transfer on EP0 only while it is still idle during
- * enumeration; issued at runtime it poisons the keyboard's EP1, which then
- * tolerates up to 3 simultaneous keys and freezes permanently on a >=4-key
- * rollover burst (the reported "AWDVA" case). Symptom fit is exact: only
- * the keyboard endpoint dies, the Consumer/media endpoint keeps working,
- * and there is no recovery in this firmware (CLEAR_FEATURE is dead code -
- * keyboard_halt_recovery_pending is only ever assigned false - and
- * pio_usb_host_endpoint_reset_toggle() returns early whenever EP1 already
- * has a transfer armed).
- *
- * This kick is also redundant: the Sonix MCU lights NumLock ON by itself at
- * power-up. Set to 1 only for deliberate LED experiments, never in a daily
- * build. With 0 the rest of this function is unreachable but still compiled,
- * so no helper loses its last reference (-Wunused-function stays quiet). */
-#define KEYBOARD_LED_SYNC_ENABLED 0
-
+/* One-shot boot kick: 300 ms after the keyboard mounts (all keys released,
+ * EP0 idle), send a single SET_REPORT(Output) with NumLock ON so the Sonix
+ * MCU lights the physical LED. EP1 toggle is reset host-side after the
+ * transfer completes (the CLEAR_FEATURE recovery pattern), which realigns
+ * the IN data toggle in case the SN32 restarts its toggle on control
+ * transfers. Nothing else is ever sent on EP0 at runtime. */
 static uint32_t keyboard_led_boot_kick_ms;
 static bool     keyboard_led_boot_kick_done;
 
 static void keyboard_led_task(void)
 {
     keyboard_led_update_pending = false;
-
-    if (!KEYBOARD_LED_SYNC_ENABLED) return;
 
     if (!kbd_is_mounted || keyboard_led_boot_kick_done) return;
 
