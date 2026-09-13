@@ -38,7 +38,7 @@ This firmware is part of the 3-tier custom wireless keyboard project:
    - After 5 minutes of idle time with all keys released, queues `LINK_CONTROL_SYSTEM_OFF` to place the transmitter into $0.5\ \mu A$ deep sleep, signaled by 4 blue LED pulses.
    - First physical keypress wakes the transmitter via active-low CSN pulse without losing the wake-up key stroke.
 5. **Dual-Bank 4MB Wireless OTA DFU**:
-   - Integrated dual-bank flash partition layout with 32-bit CRC32 verification and hardware target locks for over-the-air firmware updates via `flash_ota.exe`.
+   - Integrated dual-bank flash partition layout with 32-bit CRC32 verification and hardware target locks for over-the-air firmware updates via `tools/FLASH_OTA.exe`.
 
 ---
 

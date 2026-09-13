@@ -47,8 +47,9 @@ Acest document descrie arhitectura, modificările realizate, uneltele de compila
 1. **`tools/flash_ota.py`:**
    - Suport nativ Windows 64-bit prin `ctypes` (`SetupDi*` APIs, structuri cu aliniere strictă).
    - Setare precizie temporizator sistem la 1 ms (`timeBeginPeriod(1)`).
-2. **`tools/flash_ota.cpp` & `tools/flash_ota.exe`:**
-   - Flasher nativ Win32 C++ de mare viteză.
+2. **`tools/flash_ota_gui.py` -> `tools/FLASH_OTA.exe` (GUI) & `tools/flash_ota_cmd.py` -> `tools/flash_ota_cmd.exe` (CLI):**
+   - Flasher protocol v2 (i18n EN/RU/RO), construit cu `tools/build_ota_flasher.ps1`.
+   - Flasherul nativ C++ vechi (`tools/flash_ota.cpp` / `flash_ota.exe`) a fost eliminat; nu exista script de build pentru el.
 3. **`tools/probe_ota_link.exe`:**
    - Utilitar rapid pentru diagnosticarea și verificarea stării de funcționare a conexiunii radio.
 
@@ -83,8 +84,11 @@ west build -b nrf52840dongle_nrf52840
 # Varianta Python:
 & "$env:USERPROFILE\.pico-sdk\python\3.13.7\python.exe" tools/flash_ota.py firmware/WirelessKeyboard_OTA.wkota
 
-# Varianta C++ nativă:
-& "C:\Users\Monard\Raspberry\WirelessKeyboard\tools\flash_ota.exe" "firmware\WirelessKeyboard_OTA.wkota"
+# Varianta GUI (recomandata, protocol v2):
+& "C:\Users\Monard\Raspberry\WirelessKeyboard\tools\FLASH_OTA.exe"
+
+# Varianta CLI (protocol v2):
+& "C:\Users\Monard\Raspberry\WirelessKeyboard\tools\flash_ota_cmd.exe" "firmware\WirelessKeyboard_OTA.wkota"
 ```
 
 ---

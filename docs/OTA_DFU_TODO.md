@@ -17,7 +17,7 @@ This document tracks the implementation status and future roadmap for Over-The-A
 - [x] **Full 32-bit CRC32 verification** (replaces the earlier 24-bit truncated compare) **plus on-device vector validation**: the staged image's stack pointer must be in SRAM and its Thumb reset handler inside the active slot before ACTIVATE is possible. Target/protocol/board lock on START, CRC and package header (`WKRPOTA1`, board `0x2040`).
 - [x] **Watchdog-safe flash windows**: staging erase chunked per 4 kB sector inside `flash_safe_execute` with the watchdog fed between chunks; streaming programs one 256-byte page per window; the final slot swap runs on core 0 after resetting core 1 in the documented direction (`dfu_apply_and_reboot`, never returns).
 - [x] **OTA radio discovery**: DFU traffic refreshes radio activity, and while the radio is in System OFF the RP2040 issues 30 s wake requests so `flash_ota` can start a session against a sleeping keyboard; `spi_ack_poll_task` pumps reverse ACKs at 1 ms during sessions (1 s idle, 20 ms input quiet guard, separate control sequence namespace).
-- [x] **Target-locked packages & native tool**: `tools/make_ota_package.py` builds `.wkota` packages (header + payload CRC32, vector validation); `tools/flash_ota.exe` (rebuilt via `tools/build_flash_ota.ps1`) drives the strict flow and confirms the exact package CRC32 through the post-reboot BOOT_OK metadata self-report.
+- [x] **Target-locked packages & native tool**: `tools/make_ota_package.py` builds `.wkota` packages (header + payload CRC32, vector validation); `tools/FLASH_OTA.exe` / `tools/flash_ota_cmd.exe` (rebuilt via `tools/build_ota_flasher.ps1`) drive the strict flow and confirm the exact package CRC32 through the post-reboot BOOT_OK metadata self-report.
 - [x] **RAM Flash Swap & Watchdog Reboot**: Resident `dfu_apply_and_reboot()` in RAM erases Slot A, copies verified binary from Slot B into Slot A, and resets RP2040.
 - [x] **Null Movement & Zero Duplicate Fix**: Snap Tap (SOCD Last Win) and 500ms keepalive deduplication integrated.
 
@@ -54,12 +54,12 @@ Enable complete over-the-air firmware upgrades for the **nRF52840 Transmitter** 
 - [ ] **Image Validation & Failsafe Boot**:
   - Compute CRC32 / SHA-256 over received Transmitter image.
   - Implement MCUboot test-mode or direct flash swap with Watchdog fallback in case of corrupted image.
-- [ ] **Windows Flashing Tool (`tools/flash_ota.exe`) Integration**:
+- [ ] **Windows Flashing Tool (`tools/flash_ota_cmd.exe`) Integration**:
   - Add CLI target selection flags:
     ```powershell
     # Flash RP2040 Host:
-    .\tools\flash_ota.exe --target rp2040 firmware\WirelessKeyboard_OTA.bin
+    .\tools\flash_ota_cmd.exe --target rp2040 firmware\WirelessKeyboard_OTA.bin
 
     # Flash nRF52840 Transmitter:
-    .\tools\flash_ota.exe --target transmitter firmware\transmitter_OTA.bin
+    .\tools\flash_ota_cmd.exe --target transmitter firmware\transmitter_OTA.bin
     ```
