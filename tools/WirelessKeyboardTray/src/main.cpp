@@ -14,6 +14,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <ctime>
 #include <cwchar>
 #include <new>
 #include <string>
@@ -44,11 +45,53 @@ constexpr USHORT kReceiverPid = 0x0001;
 constexpr USAGE kBatteryUsagePage = 0xFF00;
 constexpr USAGE kBatteryUsage = 0x0001;
 constexpr uint8_t kBatteryReportId = 3;
-constexpr size_t kBatteryPayloadLength = 8;
+constexpr size_t kBatteryPayloadLength = 10;   /* pct,state,mV[2],seq,flags,age[2],eta[2] */
 constexpr size_t kBatteryReportLength = 1 + kBatteryPayloadLength;
+/* Older Receiver firmware exposes 9 bytes (8-byte payload) without the ETA
+ * fields. Accept both so a firmware rollback or a not-yet-flashed dongle still
+ * shows percentage/voltage and falls back to the local estimator. */
+constexpr size_t kBatteryReportLengthLegacy = 9;
+constexpr size_t kBatteryReportLengthMin = kBatteryReportLengthLegacy;
+constexpr uint8_t kFlagTelemetryValid = 0x01;
+constexpr uint8_t kFlagEtaValid = 0x04;
+constexpr uint16_t kEtaUnknown = 0xFFFF;
 constexpr DWORD kPollIntervalMs = 5000;
 constexpr DWORD kTimerToleranceMs = 5000;
 constexpr uint16_t kStaleAfterSeconds = 120;
+
+/* Per-user cache of the last known countdown so the popup shows a number the
+ * instant the app starts, before the Receiver has handed us fresh telemetry. */
+constexpr wchar_t kCacheKeyPath[] = L"Software\\WirelessKeyboardTray";
+constexpr wchar_t kCacheValueEta[] = L"LastEtaMinutes";
+constexpr wchar_t kCacheValuePct[] = L"LastEtaPercent";
+constexpr wchar_t kCacheValueAge[] = L"LastEtaSavedAt";
+
+/* --- Discharge ETA estimator ----------------------------------------
+ * The Receiver cache exposes a 1 %-quantised percentage and a 1 mV
+ * voltage; the tray samples both every kPollIntervalMs. The estimator
+ * fits the millivolt decay and extrapolates the time left until the
+ * reading reaches the firmware's 0 % reference (kFirmwareBattMinMv).
+ *
+ * The millivolt signal is used instead of the percentage because it has
+ * 11x finer resolution (1 % = kMvPerPercent mV). Voltage is a *state*,
+ * not a flow, so the slope must be measured robustly: a load step sags the
+ * cell by tens of millivolts and recovers, which a raw first/last sample
+ * difference would read as a huge fake discharge rate. Median blocks are
+ * therefore used at both ends of the window.
+ */
+constexpr ULONGLONG kSampleGapResetMs = 6ull * 60ull * 60ull * 1000ull;  /* only a pathological gap voids the window */
+constexpr ULONGLONG kRateWindowMs = 60ull * 60ull * 1000ull;      /* widest look-back */
+constexpr ULONGLONG kMinRateElapsedMs = 5ull * 60ull * 1000ull;   /* min span before a rate is reported */
+constexpr double kEstimatorMinDropMv = 5.0;    /* ~0.4 % of the 3050..4190 mV scale */
+constexpr double kChargeRiseResetMv = 25.0;    /* a rise this large means charging was missed */
+constexpr uint32_t kFirmwareBattMinMv = 3050;  /* mirrors BATT_MIN_MV in WirelessKeyboard.c */
+constexpr uint32_t kFirmwareBattMaxMv = 4190;  /* mirrors BATT_MAX_MV in WirelessKeyboard.c */
+constexpr double kMvPerPercent =
+    (kFirmwareBattMaxMv - kFirmwareBattMinMv) / 100.0;   /* 11.4 mV per 1 % */
+constexpr size_t kDrainCapacity = 1024;        /* ~85 min of samples at a 5 s poll */
+constexpr size_t kRateSmoothingLen = 9;
+constexpr size_t kMedianWindowLen = 5;         /* 25 s median filter on raw mV */
+constexpr size_t kMedianHalfBlock = 4;         /* 20 s median per window endpoint */
 
 constexpr UINT kTrayCallbackMessage = WM_APP + 1;
 constexpr UINT kStatusMessage = WM_APP + 2;
@@ -77,7 +120,308 @@ struct BatterySnapshot {
     uint8_t sequence = 0;
     uint8_t flags = 0;
     uint16_t ageSeconds = 0;
+    uint16_t etaMinutes = kEtaUnknown;
+    bool etaValid = false;
     DWORD error = ERROR_SUCCESS;
+};
+
+struct DrainSample {
+    ULONGLONG timeMs = 0;
+    uint8_t percentage = 0;
+    uint16_t millivolts = 0;
+};
+
+enum class DrainConfidence {
+    None,
+    Low,
+    Medium,
+    High,
+};
+
+struct DrainEstimate {
+    bool valid = false;
+    bool voltageBased = true;
+    DrainConfidence confidence = DrainConfidence::None;
+    double percentPerMinute = 0.0;
+    double minutesRemaining = 0.0;
+    double millivoltsPerMinute = 0.0;
+    ULONGLONG windowMs = 0;
+    size_t sampleCount = 0;
+};
+
+struct TrayUpdate {
+    BatterySnapshot snapshot;
+    DrainEstimate estimate;
+};
+
+/* Sliding-window discharge estimator.
+ *
+ * Only Live telemetry in a discharging state feeds the window. A charge
+ * cycle clears it, and so does a sampling gap longer than
+ * kSampleGapResetMs, because those samples no longer describe one
+ * continuous discharge. A stale/offline receiver stops feeding the window
+ * but keeps the last estimate for display.
+ */
+class DrainEstimator {
+public:
+    DrainEstimate Update(BatterySnapshot const &snapshot, ULONGLONG nowMs)
+    {
+        bool const live = (snapshot.availability == Availability::Live);
+        bool const charging =
+            live && (snapshot.batteryState == 1 || snapshot.batteryState == 3);
+        bool const discharging =
+            live && (snapshot.batteryState == 0 || snapshot.batteryState == 2);
+
+        if (charging) {
+            /* A charge cycle invalidates the discharge history. */
+            Clear();
+            estimate_ = DrainEstimate{};
+            return estimate_;
+        }
+        if (!live) {
+            /* Receiver stale/offline: keep showing the last estimate. */
+            return estimate_;
+        }
+        if (!discharging) {
+            /* Unreported/unknown state: keep the window, do not feed it. */
+            return estimate_;
+        }
+
+        if (hasLastSample_ && (nowMs - lastSampleMs_) > kSampleGapResetMs) {
+            Clear();
+        }
+
+        /* A rise this large over a full sampling gap means a charge cycle
+         * happened while we were not looking; stored history is not one
+         * continuous discharge any more. */
+        if (count_ > 0 &&
+            static_cast<int32_t>(snapshot.millivolts) -
+                static_cast<int32_t>(MedianMillivolts()) >
+                static_cast<int32_t>(kChargeRiseResetMv)) {
+            Clear();
+        }
+
+        DrainSample sample{};
+        sample.timeMs = nowMs;
+        sample.percentage = snapshot.percentage;
+        sample.millivolts = snapshot.millivolts;
+        Push(sample);
+        lastSampleMs_ = nowMs;
+        hasLastSample_ = true;
+        AppendMedian(sample.millivolts);
+
+        double ratePerMinute = 0.0;
+        double mvPerMinute = 0.0;
+        if (ComputeWindowRate(ratePerMinute, mvPerMinute)) {
+            PushRate(ratePerMinute);
+            double const smoothed = MedianRate();
+            double const mvSmoothed =
+                smoothed <= 0.0 ? 0.0 : smoothed * kMvPerPercent;
+            estimate_.valid = smoothed > 0.0;
+            estimate_.percentPerMinute = smoothed;
+            estimate_.millivoltsPerMinute = mvSmoothed;
+            /* Extrapolate from the least noisy endpoint: the median of the
+             * newest block, not the raw instantaneous reading. */
+            double const fromMv =
+                static_cast<double>(MedianMillivolts()) -
+                static_cast<double>(kFirmwareBattMinMv);
+            double const pctEquivalent =
+                fromMv > 0.0 ? fromMv / kMvPerPercent :
+                               static_cast<double>(snapshot.percentage);
+            estimate_.minutesRemaining =
+                smoothed > 0.0 ? pctEquivalent / smoothed : 0.0;
+            estimate_.confidence = Classify();
+        } else {
+            estimate_.valid = false;
+            estimate_.percentPerMinute = 0.0;
+            estimate_.millivoltsPerMinute = 0.0;
+            estimate_.minutesRemaining = 0.0;
+            estimate_.confidence = DrainConfidence::None;
+        }
+        estimate_.windowMs = WindowMs();
+        estimate_.sampleCount = count_;
+        return estimate_;
+    }
+
+private:
+    DrainSample Sample(size_t indexFromOldest) const
+    {
+        size_t const start =
+            (head_ + kDrainCapacity - count_) % kDrainCapacity;
+        return history_[(start + indexFromOldest) % kDrainCapacity];
+    }
+
+    ULONGLONG WindowMs() const
+    {
+        if (count_ < 2) {
+            return 0;
+        }
+        return Sample(count_ - 1).timeMs - Sample(0).timeMs;
+    }
+
+    void Push(DrainSample const &sample)
+    {
+        history_[head_] = sample;
+        head_ = (head_ + 1) % kDrainCapacity;
+        if (count_ < kDrainCapacity) {
+            ++count_;
+        }
+    }
+
+    void Clear()
+    {
+        count_ = 0;
+        head_ = 0;
+        hasLastSample_ = false;
+        rateCount_ = 0;
+        rateHead_ = 0;
+        lastElapsedMs_ = 0;
+        medCount_ = 0;
+        medHead_ = 0;
+    }
+
+    /* Rolling median of the raw millivolt stream. A median filter removes the
+     * short sag/spike a keypress, radio burst or LED pulse puts on the cell,
+     * which is exactly the artefact that made the old first/last estimator
+     * report a wildly wrong rate. */
+    void AppendMedian(uint16_t millivolts)
+    {
+        medWindow_[medHead_] = millivolts;
+        medHead_ = (medHead_ + 1) % kMedianWindowLen;
+        if (medCount_ < kMedianWindowLen) {
+            ++medCount_;
+        }
+    }
+
+    uint16_t MedianMillivolts() const
+    {
+        if (medCount_ == 0) {
+            return static_cast<uint16_t>(kFirmwareBattMinMv);
+        }
+        std::array<uint16_t, kMedianWindowLen> sorted{};
+        for (size_t i = 0; i < medCount_; ++i) {
+            sorted[i] = medWindow_[i];
+        }
+        std::sort(sorted.begin(), sorted.begin() + medCount_);
+        return sorted[medCount_ / 2];
+    }
+
+    double MedianOfSamples(size_t from, size_t toExclusive) const
+    {
+        size_t const span = toExclusive - from;
+        if (span == 0) {
+            return 0.0;
+        }
+        std::array<double, kMedianHalfBlock> block{};
+        size_t n = span < kMedianHalfBlock ? span : kMedianHalfBlock;
+        for (size_t i = 0; i < n; ++i) {
+            block[i] = static_cast<double>(Sample(from + i).millivolts);
+        }
+        std::sort(block.begin(), block.begin() + n);
+        return block[n / 2];
+    }
+
+    bool ComputeWindowRate(double &ratePerMinute, double &mvPerMinute)
+    {
+        if (count_ < kMedianHalfBlock * 2) {
+            return false;
+        }
+
+        /* Window = the most recent samples that fit kRateWindowMs. */
+        DrainSample const newest = Sample(count_ - 1);
+        size_t index = count_ - 1;
+        while (index > 0 &&
+               (newest.timeMs - Sample(index - 1).timeMs) <= kRateWindowMs) {
+            --index;
+        }
+
+        size_t const span = count_ - index;
+        size_t const blockLen =
+            (span / 2) < kMedianHalfBlock ? (span / 2) : kMedianHalfBlock;
+        if (blockLen == 0) {
+            return false;
+        }
+
+        size_t const oldestBlockBegin = index;
+        size_t const oldestBlockEnd = index + blockLen;
+        size_t const newestBlockBegin = count_ - blockLen;
+        size_t const newestBlockEnd = count_;
+
+        double const oldestMv = MedianOfSamples(oldestBlockBegin, oldestBlockEnd);
+        double const newestMv = MedianOfSamples(newestBlockBegin, newestBlockEnd);
+
+        /* Time span between the *centres* of the two blocks. */
+        ULONGLONG const oldestCentre = Sample(oldestBlockBegin + blockLen / 2).timeMs;
+        ULONGLONG const newestCentre = Sample(newestBlockBegin + blockLen / 2).timeMs;
+        if (newestCentre <= oldestCentre) {
+            return false;
+        }
+        ULONGLONG const elapsedMs = newestCentre - oldestCentre;
+        lastElapsedMs_ = elapsedMs;
+        if (elapsedMs < kMinRateElapsedMs) {
+            return false;
+        }
+
+        double const dropMv = oldestMv - newestMv;
+        if (dropMv < kEstimatorMinDropMv) {
+            return false;
+        }
+
+        double const elapsedMinutes = static_cast<double>(elapsedMs) / 60000.0;
+        mvPerMinute = dropMv / elapsedMinutes;
+        ratePerMinute = (mvPerMinute / kMvPerPercent);
+        return ratePerMinute > 0.0;
+    }
+
+    DrainConfidence Classify() const
+    {
+        if (lastElapsedMs_ >= 30ull * 60ull * 1000ull) {
+            return DrainConfidence::High;
+        }
+        if (lastElapsedMs_ >= kMinRateElapsedMs) {
+            return DrainConfidence::Medium;
+        }
+        return DrainConfidence::Low;
+    }
+
+    void PushRate(double rate)
+    {
+        rateHistory_[rateHead_] = rate;
+        rateHead_ = (rateHead_ + 1) % kRateSmoothingLen;
+        if (rateCount_ < kRateSmoothingLen) {
+            ++rateCount_;
+        }
+    }
+
+    double MedianRate() const
+    {
+        if (rateCount_ == 0) {
+            return 0.0;
+        }
+        std::array<double, kRateSmoothingLen> sorted{};
+        for (size_t i = 0; i < rateCount_; ++i) {
+            sorted[i] = rateHistory_[i];
+        }
+        std::sort(sorted.begin(), sorted.begin() + rateCount_);
+        return sorted[rateCount_ / 2];
+    }
+
+    std::array<DrainSample, kDrainCapacity> history_{};
+    size_t count_ = 0;
+    size_t head_ = 0;
+    ULONGLONG lastSampleMs_ = 0;
+    ULONGLONG lastElapsedMs_ = 0;
+    bool hasLastSample_ = false;
+
+    std::array<uint16_t, kMedianWindowLen> medWindow_{};
+    size_t medCount_ = 0;
+    size_t medHead_ = 0;
+
+    std::array<double, kRateSmoothingLen> rateHistory_{};
+    size_t rateCount_ = 0;
+    size_t rateHead_ = 0;
+
+    DrainEstimate estimate_{};
 };
 
 struct PopupColors {
@@ -118,6 +462,31 @@ HICON gCurrentIcon = nullptr;
 UINT gTaskbarCreatedMessage = 0;
 volatile LONG gDeviceEpoch = 0;
 BatterySnapshot gLastSnapshot{};
+size_t gBatteryReportLength = kBatteryReportLengthMin;
+DrainEstimator gDrainEstimator;
+DrainEstimate gLastEstimate{};
+
+/* Last countdown persisted in HKCU, shown while the Receiver warms up. */
+struct EtaCache {
+    bool valid = false;
+    uint16_t minutes = 0;
+    uint8_t percent = 0;
+    uint32_t savedAtUnix = 0;
+};
+
+EtaCache gEtaCache{};
+enum class EtaSource {
+    None,
+    Receiver,
+    Local,
+    Cached,
+};
+
+struct EtaView {
+    bool valid = false;
+    EtaSource source = EtaSource::None;
+    double minutes = 0.0;
+};
 
 bool gIsRefreshing = false;
 int gHoverItem = -1;
@@ -247,6 +616,79 @@ bool SetAutostartEnabled(bool enabled)
         SetLastError(static_cast<DWORD>(result));
         return false;
     }
+    return true;
+}
+
+/* Persist the newest usable countdown so a later start (or a PC/Dongle power
+ * cycle) still shows a number instead of an empty "estimating" state. */
+bool SaveEtaCache(uint16_t minutes, uint8_t percent)
+{
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kCacheKeyPath, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key,
+                        nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    DWORD const eta = static_cast<DWORD>(minutes);
+    DWORD const pct = static_cast<DWORD>(percent);
+    DWORD const savedAt = static_cast<DWORD>(std::time(nullptr));
+
+    LONG result = RegSetValueExW(
+        key, kCacheValueEta, 0, REG_DWORD,
+        reinterpret_cast<BYTE const *>(&eta), sizeof(eta));
+    if (result == ERROR_SUCCESS) {
+        result = RegSetValueExW(
+            key, kCacheValuePct, 0, REG_DWORD,
+            reinterpret_cast<BYTE const *>(&pct), sizeof(pct));
+    }
+    if (result == ERROR_SUCCESS) {
+        result = RegSetValueExW(
+            key, kCacheValueAge, 0, REG_DWORD,
+            reinterpret_cast<BYTE const *>(&savedAt), sizeof(savedAt));
+    }
+
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS;
+}
+
+bool LoadEtaCache()
+{
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kCacheKeyPath, 0, KEY_QUERY_VALUE,
+                      &key) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    DWORD minutes = 0;
+    DWORD percent = 0;
+    DWORD savedAt = 0;
+    DWORD type = REG_DWORD;
+    DWORD size = sizeof(DWORD);
+
+    bool ok = RegQueryValueExW(key, kCacheValueEta, nullptr, &type,
+                               reinterpret_cast<LPBYTE>(&minutes),
+                               &size) == ERROR_SUCCESS && type == REG_DWORD;
+    type = REG_DWORD;
+    size = sizeof(DWORD);
+    ok = ok && RegQueryValueExW(key, kCacheValuePct, nullptr, &type,
+                                reinterpret_cast<LPBYTE>(&percent),
+                                &size) == ERROR_SUCCESS && type == REG_DWORD;
+    type = REG_DWORD;
+    size = sizeof(DWORD);
+    ok = ok && RegQueryValueExW(key, kCacheValueAge, nullptr, &type,
+                                reinterpret_cast<LPBYTE>(&savedAt),
+                                &size) == ERROR_SUCCESS && type == REG_DWORD;
+
+    RegCloseKey(key);
+    if (!ok || minutes == 0 || minutes > 0xFFFFu) {
+        return false;
+    }
+
+    gEtaCache.valid = true;
+    gEtaCache.minutes = static_cast<uint16_t>(minutes);
+    gEtaCache.percent = static_cast<uint8_t>(percent > 100u ? 100u : percent);
+    gEtaCache.savedAtUnix = savedAt;
     return true;
 }
 
@@ -556,9 +998,15 @@ wchar_t const *BatteryStateName(uint8_t state)
     }
 }
 
+std::wstring BuildTooltip(BatterySnapshot const &snapshot);
+bool IsCountdownApplicable(BatterySnapshot const &snapshot);
+bool FormatCountdown(wchar_t *out, size_t outCount);
+EtaView ResolveEta(BatterySnapshot const &snapshot);
+bool FormatEtaMinutes(wchar_t *out, size_t outCount, double minutes);
+
 std::wstring BuildTooltip(BatterySnapshot const &snapshot)
 {
-    wchar_t text[128]{};
+    wchar_t text[192]{};
     switch (snapshot.availability) {
     case Availability::Offline:
         return L"Wireless Keyboard: Receiver offline";
@@ -578,6 +1026,17 @@ std::wstring BuildTooltip(BatterySnapshot const &snapshot)
             BatteryStateName(snapshot.batteryState),
             snapshot.availability == Availability::Live ? L"LIVE" : L"STALE",
             static_cast<unsigned>(snapshot.ageSeconds));
+        if (IsCountdownApplicable(snapshot)) {
+            EtaView const view = ResolveEta(snapshot);
+            wchar_t body[48]{};
+            if (view.valid &&
+                FormatEtaMinutes(body, std::size(body), view.minutes)) {
+                std::wstring combined = text;
+                combined += L" | ";
+                combined += body;
+                return combined;
+            }
+        }
         return text;
     }
     return kAppName;
@@ -590,6 +1049,104 @@ void CopyTooltip(std::wstring const &tooltip)
     gNotifyIcon.szTip[std::size(gNotifyIcon.szTip) - 1] = L'\0';
 }
 
+wchar_t const *DrainConfidenceName(DrainConfidence confidence, bool voltageBased)
+{
+    if (voltageBased) {
+        return L"voltage slope";
+    }
+    switch (confidence) {
+    case DrainConfidence::High:
+        return L"high";
+    case DrainConfidence::Medium:
+        return L"medium";
+    case DrainConfidence::Low:
+        return L"low";
+    case DrainConfidence::None:
+    default:
+        return L"none";
+    }
+}
+
+bool IsCountdownApplicable(BatterySnapshot const &snapshot)
+{
+    return (snapshot.availability == Availability::Live ||
+            snapshot.availability == Availability::Stale) &&
+           (snapshot.batteryState == 0 || snapshot.batteryState == 2);
+}
+
+/*
+ * Countdown priority, so the popup always shows a number instead of a bare
+ * "estimating" state:
+ *   1. the Ready-made ETA the Receiver computed from its own continuous
+ *      history (available the instant the tray starts);
+ *   2. the local estimator, when it has a valid slope of its own;
+ *   3. the last countdown persisted in HKCU, marked as last known, while the
+ *      Receiver has not produced fresh telemetry yet (PC/Dongle power cycle).
+ */
+EtaView ResolveEta(BatterySnapshot const &snapshot)
+{
+    EtaView view{};
+
+    if (snapshot.etaValid && snapshot.availability == Availability::Live) {
+        view.valid = true;
+        view.source = EtaSource::Receiver;
+        view.minutes = static_cast<double>(snapshot.etaMinutes);
+        return view;
+    }
+
+    if (gLastEstimate.valid) {
+        view.valid = true;
+        view.source = EtaSource::Local;
+        view.minutes = gLastEstimate.minutesRemaining;
+        return view;
+    }
+
+    if (gEtaCache.valid) {
+        view.valid = true;
+        view.source = EtaSource::Cached;
+        view.minutes = static_cast<double>(gEtaCache.minutes);
+        return view;
+    }
+
+    return view;
+}
+
+/* "24 h 14 min", "45 min" or "< 10 min". */
+bool FormatEtaMinutes(wchar_t *out, size_t outCount, double minutes)
+{
+    if (out == nullptr || outCount == 0) {
+        return false;
+    }
+    if (!(minutes > 0.0) || minutes > 60.0 * 48.0) {
+        return false;
+    }
+    if (minutes < 10.0) {
+        std::swprintf(out, outCount, L"< 10 min");
+        return true;
+    }
+    unsigned const totalMinutes = static_cast<unsigned>(minutes + 0.5);
+    unsigned const hours = totalMinutes / 60u;
+    unsigned const mins = totalMinutes % 60u;
+    if (hours == 0u) {
+        std::swprintf(out, outCount, L"%u min", mins);
+    } else if (mins == 0u) {
+        std::swprintf(out, outCount, L"%u h", hours);
+    } else {
+        std::swprintf(out, outCount, L"%u h %u min", hours, mins);
+    }
+    return true;
+}
+
+/* Suffix describing where the number came from. */
+bool FormatCountdown(wchar_t *out, size_t outCount)
+{
+    EtaView const view = ResolveEta(gLastSnapshot);
+    if (!view.valid) {
+        return false;
+    }
+    return FormatEtaMinutes(out, outCount, view.minutes);
+}
+
 PopupLayout ComputeLayout(BatterySnapshot const &snapshot,
                          PopupColors const &colors, UINT dpi)
 {
@@ -600,8 +1157,9 @@ PopupLayout ComputeLayout(BatterySnapshot const &snapshot,
     int const lineHeight = ScaleDpi(20, dpi);
     int const itemHeight = ScaleDpi(30, dpi);
     int const sideMargin = ScaleDpi(5, dpi);
+    int const titleTop = y;
 
-    l.titleRect = {sidePad, y, l.width - sidePad, y + ScaleDpi(18, dpi)};
+    /* The title rect is filled in below, once the width is known. */
     y += ScaleDpi(20, dpi);
 
     wchar_t text[128]{};
@@ -629,6 +1187,27 @@ PopupLayout ComputeLayout(BatterySnapshot const &snapshot,
         std::swprintf(text, std::size(text), L"State: %ls",
                       BatteryStateName(snapshot.batteryState));
         l.telemetryLines.push_back({text, colors.textPrimary});
+        /* Time Remaining is always shown, exactly like the other fields, so the
+         * popup never grows or shrinks a line depending on estimator state.
+         * The number itself comes from the Receiver first, then the local
+         * estimator, then the value persisted in HKCU. */
+        if (snapshot.batteryState == 1 || snapshot.batteryState == 3) {
+            l.telemetryLines.push_back(
+                {L"Time Remaining: Charging", colors.textPrimary});
+        } else {
+            EtaView const view = ResolveEta(snapshot);
+            wchar_t body[48]{};
+            if (view.valid &&
+                FormatEtaMinutes(body, std::size(body), view.minutes)) {
+                std::swprintf(text, std::size(text),
+                              L"Time Remaining: %ls", body);
+                l.telemetryLines.push_back({text, colors.textPrimary});
+            } else {
+                l.telemetryLines.push_back(
+                    {L"Time Remaining: Calculating...", colors.textPrimary});
+            }
+        }
+
         std::swprintf(text, std::size(text), L"Telemetry: %ls, age %u s",
                       snapshot.availability == Availability::Live ?
                           L"LIVE" : L"STALE",
@@ -637,8 +1216,69 @@ PopupLayout ComputeLayout(BatterySnapshot const &snapshot,
         std::swprintf(text, std::size(text), L"Sequence: %u",
                       static_cast<unsigned>(snapshot.sequence));
         l.telemetryLines.push_back({text, colors.textSecondary});
+
+        /* Rate detail while the local estimator is the one producing numbers. */
+        if ((snapshot.batteryState == 0 || snapshot.batteryState == 2) &&
+            gLastEstimate.valid) {
+            double const windowMinutes =
+                static_cast<double>(gLastEstimate.windowMs) / 60000.0;
+            std::swprintf(
+                text, std::size(text),
+                L"Rate: %.1f %%/h (%.1f mV/h) over %.0f min",
+                gLastEstimate.percentPerMinute * 60.0,
+                gLastEstimate.millivoltsPerMinute * 60.0, windowMinutes);
+            l.telemetryLines.push_back({text, colors.textSecondary});
+        }
         break;
     }
+
+    /*
+     * Widen the popup so the longest telemetry line always fits. The labels and
+     * the countdown vary in length ("Time remaining: calculating..." versus
+     * "Time remaining: 24 h 14 min"), and a fixed width clipped them.
+     */
+    {
+        HDC const screen = GetDC(nullptr);
+
+        if (screen != nullptr) {
+            int const fontHeight =
+                -MulDiv(9, static_cast<int>(dpi), 72);
+            HFONT const font = CreateFontW(
+                fontHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+            HGDIOBJ const previous = SelectObject(screen, font);
+            int widest = 0;
+
+            auto measure = [&](wchar_t const *line) {
+                SIZE size{};
+                if (GetTextExtentPoint32W(screen, line,
+                                          static_cast<int>(std::wcslen(line)),
+                                          &size)) {
+                    widest = std::max(widest, static_cast<int>(size.cx));
+                }
+            };
+
+            measure(kAppName);
+            for (auto const &line : l.telemetryLines) {
+                measure(line.first.c_str());
+            }
+
+            SelectObject(screen, previous);
+            DeleteObject(font);
+            ReleaseDC(nullptr, screen);
+
+            if (widest > 0) {
+                int const required = widest + sidePad * 2;
+                if (required > l.width) {
+                    l.width = required;
+                }
+            }
+        }
+    }
+
+    l.titleRect = {sidePad, titleTop, l.width - sidePad,
+                   titleTop + ScaleDpi(18, dpi)};
 
     y += static_cast<int>(l.telemetryLines.size()) * lineHeight +
          ScaleDpi(6, dpi);
@@ -674,6 +1314,23 @@ void UpdateTray(BatterySnapshot const &snapshot)
 
     gLastSnapshot = snapshot;
     gIsRefreshing = false;
+
+    /* Keep the persisted countdown fresh whenever a fresh number exists.
+     * Re-saving the cached value would refresh its timestamp without new
+     * information, so only Receiver/local results are written back. */
+    EtaView const view = ResolveEta(snapshot);
+    if (view.valid && view.source != EtaSource::Cached &&
+        view.minutes >= 1.0) {
+        uint16_t const minutes = static_cast<uint16_t>(
+            view.minutes > 65534.0 ? 65534.0 : view.minutes + 0.5);
+        if (minutes != gEtaCache.minutes || !gEtaCache.valid) {
+            if (SaveEtaCache(minutes, snapshot.percentage)) {
+                gEtaCache.valid = true;
+                gEtaCache.minutes = minutes;
+                gEtaCache.percent = snapshot.percentage;
+            }
+        }
+    }
 
     if (gPopupWindow != nullptr && IsWindowVisible(gPopupWindow)) {
         UINT const dpi = GetWindowDpi(gPopupWindow);
@@ -730,7 +1387,7 @@ void RemoveTrayIcon()
     gCurrentIcon = nullptr;
 }
 
-bool IsBatteryCollection(HANDLE handle)
+bool IsBatteryCollection(HANDLE handle, size_t *reportLength)
 {
     HIDD_ATTRIBUTES attributes{};
     attributes.Size = sizeof(attributes);
@@ -748,10 +1405,16 @@ bool IsBatteryCollection(HANDLE handle)
     HIDP_CAPS caps{};
     NTSTATUS const status = HidP_GetCaps(preparsed, &caps);
     HidD_FreePreparsedData(preparsed);
-    return status == HIDP_STATUS_SUCCESS &&
-           caps.UsagePage == kBatteryUsagePage &&
-           caps.Usage == kBatteryUsage &&
-           caps.FeatureReportByteLength >= kBatteryReportLength;
+    if (status != HIDP_STATUS_SUCCESS ||
+        caps.UsagePage != kBatteryUsagePage ||
+        caps.Usage != kBatteryUsage ||
+        caps.FeatureReportByteLength < kBatteryReportLengthMin) {
+        return false;
+    }
+    if (reportLength != nullptr) {
+        *reportLength = caps.FeatureReportByteLength;
+    }
+    return true;
 }
 
 HANDLE OpenBatteryCollection()
@@ -799,7 +1462,7 @@ HANDLE OpenBatteryCollection()
         if (inspect == INVALID_HANDLE_VALUE) {
             continue;
         }
-        bool const matches = IsBatteryCollection(inspect);
+        bool const matches = IsBatteryCollection(inspect, &gBatteryReportLength);
         CloseHandle(inspect);
         if (!matches) {
             continue;
@@ -830,8 +1493,11 @@ BatterySnapshot ReadBattery(HANDLE handle)
     std::array<uint8_t, kBatteryReportLength> report{};
     report[0] = kBatteryReportId;
 
-    if (!HidD_GetFeature(handle, report.data(),
-                         static_cast<ULONG>(report.size()))) {
+    ULONG const requestLength = static_cast<ULONG>(
+        gBatteryReportLength <= kBatteryReportLength ?
+            gBatteryReportLength : kBatteryReportLength);
+
+    if (!HidD_GetFeature(handle, report.data(), requestLength)) {
         snapshot.availability = Availability::ReadError;
         snapshot.error = GetLastError();
         return snapshot;
@@ -845,8 +1511,21 @@ BatterySnapshot ReadBattery(HANDLE handle)
     snapshot.flags = report[6];
     snapshot.ageSeconds = static_cast<uint16_t>(report[7]) |
                           (static_cast<uint16_t>(report[8]) << 8U);
+    /* The ETA fields only exist on Receiver firmware that exposes the larger
+     * feature report; a legacy dongle simply leaves the countdown to the
+     * local estimator and the persisted value. */
+    if (requestLength >= kBatteryReportLength) {
+        snapshot.etaMinutes = static_cast<uint16_t>(report[9]) |
+                              (static_cast<uint16_t>(report[10]) << 8U);
+        snapshot.etaValid = (snapshot.flags & kFlagEtaValid) != 0 &&
+                            snapshot.etaMinutes != kEtaUnknown &&
+                            snapshot.etaMinutes > 0;
+    } else {
+        snapshot.etaMinutes = kEtaUnknown;
+        snapshot.etaValid = false;
+    }
 
-    if ((snapshot.flags & 0x01U) == 0) {
+    if ((snapshot.flags & kFlagTelemetryValid) == 0) {
         snapshot.availability = Availability::WaitingForTelemetry;
     } else if (snapshot.ageSeconds > kStaleAfterSeconds) {
         snapshot.availability = Availability::Stale;
@@ -856,15 +1535,15 @@ BatterySnapshot ReadBattery(HANDLE handle)
     return snapshot;
 }
 
-void PostSnapshot(BatterySnapshot const &snapshot)
+void PostSnapshot(BatterySnapshot const &snapshot, DrainEstimate const &estimate)
 {
-    auto *copy = new (std::nothrow) BatterySnapshot(snapshot);
-    if (copy == nullptr) {
+    auto *update = new (std::nothrow) TrayUpdate{snapshot, estimate};
+    if (update == nullptr) {
         return;
     }
     if (!PostMessageW(gWindow, kStatusMessage, 0,
-                      reinterpret_cast<LPARAM>(copy))) {
-        delete copy;
+                      reinterpret_cast<LPARAM>(update))) {
+        delete update;
     }
 }
 
@@ -901,7 +1580,9 @@ DWORD WINAPI WorkerMain(void *)
             battery = OpenBatteryCollection();
         }
         if (battery == INVALID_HANDLE_VALUE) {
-            PostSnapshot(BatterySnapshot{});
+            PostSnapshot(BatterySnapshot{}, gDrainEstimator.Update(
+                                               BatterySnapshot{},
+                                               GetTickCount64()));
             continue;
         }
 
@@ -915,7 +1596,8 @@ DWORD WINAPI WorkerMain(void *)
         }
 
         BatterySnapshot const snapshot = ReadBattery(battery);
-        PostSnapshot(snapshot);
+        PostSnapshot(snapshot,
+                     gDrainEstimator.Update(snapshot, GetTickCount64()));
         if (snapshot.availability == Availability::ReadError) {
             CloseHandle(battery);
             battery = INVALID_HANDLE_VALUE;
@@ -1293,10 +1975,13 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam,
         return 0;
     }
     case kStatusMessage: {
-        auto *snapshot = reinterpret_cast<BatterySnapshot *>(lParam);
-        if (snapshot != nullptr) {
-            UpdateTray(*snapshot);
-            delete snapshot;
+        auto *update = reinterpret_cast<TrayUpdate *>(lParam);
+        if (update != nullptr) {
+            /* Adopt the estimate that shipped with this snapshot before any
+             * tooltip or popup layout is rebuilt from it. */
+            gLastEstimate = update->estimate;
+            UpdateTray(update->snapshot);
+            delete update;
         }
         return 0;
     }
@@ -1380,6 +2065,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 
     gInstance = instance;
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+
+    /* Seed the countdown from the persisted value so the first tooltip already
+     * shows a number while the Receiver warms up. */
+    (void)LoadEtaCache();
 
     gSingleInstance = CreateMutexW(nullptr, FALSE, kSingleInstanceName);
     if (gSingleInstance == nullptr) {
