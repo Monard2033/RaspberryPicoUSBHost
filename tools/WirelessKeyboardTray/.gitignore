@@ -1,2 +1,5 @@
 *.o
 build/
+.buildtools/
+*.bak-*
+__pycache__/
