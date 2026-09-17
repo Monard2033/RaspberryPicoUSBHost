@@ -9,6 +9,13 @@ $distPath = Join-Path $projectRoot 'dist'
 $resObjPath = Join-Path $distPath 'resources.o'
 $outputPath = Join-Path $distPath 'WirelessKeyboardTray.exe'
 
+$toolsDevkit = Join-Path $projectRoot '..\w64devkit'
+$toolsZip = Join-Path $projectRoot '..\w64devkit.zip'
+if (-not (Test-Path -LiteralPath "$toolsDevkit\bin\g++.exe") -and (Test-Path -LiteralPath $toolsZip)) {
+    Write-Output "Extracting toolchain from w64devkit.zip..."
+    tar.exe -xf $toolsZip -C (Join-Path $projectRoot '..')
+}
+
 $compiler = Get-Command 'g++.exe' -ErrorAction SilentlyContinue
 if ($null -eq $compiler) {
     $toolsCompiler = Join-Path $projectRoot '..\w64devkit\bin\g++.exe'
