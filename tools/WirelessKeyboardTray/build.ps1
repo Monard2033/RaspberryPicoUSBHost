@@ -11,8 +11,11 @@ $outputPath = Join-Path $distPath 'WirelessKeyboardTray.exe'
 
 $compiler = Get-Command 'g++.exe' -ErrorAction SilentlyContinue
 if ($null -eq $compiler) {
+    $toolsCompiler = Join-Path $projectRoot '..\w64devkit\bin\g++.exe'
     $fallbackCompiler = 'C:\ProgramData\mingw64\mingw64\bin\g++.exe'
-    if (Test-Path -LiteralPath $fallbackCompiler) {
+    if (Test-Path -LiteralPath $toolsCompiler) {
+        $compiler = Get-Item -LiteralPath $toolsCompiler
+    } elseif (Test-Path -LiteralPath $fallbackCompiler) {
         $compiler = Get-Item -LiteralPath $fallbackCompiler
     } else {
         throw 'g++.exe was not found. Install an x64 MinGW-w64 toolchain or add it to PATH.'
@@ -21,22 +24,33 @@ if ($null -eq $compiler) {
 
 $windres = Get-Command 'windres.exe' -ErrorAction SilentlyContinue
 if ($null -eq $windres) {
+    $toolsWindres = Join-Path $projectRoot '..\w64devkit\bin\windres.exe'
     $fallbackWindres = 'C:\ProgramData\mingw64\mingw64\bin\windres.exe'
-    if (Test-Path -LiteralPath $fallbackWindres) {
+    if (Test-Path -LiteralPath $toolsWindres) {
+        $windres = Get-Item -LiteralPath $toolsWindres
+    } elseif (Test-Path -LiteralPath $fallbackWindres) {
         $windres = Get-Item -LiteralPath $fallbackWindres
     }
 }
 
+$compilerPath = if ($compiler -is [System.IO.FileInfo]) { $compiler.FullName } else { $compiler.Source }
+$windresPath = if ($null -ne $windres) { if ($windres -is [System.IO.FileInfo]) { $windres.FullName } else { $windres.Source } } else { $null }
+
+$compilerDir = Split-Path -Parent $compilerPath
+if ($env:PATH -notlike "*$compilerDir*") {
+    $env:PATH = "$compilerDir;$env:PATH"
+}
+
 New-Item -ItemType Directory -Path $distPath -Force | Out-Null
 
-if ($null -ne $windres -and (Test-Path -LiteralPath $rcPath)) {
+if ($null -ne $windresPath -and (Test-Path -LiteralPath $rcPath)) {
     $windresArgs = @(
         '-i', $rcPath,
         '-o', $resObjPath,
         '--input-format=rc',
         '--output-format=coff'
     )
-    & $windres.Source @windresArgs
+    & $windresPath @windresArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Resource compilation failed with exit code $LASTEXITCODE."
     }
@@ -80,7 +94,7 @@ $arguments += @(
     '-luxtheme'
 )
 
-& $compiler.Source @arguments
+& $compilerPath @arguments
 if ($LASTEXITCODE -ne 0) {
     throw "Native build failed with exit code $LASTEXITCODE."
 }

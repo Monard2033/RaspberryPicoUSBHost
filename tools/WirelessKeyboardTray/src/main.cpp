@@ -4,11 +4,13 @@
 #include <windowsx.h>
 #include <dbt.h>
 #include <dwmapi.h>
-#include <hidsdi.h>
-#include <hidpi.h>
 #include <setupapi.h>
 #include <shellapi.h>
 #include <uxtheme.h>
+extern "C" {
+#include <hidsdi.h>
+#include <hidpi.h>
+}
 
 #include <algorithm>
 #include <array>
@@ -83,7 +85,7 @@ constexpr ULONGLONG kSampleGapResetMs = 6ull * 60ull * 60ull * 1000ull;  /* only
 constexpr ULONGLONG kRateWindowMs = 60ull * 60ull * 1000ull;      /* widest look-back */
 constexpr ULONGLONG kMinRateElapsedMs = 5ull * 60ull * 1000ull;   /* min span before a rate is reported */
 constexpr double kEstimatorMinDropMv = 5.0;    /* ~0.4 % of the 3050..4190 mV scale */
-constexpr double kChargeRiseResetMv = 25.0;    /* a rise this large means charging was missed */
+constexpr double kChargeRiseResetMv = 75.0;    /* a rise this large means charging was missed */
 constexpr uint32_t kFirmwareBattMinMv = 3050;  /* mirrors BATT_MIN_MV in WirelessKeyboard.c */
 constexpr uint32_t kFirmwareBattMaxMv = 4190;  /* mirrors BATT_MAX_MV in WirelessKeyboard.c */
 constexpr double kMvPerPercent =
@@ -195,9 +197,10 @@ public:
          * happened while we were not looking; stored history is not one
          * continuous discharge any more. */
         if (count_ > 0 &&
-            static_cast<int32_t>(snapshot.millivolts) -
-                static_cast<int32_t>(MedianMillivolts()) >
-                static_cast<int32_t>(kChargeRiseResetMv)) {
+            ((snapshot.batteryState == 1 || snapshot.batteryState == 3) ||
+             (static_cast<int32_t>(snapshot.millivolts) -
+                  static_cast<int32_t>(MedianMillivolts()) >
+              static_cast<int32_t>(kChargeRiseResetMv)))) {
             Clear();
         }
 
@@ -231,7 +234,7 @@ public:
             estimate_.minutesRemaining =
                 smoothed > 0.0 ? pctEquivalent / smoothed : 0.0;
             estimate_.confidence = Classify();
-        } else {
+        } else if (!estimate_.valid || !discharging) {
             estimate_.valid = false;
             estimate_.percentPerMinute = 0.0;
             estimate_.millivoltsPerMinute = 0.0;
@@ -1049,7 +1052,7 @@ void CopyTooltip(std::wstring const &tooltip)
     gNotifyIcon.szTip[std::size(gNotifyIcon.szTip) - 1] = L'\0';
 }
 
-wchar_t const *DrainConfidenceName(DrainConfidence confidence, bool voltageBased)
+[[maybe_unused]] wchar_t const *DrainConfidenceName(DrainConfidence confidence, bool voltageBased)
 {
     if (voltageBased) {
         return L"voltage slope";
@@ -1087,7 +1090,7 @@ EtaView ResolveEta(BatterySnapshot const &snapshot)
 {
     EtaView view{};
 
-    if (snapshot.etaValid && snapshot.availability == Availability::Live) {
+    if (snapshot.etaValid) {
         view.valid = true;
         view.source = EtaSource::Receiver;
         view.minutes = static_cast<double>(snapshot.etaMinutes);
@@ -1117,7 +1120,7 @@ bool FormatEtaMinutes(wchar_t *out, size_t outCount, double minutes)
     if (out == nullptr || outCount == 0) {
         return false;
     }
-    if (!(minutes > 0.0) || minutes > 60.0 * 48.0) {
+    if (!(minutes > 0.0) || minutes > 60.0 * 24.0 * 90.0) {
         return false;
     }
     if (minutes < 10.0) {
@@ -1125,9 +1128,17 @@ bool FormatEtaMinutes(wchar_t *out, size_t outCount, double minutes)
         return true;
     }
     unsigned const totalMinutes = static_cast<unsigned>(minutes + 0.5);
-    unsigned const hours = totalMinutes / 60u;
-    unsigned const mins = totalMinutes % 60u;
-    if (hours == 0u) {
+    unsigned const days = totalMinutes / (24u * 60u);
+    unsigned const remainingMinutes = totalMinutes % (24u * 60u);
+    unsigned const hours = remainingMinutes / 60u;
+    unsigned const mins = remainingMinutes % 60u;
+    if (days > 0u) {
+        if (hours == 0u) {
+            std::swprintf(out, outCount, L"%u d", days);
+        } else {
+            std::swprintf(out, outCount, L"%u d %u h", days, hours);
+        }
+    } else if (hours == 0u) {
         std::swprintf(out, outCount, L"%u min", mins);
     } else if (mins == 0u) {
         std::swprintf(out, outCount, L"%u h", hours);
@@ -1138,7 +1149,7 @@ bool FormatEtaMinutes(wchar_t *out, size_t outCount, double minutes)
 }
 
 /* Suffix describing where the number came from. */
-bool FormatCountdown(wchar_t *out, size_t outCount)
+[[maybe_unused]] bool FormatCountdown(wchar_t *out, size_t outCount)
 {
     EtaView const view = ResolveEta(gLastSnapshot);
     if (!view.valid) {
