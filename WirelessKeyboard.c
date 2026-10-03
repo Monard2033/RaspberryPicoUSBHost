@@ -305,6 +305,7 @@ static uint32_t hid_activity_hash[CFG_TUH_HID];
 static uint16_t hid_activity_len[CFG_TUH_HID];
 static bool hid_activity_valid[CFG_TUH_HID];
 static bool hid_receive_rearm_pending[CFG_TUH_HID];
+static void led_pwm_enable(bool enable);
 
 /* PIO-USB is timing-sensitive: core 0 owns the TinyUSB/PIO-USB host callbacks
  * and is the sole producer into this lock-free ring; core 1 owns SPI/radio and
@@ -338,6 +339,11 @@ static struct usb_host_event usb_host_event_queue[USB_HOST_EVENT_QUEUE_DEPTH];
 static volatile uint8_t usb_host_event_head;      /* producer (core 0) only */
 static volatile uint8_t usb_host_event_tail;      /* consumer (core 1) only */
 static volatile uint32_t usb_host_event_overruns; /* producer (core 0) only */
+
+static inline bool usb_host_event_ring_is_empty(void)
+{
+    return usb_host_event_head == usb_host_event_tail;
+}
 
 static bool usb_host_event_push(uint8_t type, uint8_t dev_addr,
                                 uint8_t instance, uint8_t const *data)
@@ -1355,6 +1361,10 @@ static void spi_service_task(void)
 
 static void spi_send_control_command(uint8_t command)
 {
+    if (radio_power_state != RADIO_AWAKE) {
+        return;
+    }
+
     struct link_input_frame const frame = {
         .magic = LINK_MAGIC,
         .version = LINK_VERSION,
@@ -1485,6 +1495,8 @@ static void radio_start_wake(void)
     radio_power_state = RADIO_WAKING;
     radio_wake_requested = false;
     radio_transition_after_ms = board_millis() + RADIO_BOOT_WAIT_MS;
+    radio_sleep_indicator_active = false;
+    led_pwm_enable(true);
 }
 
 static void radio_power_task(void)
@@ -2281,6 +2293,23 @@ struct rgb_color {
 
 static uint slice_r, slice_g, slice_b;
 static uint chan_r, chan_g, chan_b;
+static bool led_pwm_running = true;
+
+static void led_off(void);
+
+static void led_pwm_enable(bool enable)
+{
+    if (led_pwm_running == enable) return;
+    led_pwm_running = enable;
+    if (!enable) {
+        led_off();
+    }
+    pwm_set_enabled(slice_r, enable);
+    pwm_set_enabled(slice_g, enable);
+    if (slice_b != slice_g) {
+        pwm_set_enabled(slice_b, enable);
+    }
+}
 
 static void led_pwm_init(void)
 {
@@ -2305,7 +2334,7 @@ static void led_pwm_init(void)
     pwm_set_enabled(slice_r, true);
     pwm_set_enabled(slice_g, true);
     pwm_set_enabled(slice_b, true);
-
+    led_pwm_running = true;
 }
 
 static uint8_t led_pwm_level(uint8_t brightness)
@@ -2319,6 +2348,9 @@ static uint8_t led_pwm_level(uint8_t brightness)
 
 static void led_apply(struct rgb_color color)
 {
+    if (!led_pwm_running && (color.r != 0 || color.g != 0 || color.b != 0)) {
+        led_pwm_enable(true);
+    }
     pwm_set_chan_level(slice_r, chan_r, led_pwm_level(color.r));
     pwm_set_chan_level(slice_g, chan_g, led_pwm_level(color.g));
     pwm_set_chan_level(slice_b, chan_b, led_pwm_level(color.b));
@@ -2335,7 +2367,10 @@ static struct rgb_color led_scale(struct rgb_color color, uint8_t level)
 
 static void led_off(void)
 {
-    led_apply((struct rgb_color) { 0, 0, 0 });
+    uint8_t const off_level = LED_COMMON_ANODE ? LED_PWM_WRAP : 0;
+    pwm_set_chan_level(slice_r, chan_r, off_level);
+    pwm_set_chan_level(slice_g, chan_g, off_level);
+    pwm_set_chan_level(slice_b, chan_b, off_level);
 }
 
 static struct rgb_color battery_color_for_pct(uint8_t pct)
@@ -2458,6 +2493,11 @@ static void battery_update_led(uint32_t now)
             return;
         }
         radio_sleep_indicator_active = false;
+    }
+
+    if (radio_power_state == RADIO_SYSTEM_OFF && keyboard_report_is_released()) {
+        led_pwm_enable(false);
+        return;
     }
 
     if (!battery_sample_valid) {
@@ -3337,7 +3377,9 @@ static void usb_host_event_task(void)
 
 /* Core 1 spins while work is pending; otherwise it naps with WFE so the clock
  * tree gates the CPU. Core 0 raises SEV on every queued USB event (see
- * usb_host_event_push), so input latency is unaffected. The 1 ms cap bounds
+ * usb_host_event_push), so input latency is unaffected. In RADIO_SYSTEM_OFF,
+ * a 10 ms sleep bounds wake-up cadence while slashing core1 idling wakeups
+ * by 10x; watchdog is 2000 ms, so 10 ms is completely safe. The 1 ms cap bounds
  * battery/LED/power-state cadence, and a pending SPI MISO retry schedules an
  * exact timer wake so its 100 us retry guard is never overslept. */
 static void worker_core1_idle_wait(void)
@@ -3345,14 +3387,20 @@ static void worker_core1_idle_wait(void)
 #if WIRELESS_KEYBOARD_OTA_SUPPORT
     if (dfu_session_active) return;
 #endif
-    if (usb_host_event_head != usb_host_event_tail ||
+    if (!usb_host_event_ring_is_empty() ||
         spi_input_queue_count != 0 || radio_wake_queue_count != 0 ||
-        battery_spi_pending || consumer_retry_pending) {
+        battery_spi_pending || consumer_retry_pending ||
+        radio_wake_requested) {
         return;
     }
 
     if (spi_retry_pending) {
         sleep_until(from_us_since_boot(spi_retry_after_us));
+        return;
+    }
+
+    if (radio_power_state == RADIO_SYSTEM_OFF) {
+        sleep_until(make_timeout_time_ms(10));
         return;
     }
 
