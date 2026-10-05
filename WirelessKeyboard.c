@@ -307,6 +307,17 @@ static bool hid_activity_valid[CFG_TUH_HID];
 static bool hid_receive_rearm_pending[CFG_TUH_HID];
 static void led_pwm_enable(bool enable);
 
+#define USB_HOST_DM_PIN (USB_HOST_DP_PIN + 1)
+
+enum usb_host_power_state {
+    USB_HOST_STATE_ACTIVE = 0,
+    USB_HOST_STATE_SUSPENDED,
+    USB_HOST_STATE_RESUMING,
+};
+static volatile enum usb_host_power_state usb_host_power_state = USB_HOST_STATE_ACTIVE;
+static volatile bool usb_suspend_requested = false;
+static volatile bool usb_remote_wake_detected = false;
+
 /* PIO-USB is timing-sensitive: core 0 owns the TinyUSB/PIO-USB host callbacks
  * and is the sole producer into this lock-free ring; core 1 owns SPI/radio and
  * is the sole consumer (usb_host_event_task).  No callback may wait for SPI or
@@ -1490,6 +1501,8 @@ static void radio_start_wake(void)
     radio_transition_after_ms = board_millis() + RADIO_BOOT_WAIT_MS;
     radio_sleep_indicator_active = false;
     led_pwm_enable(true);
+    usb_suspend_requested = false;
+    __sev();
 }
 
 static void radio_power_task(void)
@@ -1520,6 +1533,8 @@ static void radio_power_task(void)
         radio_sleep_indicator_started_ms = now;
         radio_power_state = RADIO_SYSTEM_OFF;
         radio_transition_after_ms = now + RADIO_OFF_SETTLE_MS;
+        usb_suspend_requested = true;
+        __sev();
 #if PERIODIC_DEBUG
         printf("[POWER] nRF52840 System OFF control completed\n");
 #endif
@@ -3453,6 +3468,92 @@ static void led_blinking_task(void)
 /*--------------------------------------------------------------------+
  *  MAIN
  *--------------------------------------------------------------------*/
+/*--------------------------------------------------------------------+
+ *  USB Host Power Management (PIO-USB Suspend & Remote Wakeup)
+ *--------------------------------------------------------------------*/
+static void usb_host_gpio_irq_callback(uint gpio, uint32_t events)
+{
+    if (gpio == USB_HOST_DM_PIN && (events & (GPIO_IRQ_EDGE_RISE | GPIO_IRQ_LEVEL_HIGH))) {
+        usb_remote_wake_detected = true;
+    } else if (gpio == USB_HOST_DP_PIN && (events & GPIO_IRQ_EDGE_FALL)) {
+        usb_remote_wake_detected = true;
+    }
+}
+
+static void usb_host_suspend_bus(void)
+{
+    if (usb_host_power_state == USB_HOST_STATE_SUSPENDED) {
+        return;
+    }
+
+    if (!keyboard_report_is_released()) {
+        return;
+    }
+
+    pio_usb_host_stop();
+
+    root_port_t *root = PIO_USB_ROOT_PORT(0);
+    root->suspended = true;
+
+    gpio_acknowledge_irq(USB_HOST_DM_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_LEVEL_HIGH);
+    gpio_acknowledge_irq(USB_HOST_DP_PIN, GPIO_IRQ_EDGE_FALL);
+    gpio_set_irq_enabled_with_callback(USB_HOST_DM_PIN, GPIO_IRQ_EDGE_RISE, true, &usb_host_gpio_irq_callback);
+    gpio_set_irq_enabled(USB_HOST_DP_PIN, GPIO_IRQ_EDGE_FALL, true);
+
+    usb_remote_wake_detected = false;
+    usb_host_power_state = USB_HOST_STATE_SUSPENDED;
+}
+
+static void usb_host_resume_bus(void)
+{
+    if (usb_host_power_state != USB_HOST_STATE_SUSPENDED) {
+        return;
+    }
+
+    usb_host_power_state = USB_HOST_STATE_RESUMING;
+
+    gpio_set_irq_enabled(USB_HOST_DM_PIN, GPIO_IRQ_EDGE_RISE, false);
+    gpio_set_irq_enabled(USB_HOST_DP_PIN, GPIO_IRQ_EDGE_FALL, false);
+
+    root_port_t *root = PIO_USB_ROOT_PORT(0);
+
+    /* Downstream resume: drive K-state (D+ LOW, D- HIGH) for 20 ms */
+    gpio_set_outover(root->pin_dp, GPIO_OVERRIDE_LOW);
+    gpio_set_outover(root->pin_dm, GPIO_OVERRIDE_HIGH);
+    gpio_set_oeover(root->pin_dp, GPIO_OVERRIDE_HIGH);
+    gpio_set_oeover(root->pin_dm, GPIO_OVERRIDE_HIGH);
+    busy_wait_ms(20);
+
+    /* End of resume: Low-Speed EOP (SE0 for 2 us) per USB 2.0 spec */
+    gpio_set_outover(root->pin_dm, GPIO_OVERRIDE_LOW);
+    busy_wait_us(2);
+
+    /* Release pin overrides back to PIO normal */
+    gpio_set_oeover(root->pin_dp, GPIO_OVERRIDE_NORMAL);
+    gpio_set_oeover(root->pin_dm, GPIO_OVERRIDE_NORMAL);
+    gpio_set_outover(root->pin_dp, GPIO_OVERRIDE_NORMAL);
+    gpio_set_outover(root->pin_dm, GPIO_OVERRIDE_NORMAL);
+    busy_wait_us(100);
+
+    root->suspended = false;
+
+    /* Restart 1 ms SOF timer */
+    pio_usb_host_restart();
+
+    /* Wake Core 1 and nRF52840 */
+    radio_note_activity();
+    __sev();
+
+    /* Re-arm HID receive on keyboard */
+    for (uint8_t i = 0; i < CFG_TUH_HID; i++) {
+        hid_receive_rearm_pending[i] = true;
+    }
+
+    usb_suspend_requested = false;
+    usb_remote_wake_detected = false;
+    usb_host_power_state = USB_HOST_STATE_ACTIVE;
+}
+
 int main(void)
 {
     set_sys_clock_khz(RP2040_SYS_CLOCK_KHZ, true);
@@ -3518,6 +3619,23 @@ int main(void)
 #endif
 
         watchdog_update();
+
+        if (usb_host_power_state == USB_HOST_STATE_SUSPENDED) {
+            if (usb_remote_wake_detected || !usb_suspend_requested ||
+                gpio_get(USB_HOST_DM_PIN) || !gpio_get(USB_HOST_DP_PIN)) {
+                usb_host_resume_bus();
+            } else {
+                __wfe();
+                continue;
+            }
+        } else if (usb_suspend_requested) {
+            usb_host_suspend_bus();
+            if (usb_host_power_state == USB_HOST_STATE_SUSPENDED) {
+                __wfe();
+                continue;
+            }
+        }
+
         tuh_task();
         hid_receive_rearm_task();
         keyboard_halt_recovery_task();
