@@ -99,16 +99,14 @@ usb_device_t *pio_usb_host_init(const pio_usb_configuration_t *c) {
 }
 
 void pio_usb_host_stop(void) {
-  cancel_timer_flag = true;
-  while (cancel_timer_flag) {
-    continue;
+  if (timer_active) {
+    stop_timer();
   }
 }
 
 void pio_usb_host_restart(void) {
-  start_timer_flag = true;
-  while (start_timer_flag) {
-    continue;
+  if (!timer_active) {
+    start_timer(_alarm_pool);
   }
 }
 

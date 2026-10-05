@@ -10,6 +10,8 @@
 #include "hardware/pwm.h"
 #include "hardware/flash.h"
 #include "hardware/watchdog.h"
+#include "hardware/structs/watchdog.h"
+#include "hardware/structs/psm.h"
 #include "pico/flash.h"
 #include "bsp/board_api.h"
 #include "tusb.h"
@@ -305,6 +307,7 @@ static uint32_t hid_activity_hash[CFG_TUH_HID];
 static uint16_t hid_activity_len[CFG_TUH_HID];
 static bool hid_activity_valid[CFG_TUH_HID];
 static bool hid_receive_rearm_pending[CFG_TUH_HID];
+static void led_pwm_enable(bool enable);
 
 /* PIO-USB is timing-sensitive: core 0 owns the TinyUSB/PIO-USB host callbacks
  * and is the sole producer into this lock-free ring; core 1 owns SPI/radio and
@@ -338,6 +341,11 @@ static struct usb_host_event usb_host_event_queue[USB_HOST_EVENT_QUEUE_DEPTH];
 static volatile uint8_t usb_host_event_head;      /* producer (core 0) only */
 static volatile uint8_t usb_host_event_tail;      /* consumer (core 1) only */
 static volatile uint32_t usb_host_event_overruns; /* producer (core 0) only */
+
+static inline bool usb_host_event_ring_is_empty(void)
+{
+    return usb_host_event_head == usb_host_event_tail;
+}
 
 static bool usb_host_event_push(uint8_t type, uint8_t dev_addr,
                                 uint8_t instance, uint8_t const *data)
@@ -589,7 +597,6 @@ static volatile bool dfu_apply_requested;
 static volatile uint32_t dfu_apply_size;
 static uint8_t dfu_boot_report_count;
 static uint32_t dfu_boot_report_after_ms;
-static uint32_t ota_last_radio_discovery_ms;
 
 static volatile uint8_t  dfu_core0_flash_cmd;
 static volatile uint32_t dfu_core0_flash_offset;
@@ -769,8 +776,8 @@ static bool dfu_staged_image_vectors_valid(void)
 
 /* Called from the core 0 main loop once core 1 has requested the swap, so
  * multicore_reset_core1() runs in its documented core 0 direction and only
- * one core exists from here on.  The watchdog is fed inside the loop because
- * a full image swap can exceed one watchdog period. */
+ * one core exists from here on. The watchdog is disabled for the bounded
+ * erase/program transaction and re-armed by the SRAM restart helper below. */
 static uint8_t dfu_swap_sram_buffer[128 * 1024];
 
 /* IMPORTANT: erase/program of Slot 0 (flash offset 0) destroys the running
@@ -780,7 +787,54 @@ static uint8_t dfu_swap_sram_buffer[128 * 1024];
  * watchdog is disabled BEFORE the first erase and the whole swap runs
  * watchdog-free; erase+program of 128 KB completes well within a single
  * transaction with interrupts masked. flash_range_erase/program are
- * RAM-resident SDK functions. */
+ * RAM-resident SDK functions.
+ *
+ * The restart helper below is deliberately kept as raw SRAM code. DO NOT
+ * CHANGE its SRAM-only implementation or the IRQ-masked reset invariant:
+ * after Slot 0 is erased, SDK calls may resolve into the old XIP image and
+ * IRQ vectors are stale. Preserve this memo for future code changes once the
+ * final reboot path is confirmed working on the target hardware.
+ * HARDWARE VALIDATED 2026-10-05: payload 74120, CRC32 0xED0CD8FB;
+ * OTA restart succeeded and PIO USB keyboard returned immediately to working
+ * state without a power cycle. */
+
+/* RP2040 watchdog reboot sequence, expressed only as MMIO so it remains
+ * valid after the old XIP image has been erased. The SDK's _watchdog_enable()
+ * resets every watchdog-selected block except ROSC/XOSC, clears debug pause,
+ * loads the 2 s timeout (RP2040 watchdog ticks at 2x), and enables it. The
+ * final trigger performs a normal flash boot and clears scratch4. */
+static void __no_inline_not_in_flash_func(dfu_restart_from_sram)(void)
+{
+    volatile uint32_t *const watchdog_ctrl =
+        (volatile uint32_t *)(WATCHDOG_BASE + WATCHDOG_CTRL_OFFSET);
+    volatile uint32_t *const watchdog_load =
+        (volatile uint32_t *)(WATCHDOG_BASE + WATCHDOG_LOAD_OFFSET);
+    volatile uint32_t *const watchdog_scratch4 =
+        (volatile uint32_t *)(WATCHDOG_BASE + WATCHDOG_SCRATCH4_OFFSET);
+    volatile uint32_t *const psm_wdsel =
+        (volatile uint32_t *)(PSM_BASE + PSM_WDSEL_OFFSET);
+
+    /* Keep the normal flash path selected and stop any previous watchdog. */
+    *watchdog_ctrl &= ~WATCHDOG_CTRL_ENABLE_BITS;
+    *watchdog_scratch4 = 0u;
+
+    /* Reset all watchdog-selected blocks, except ROSC and XOSC. */
+    *psm_wdsel |= PSM_WDSEL_BITS & ~(PSM_WDSEL_ROSC_BITS | PSM_WDSEL_XOSC_BITS);
+
+    /* Do not pause during debug; this is the SDK's pause_on_debug=false path. */
+    *watchdog_ctrl &= ~(WATCHDOG_CTRL_PAUSE_DBG0_BITS |
+                        WATCHDOG_CTRL_PAUSE_DBG1_BITS |
+                        WATCHDOG_CTRL_PAUSE_JTAG_BITS);
+    *watchdog_load = RP2040_WATCHDOG_TIMEOUT_MS * 2000u;
+    *watchdog_ctrl |= WATCHDOG_CTRL_ENABLE_BITS;
+    *watchdog_ctrl |= WATCHDOG_CTRL_TRIGGER_BITS;
+
+    /* The reset must win while interrupts remain masked; never return into
+     * code or a vector table that may have been erased/replaced. */
+    for (;;) {
+        __asm volatile("nop");
+    }
+}
 
 static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
 {
@@ -816,21 +870,10 @@ static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
         flash_range_program(off, dfu_swap_sram_buffer + off, FLASH_PAGE_SIZE);
     }
 
-    restore_interrupts(ints);
-
-    /* Re-enable the watchdog before the reboot: watchdog_disable() stops
-     * the counter, and on some boards watchdog_reboot() issued with the
-     * watchdog fully disabled leaves the chip in a powered-down wedge (no
-     * BOOTSEL, no USB) until a manual power cycle. Re-arm the 2 s window
-     * so the reboot lands back into the ROM reliably. */
-    watchdog_enable(RP2040_WATCHDOG_TIMEOUT_MS, true);
-    watchdog_update();
-
-    /* 4. Reboot RP2040 into the newly installed firmware */
-    watchdog_reboot(0, 0, 0);
-    while (1) {
-        tight_loop_contents();
-    }
+    /* 4. Re-arm and trigger a normal flash boot from SRAM. Keep interrupts
+     * masked through reset: restoring them would dispatch stale vectors from
+     * the erased old image before the watchdog reset takes effect. */
+    dfu_restart_from_sram();
 }
 
 static void dfu_process_command(struct link_ack_frame const *ack)
@@ -1355,6 +1398,10 @@ static void spi_service_task(void)
 
 static void spi_send_control_command(uint8_t command)
 {
+    if (radio_power_state != RADIO_AWAKE) {
+        return;
+    }
+
     struct link_input_frame const frame = {
         .magic = LINK_MAGIC,
         .version = LINK_VERSION,
@@ -1387,22 +1434,16 @@ static void spi_send_control_command(uint8_t command)
  * input alone cannot guarantee that.  Idle polling stays far from the input
  * hot path (never within SPI_ACK_POLL_QUIET_MS of real input, never while
  * input work is queued) and doubles as LED-state refresh.  While the radio
- * is in System OFF, periodic wake requests let an OTA session start without
- * a physical keypress (OTA discovery). */
+ * is in System OFF, the radio sleeps uninterrupted until a physical keypress. */
 static void spi_ack_poll_task(void)
 {
-    uint32_t const now = board_millis();
-
-#if WIRELESS_KEYBOARD_OTA_SUPPORT
     if (radio_power_state == RADIO_SYSTEM_OFF) {
-        if ((uint32_t)(now - ota_last_radio_discovery_ms) >=
-            OTA_RADIO_DISCOVERY_MS) {
-            ota_last_radio_discovery_ms = now;
-            radio_wake_requested = true;
-        }
         return;
     }
 
+    uint32_t const now = board_millis();
+
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
     if (dfu_session_active) {
         if (radio_power_state != RADIO_AWAKE || spi_retry_pending ||
             spi_input_queue_count != 0 || battery_spi_pending ||
@@ -1485,6 +1526,8 @@ static void radio_start_wake(void)
     radio_power_state = RADIO_WAKING;
     radio_wake_requested = false;
     radio_transition_after_ms = board_millis() + RADIO_BOOT_WAIT_MS;
+    radio_sleep_indicator_active = false;
+    led_pwm_enable(true);
 }
 
 static void radio_power_task(void)
@@ -1524,6 +1567,7 @@ static void radio_power_task(void)
     if (radio_power_state == RADIO_WAKING) {
         if ((int32_t)(now - radio_transition_after_ms) < 0) return;
 
+        bool const had_wake_inputs = (radio_wake_queue_count != 0);
         uint8_t const released[KBD_REPORT_LEN] = { 0 };
         uint8_t consumer[KBD_REPORT_LEN] = {
             (uint8_t)previous_consumer_usage,
@@ -1543,9 +1587,19 @@ static void radio_power_task(void)
             }
             (void)spi_queue_input(pending.type, pending.data);
         }
-        (void)spi_queue_input(LINK_TYPE_KEYBOARD,
-                              previous_output_valid ? previous_output_report : released);
-        (void)spi_queue_input(LINK_TYPE_CONSUMER, consumer);
+
+        /* If waking without fresh queued inputs, only transmit state if a
+         * key or consumer usage is actively held. Never inject empty release
+         * frames that would trigger useless +8 dBm RF bursts. */
+        if (!had_wake_inputs) {
+            if (!keyboard_report_is_released()) {
+                (void)spi_queue_input(LINK_TYPE_KEYBOARD,
+                                      previous_output_valid ? previous_output_report : released);
+            }
+            if (previous_consumer_usage != 0) {
+                (void)spi_queue_input(LINK_TYPE_CONSUMER, consumer);
+            }
+        }
         return;
     }
 
@@ -2281,6 +2335,23 @@ struct rgb_color {
 
 static uint slice_r, slice_g, slice_b;
 static uint chan_r, chan_g, chan_b;
+static bool led_pwm_running = true;
+
+static void led_off(void);
+
+static void led_pwm_enable(bool enable)
+{
+    if (led_pwm_running == enable) return;
+    led_pwm_running = enable;
+    if (!enable) {
+        led_off();
+    }
+    pwm_set_enabled(slice_r, enable);
+    pwm_set_enabled(slice_g, enable);
+    if (slice_b != slice_g) {
+        pwm_set_enabled(slice_b, enable);
+    }
+}
 
 static void led_pwm_init(void)
 {
@@ -2305,7 +2376,7 @@ static void led_pwm_init(void)
     pwm_set_enabled(slice_r, true);
     pwm_set_enabled(slice_g, true);
     pwm_set_enabled(slice_b, true);
-
+    led_pwm_running = true;
 }
 
 static uint8_t led_pwm_level(uint8_t brightness)
@@ -2319,6 +2390,9 @@ static uint8_t led_pwm_level(uint8_t brightness)
 
 static void led_apply(struct rgb_color color)
 {
+    if (!led_pwm_running && (color.r != 0 || color.g != 0 || color.b != 0)) {
+        led_pwm_enable(true);
+    }
     pwm_set_chan_level(slice_r, chan_r, led_pwm_level(color.r));
     pwm_set_chan_level(slice_g, chan_g, led_pwm_level(color.g));
     pwm_set_chan_level(slice_b, chan_b, led_pwm_level(color.b));
@@ -2335,7 +2409,10 @@ static struct rgb_color led_scale(struct rgb_color color, uint8_t level)
 
 static void led_off(void)
 {
-    led_apply((struct rgb_color) { 0, 0, 0 });
+    uint8_t const off_level = LED_COMMON_ANODE ? LED_PWM_WRAP : 0;
+    pwm_set_chan_level(slice_r, chan_r, off_level);
+    pwm_set_chan_level(slice_g, chan_g, off_level);
+    pwm_set_chan_level(slice_b, chan_b, off_level);
 }
 
 static struct rgb_color battery_color_for_pct(uint8_t pct)
@@ -2458,6 +2535,11 @@ static void battery_update_led(uint32_t now)
             return;
         }
         radio_sleep_indicator_active = false;
+    }
+
+    if (radio_power_state == RADIO_SYSTEM_OFF && keyboard_report_is_released()) {
+        led_pwm_enable(false);
+        return;
     }
 
     if (!battery_sample_valid) {
@@ -3337,7 +3419,9 @@ static void usb_host_event_task(void)
 
 /* Core 1 spins while work is pending; otherwise it naps with WFE so the clock
  * tree gates the CPU. Core 0 raises SEV on every queued USB event (see
- * usb_host_event_push), so input latency is unaffected. The 1 ms cap bounds
+ * usb_host_event_push), so input latency is unaffected. In RADIO_SYSTEM_OFF,
+ * a 10 ms sleep bounds wake-up cadence while slashing core1 idling wakeups
+ * by 10x; watchdog is 2000 ms, so 10 ms is completely safe. The 1 ms cap bounds
  * battery/LED/power-state cadence, and a pending SPI MISO retry schedules an
  * exact timer wake so its 100 us retry guard is never overslept. */
 static void worker_core1_idle_wait(void)
@@ -3345,14 +3429,20 @@ static void worker_core1_idle_wait(void)
 #if WIRELESS_KEYBOARD_OTA_SUPPORT
     if (dfu_session_active) return;
 #endif
-    if (usb_host_event_head != usb_host_event_tail ||
+    if (!usb_host_event_ring_is_empty() ||
         spi_input_queue_count != 0 || radio_wake_queue_count != 0 ||
-        battery_spi_pending || consumer_retry_pending) {
+        battery_spi_pending || consumer_retry_pending ||
+        radio_wake_requested) {
         return;
     }
 
     if (spi_retry_pending) {
         sleep_until(from_us_since_boot(spi_retry_after_us));
+        return;
+    }
+
+    if (radio_power_state == RADIO_SYSTEM_OFF) {
+        sleep_until(make_timeout_time_ms(10));
         return;
     }
 
@@ -3446,6 +3536,8 @@ int main(void)
     tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION,
                   &pio_cfg);
     tuh_hid_set_default_protocol(HID_PROTOCOL_BOOT);
+    /* TinyUSB performs the normal bus reset during enumeration; do not add a
+     * second startup SE0 pulse here. */
     tuh_init(BOARD_TUH_RHPORT);
     printf("[INIT] TinyUSB/PIO-USB host initialized on core 0\n");
 

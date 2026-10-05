@@ -88,7 +88,7 @@ LANGS = {
         "log_session": "📡 Session #{session} started. Waking RP2040 via ESB radio...",
         "log_start_ack": "✓ START response received from RP2040.",
         "log_crc_ack": "✓ Parameters and hardware target confirmed.",
-        "log_stream_begin": "⚡ Starting flash page streaming (~2,000 B/s)...",
+        "log_stream_begin": "⚡ Starting flash page streaming (max 2,000 firmware B/s)...",
         "log_cancel": "Update stopped by user.",
         "log_resend": "[RESEND] no ACK progress 2s; device accepted {val} B, re-sending {a}..{b}",
         "log_crc_ok": "✓ CRC32 confirmed by RP2040: 0x{crc:08X} (100% match)",
@@ -147,7 +147,7 @@ LANGS = {
         "log_session": "📡 Сеанс #{session} начат. Пробуждение RP2040 по радио ESB...",
         "log_start_ack": "✓ Получен ответ START от RP2040.",
         "log_crc_ack": "✓ Параметры и аппаратная цель подтверждены.",
-        "log_stream_begin": "⚡ Начало потоковой передачи страниц флеш (~2 000 Б/с)...",
+        "log_stream_begin": "⚡ Начало потоковой передачи страниц флеш (макс. 2 000 Б/с прошивки)...",
         "log_cancel": "Обновление остановлено пользователем.",
         "log_resend": "[RESEND] нет прогресса ACK 2 с; устройство приняло {val} Б, повторная отправка {a}..{b}",
         "log_crc_ok": "✓ CRC32 подтверждено RP2040: 0x{crc:08X} (совпадение 100%)",
@@ -206,7 +206,7 @@ LANGS = {
         "log_session": "📡 Sesiune inițiată #{session}. Se trezește RP2040 prin radio ESB...",
         "log_start_ack": "✓ Răspuns START primit de la RP2040.",
         "log_crc_ack": "✓ Verificare parametri și țintă hardware confirmată.",
-        "log_stream_begin": "⚡ Începe streaming-ul paginilor flash (~2.000 B/s)...",
+        "log_stream_begin": "⚡ Începe streaming-ul paginilor flash (max. 2.000 B/s firmware)...",
         "log_cancel": "Actualizarea a fost oprită de utilizator.",
         "log_resend": "[RESEND] no ACK progress 2s; device accepted {val} B, re-sending {a}..{b}",
         "log_crc_ok": "✓ CRC32 Confirmat de RP2040: 0x{crc:08X} (Potrivire 100%)",
@@ -275,6 +275,7 @@ OTA_PROTOCOL_VERSION = 0x01
 OTA_BOARD_WEACT_RP2040_4MB = 0x2040
 RECEIVER_VID = 0x1B4F
 RECEIVER_PID = 0x0001
+DATA_RATE_BYTES_PER_SEC = 2000.0
 DIGCF_PRESENT = 0x02
 DIGCF_DEVICEINTERFACE = 0x10
 
@@ -389,30 +390,90 @@ def set_feature(handle, payload8):
     return bool(hid.HidD_SetFeature(handle, buf, 9))
 
 
-def send_command_and_wait(handle, payload8, timeout_sec=15.0, baseline_token=0, retry_interval=0.0):
-    deadline = time.time() + timeout_sec
-    last_retry = time.time()
-    set_feature(handle, payload8)
+DFU_ERROR_STATUSES = {
+    DFU_STATUS_ERR_SIZE, DFU_STATUS_ERR_CRC, DFU_STATUS_ERR_FLASH,
+    DFU_STATUS_ERR_TARGET, DFU_STATUS_ERR_PROTOCOL, DFU_STATUS_ERR_SESSION,
+    DFU_STATUS_ERR_STATE, DFU_STATUS_ABORTED,
+}
 
-    while time.time() < deadline:
+
+class StrictRateLimiter:
+    """Pace every DATA attempt without accumulating credit after a stall."""
+
+    def __init__(self, rate_bytes_per_sec=DATA_RATE_BYTES_PER_SEC, clock=time.monotonic,
+                 sleeper=time.sleep):
+        self.rate = float(rate_bytes_per_sec)
+        self.clock = clock
+        self.sleeper = sleeper
+
+    def wait_for(self, payload_bytes):
+        # Charge every attempt from the current clock.  This precludes both
+        # an initial burst and catch-up bursts after USB/radio stalls.
+        target = self.clock() + (float(payload_bytes) / self.rate)
+        while self.clock() < target:
+            self.sleeper(target - self.clock())
+
+
+def _raise_device_error(status, detail, val):
+    if status in DFU_ERROR_STATUSES:
+        name = STATUS_NAMES.get(status, f"0x{status:02X}")
+        raise RuntimeError(f"Device returned {name} (detail={detail}, val={val})")
+
+
+def send_command_and_wait(handle, payload8, timeout_sec=15.0, baseline_token=0,
+                          retry_interval=0.0, expected_statuses=(DFU_STATUS_OK,),
+                          accept=None, cancel=None):
+    """Send a control command and accept only its phase-specific response."""
+    deadline = time.monotonic() + timeout_sec
+    last_retry = time.monotonic()
+    if not set_feature(handle, payload8):
+        raise RuntimeError("USB HID command write failed")
+
+    while time.monotonic() < deadline:
+        if cancel and cancel():
+            raise RuntimeError(tr("err_stop"))
         st = get_status(handle)
         if st is not None:
             status, session, token, detail, val = st
             if session == payload8[1] and token != baseline_token:
-                if status != DFU_STATUS_BUSY:
-                    if status in (DFU_STATUS_ERR_SIZE, DFU_STATUS_ERR_CRC,
-                                 DFU_STATUS_ERR_FLASH, DFU_STATUS_ERR_TARGET,
-                                 DFU_STATUS_ERR_PROTOCOL, DFU_STATUS_ERR_SESSION,
-                                 DFU_STATUS_ERR_STATE, DFU_STATUS_ABORTED):
-                        name = STATUS_NAMES.get(status, f"0x{status:02X}")
-                        raise RuntimeError(f"Device returned {name} (detail={detail}, val={val})")
+                _raise_device_error(status, detail, val)
+                if status in expected_statuses and (accept is None or accept(status, val, detail)):
                     return status, session, token, detail, val
-        if retry_interval > 0 and (time.time() - last_retry) > retry_interval:
-            last_retry = time.time()
-            set_feature(handle, payload8)
+        if retry_interval > 0 and (time.monotonic() - last_retry) > retry_interval:
+            last_retry = time.monotonic()
+            if not set_feature(handle, payload8):
+                raise RuntimeError("USB HID command retry failed")
         time.sleep(0.001)
 
     raise TimeoutError("Timpul de așteptare pentru răspunsul RP2040 a expirat")
+
+
+def wait_for_boot_ok(handle, act_cmd, expected_crc, session, timeout_sec=30.0,
+                     baseline_token=0, cancel=None):
+    """ACTIVATE is sent/retried only until APPLYING; then only poll BOOT_OK."""
+    deadline = time.monotonic() + timeout_sec
+    last_retry = time.monotonic()
+    applying = False
+    if not set_feature(handle, act_cmd):
+        raise RuntimeError("USB HID ACTIVATE write failed")
+    while time.monotonic() < deadline:
+        if cancel and cancel():
+            raise RuntimeError(tr("err_stop"))
+        st = get_status(handle)
+        if st is not None:
+            status, s_session, token, detail, val = st
+            if s_session == session and token != baseline_token:
+                _raise_device_error(status, detail, val)
+                if status == DFU_STATUS_BOOT_OK and val == expected_crc:
+                    return st
+                if status == DFU_STATUS_APPLYING:
+                    applying = True
+        if not applying and time.monotonic() - last_retry >= 1.0:
+            last_retry = time.monotonic()
+            if not set_feature(handle, act_cmd):
+                raise RuntimeError("USB HID ACTIVATE retry failed")
+        time.sleep(0.01)
+    raise TimeoutError("Timeout waiting for RP2040 BOOT_OK")
 
 
 def parse_package_metadata(path):
@@ -491,8 +552,11 @@ class FlasherWorker(QThread):
                 total_size & 0xFF, (total_size >> 8) & 0xFF,
                 (total_size >> 16) & 0xFF, (total_size >> 24) & 0xFF
             ])
-            _, _, token, _, _ = send_command_and_wait(
-                handle, start_cmd, timeout_sec=40.0, baseline_token=0, retry_interval=0.8
+            _, _, token, _, start_val = send_command_and_wait(
+                handle, start_cmd, timeout_sec=40.0, baseline_token=0, retry_interval=0.8,
+                expected_statuses=(DFU_STATUS_OK,),
+                accept=lambda status, val, detail: val == 0,
+                cancel=lambda: self._is_cancelled,
             )
             self.sig_log.emit(tr("log_start_ack"))
 
@@ -503,7 +567,8 @@ class FlasherWorker(QThread):
                 OTA_BOARD_WEACT_RP2040_4MB & 0xFF, (OTA_BOARD_WEACT_RP2040_4MB >> 8) & 0xFF
             ])
             _, _, token, _, _ = send_command_and_wait(
-                handle, crc_cmd, timeout_sec=15.0, baseline_token=token, retry_interval=0.8
+                handle, crc_cmd, timeout_sec=15.0, baseline_token=token, retry_interval=0.8,
+                expected_statuses=(DFU_STATUS_OK,), cancel=lambda: self._is_cancelled,
             )
             self.sig_log.emit(tr("log_crc_ack"))
 
@@ -511,8 +576,11 @@ class FlasherWorker(QThread):
             PAGE_SIZE = 256
             CHUNK_SIZE = 5
             offset = 0
-            t0 = time.time()
+            t0 = time.monotonic()
             next_page = PAGE_SIZE
+            limiter = StrictRateLimiter(DATA_RATE_BYTES_PER_SEC)
+            submitted_high_water = 0
+            ack_high_water = 0
 
             self.sig_status.emit(tr("st_stream"))
             self.sig_log.emit(tr("log_stream_begin"))
@@ -522,6 +590,7 @@ class FlasherWorker(QThread):
                     raise RuntimeError("Actualizarea a fost oprită de utilizator.")
 
                 target_offset = min(next_page, total_size)
+                page_send_deadline = time.monotonic() + 10.0
 
                 # Sector boundary guard for hardware sector erase:
                 if (offset % 4096) == 0 and offset > 0:
@@ -533,21 +602,25 @@ class FlasherWorker(QThread):
                 while offset < target_offset:
                     if self._is_cancelled:
                         raise RuntimeError(tr("err_stop"))
+                    if time.monotonic() >= page_send_deadline:
+                        raise TimeoutError(tr("err_page_timeout", offset=target_offset))
 
                     chunk = payload[offset:offset + CHUNK_SIZE]
                     seq = ((offset // CHUNK_SIZE) + 1) & 0xFF
                     data_cmd = (bytes([DFU_CMD_DATA, session]) + chunk +
                                 bytes(5 - len(chunk)) + bytes([seq]))
-                    while not set_feature(handle, data_cmd):
-                        time.sleep(0.0002)
-                    time.sleep(0.0024)
+                    limiter.wait_for(len(chunk))
+                    if not set_feature(handle, data_cmd):
+                        # A failed HID write is still charged by the limiter;
+                        # retrying cannot create a burst above DATA_RATE_BYTES_PER_SEC.
+                        continue
+                    submitted_high_water = max(submitted_high_water, offset + len(chunk))
                     offset += len(chunk)
 
                 # Await page commit ACK from RP2040:
-                deadline = time.time() + 10.0
-                last_progress = time.time()
-                last_val = -1
-                while time.time() < deadline:
+                deadline = time.monotonic() + 10.0
+                last_progress = time.monotonic()
+                while time.monotonic() < deadline:
                     if self._is_cancelled:
                         raise RuntimeError(tr("err_stop"))
 
@@ -555,7 +628,18 @@ class FlasherWorker(QThread):
                     if st is not None:
                         status, s_session, s_token, s_detail, val = st
                         if s_session == session:
-                            if val >= target_offset:
+                            _raise_device_error(status, s_detail, val)
+                            # Ignore malformed/stale ACK counts.  A count must
+                            # be a chunk boundary (except the package end),
+                            # a page commit boundary, or the package end.
+                            valid_count = (0 <= val <= submitted_high_water and
+                                           (val == total_size or val % CHUNK_SIZE == 0 or
+                                            val % PAGE_SIZE == 0))
+                            if status == DFU_STATUS_OK and valid_count and val > ack_high_water:
+                                ack_high_water = val
+                                last_progress = time.monotonic()
+                            if (status == DFU_STATUS_OK and valid_count and
+                                    val >= target_offset):
                                 token = s_token
                                 break
                             # The device-reported value is the authoritative
@@ -570,43 +654,44 @@ class FlasherWorker(QThread):
                             # for 2 s (far longer than any ACK drain or flash
                             # erase). Then re-send starting exactly at val —
                             # those bytes were never applied.
-                            if val != last_val:
-                                last_val = val
-                                last_progress = time.time()
-                            if (time.time() - last_progress) > 2.0:
-                                last_progress = time.time()
+                            if (valid_count and status == DFU_STATUS_OK and
+                                    time.monotonic() - last_progress > 2.0):
+                                last_progress = time.monotonic()
+                                recovery_val = min(target_offset, max(val, ack_high_water))
+                                recovery_start = (recovery_val // CHUNK_SIZE) * CHUNK_SIZE
                                 self.sig_log.emit(tr(
-                                    "log_resend", val=val, a=val, b=target_offset))
-                                # Re-send exactly from the device count;
-                                # sequences derive from the byte offset so
-                                # re-sent chunks carry the expected next
-                                # sequences — device drops duplicates.
-                                p = val
+                                    "log_resend", val=recovery_val, a=recovery_start,
+                                    b=target_offset))
+                                # Re-send from the containing 5-byte chunk;
+                                # page ACKs can report 256 even though DATA
+                                # uses 5-byte chunks. The sequence guard makes
+                                # this duplicate harmless.
+                                p = recovery_start
                                 while p < target_offset:
+                                    if self._is_cancelled:
+                                        raise RuntimeError(tr("err_stop"))
+                                    if time.monotonic() >= deadline:
+                                        raise TimeoutError(tr("err_page_timeout", offset=target_offset))
                                     chk = payload[p:p + CHUNK_SIZE]
                                     seq = ((p // CHUNK_SIZE) + 1) & 0xFF
                                     data_cmd = (bytes([DFU_CMD_DATA, session]) + chk +
                                                 bytes(5 - len(chk)) + bytes([seq]))
-                                    while not set_feature(handle, data_cmd):
-                                        time.sleep(0.0002)
-                                    time.sleep(0.0024)
+                                    limiter.wait_for(len(chk))
+                                    if not set_feature(handle, data_cmd):
+                                        continue
                                     p += len(chk)
-                                offset = p
-                            if status in (DFU_STATUS_ERR_SIZE, DFU_STATUS_ERR_CRC,
-                                          DFU_STATUS_ERR_FLASH, DFU_STATUS_ERR_TARGET,
-                                          DFU_STATUS_ERR_PROTOCOL, DFU_STATUS_ERR_SESSION,
-                                          DFU_STATUS_ERR_STATE, DFU_STATUS_ABORTED):
-                                name = STATUS_NAMES.get(status, f"0x{status:02X}")
-                                raise RuntimeError(tr("err_dev", name=name, detail=s_detail, val=val))
-                    time.sleep(0.0024)
+                                # Keep offset and submitted_high_water as the
+                                # sent frontier; recovery does not rewind it.
+                    time.sleep(0.001)
                 else:
                     raise TimeoutError(tr("err_page_timeout", offset=target_offset))
 
                 next_page += PAGE_SIZE
-                pct = (offset * 100) // total_size
-                elapsed = time.time() - t0
-                speed = offset / elapsed if elapsed > 0 else 0
-                self.sig_progress.emit(pct, offset, total_size, speed)
+                confirmed = min(offset, ack_high_water)
+                pct = (confirmed * 100) // total_size
+                elapsed = time.monotonic() - t0
+                speed = confirmed / elapsed if elapsed > 0 else 0
+                self.sig_progress.emit(pct, confirmed, total_size, speed)
 
             self.sig_status.emit(tr("st_verify"))
             self.sig_log.emit("🔍 Verifying complete staging image...")
@@ -618,7 +703,9 @@ class FlasherWorker(QThread):
                 0, 0
             ])
             _, _, token, _, verified_crc = send_command_and_wait(
-                handle, fin_cmd, timeout_sec=15.0, baseline_token=token, retry_interval=1.0
+                handle, fin_cmd, timeout_sec=20.0, baseline_token=token, retry_interval=1.0,
+                expected_statuses=(DFU_STATUS_VERIFIED,),
+                cancel=lambda: self._is_cancelled,
             )
             if verified_crc != expected_crc:
                 raise RuntimeError(
@@ -636,10 +723,12 @@ class FlasherWorker(QThread):
                 (expected_crc >> 16) & 0xFF, (expected_crc >> 24) & 0xFF,
                 0, 0
             ])
-            try:
-                send_command_and_wait(handle, act_cmd, timeout_sec=5.0, baseline_token=token, retry_interval=1.0)
-            except Exception:
-                pass
+            # This phase is the definitive OTA completion proof.  Keep the
+            # BOOT_OK + CRC check intact: ACTIVATE/APPLYING alone is not a
+            # successful update because the RP2040 may fail before reboot.
+            wait_for_boot_ok(handle, act_cmd, expected_crc, session,
+                             timeout_sec=30.0, baseline_token=token,
+                             cancel=lambda: self._is_cancelled)
 
             self.sig_progress.emit(100, total_size, total_size, speed)
             self.sig_status.emit(tr("st_done"))
@@ -999,6 +1088,20 @@ class MainWindow(QWidget):
 
 
 def main():
+    # This path is used by the frozen build's smoke test.  It deliberately
+    # creates a real QApplication and widget, but never touches HID or OTA
+    # state, so packaging failures are detected before shipping the EXE.
+    if "--self-test" in sys.argv:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        test_app = QApplication([])
+        test_widget = QWidget()
+        test_widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        test_widget.show()
+        test_app.processEvents()
+        test_widget.close()
+        test_app.processEvents()
+        return 0
+
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
@@ -1006,4 +1109,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
