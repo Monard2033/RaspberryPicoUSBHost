@@ -595,7 +595,6 @@ static volatile bool dfu_apply_requested;
 static volatile uint32_t dfu_apply_size;
 static uint8_t dfu_boot_report_count;
 static uint32_t dfu_boot_report_after_ms;
-static uint32_t ota_last_radio_discovery_ms;
 
 static volatile uint8_t  dfu_core0_flash_cmd;
 static volatile uint32_t dfu_core0_flash_offset;
@@ -1397,22 +1396,16 @@ static void spi_send_control_command(uint8_t command)
  * input alone cannot guarantee that.  Idle polling stays far from the input
  * hot path (never within SPI_ACK_POLL_QUIET_MS of real input, never while
  * input work is queued) and doubles as LED-state refresh.  While the radio
- * is in System OFF, periodic wake requests let an OTA session start without
- * a physical keypress (OTA discovery). */
+ * is in System OFF, the radio sleeps uninterrupted until a physical keypress. */
 static void spi_ack_poll_task(void)
 {
-    uint32_t const now = board_millis();
-
-#if WIRELESS_KEYBOARD_OTA_SUPPORT
     if (radio_power_state == RADIO_SYSTEM_OFF) {
-        if ((uint32_t)(now - ota_last_radio_discovery_ms) >=
-            OTA_RADIO_DISCOVERY_MS) {
-            ota_last_radio_discovery_ms = now;
-            radio_wake_requested = true;
-        }
         return;
     }
 
+    uint32_t const now = board_millis();
+
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
     if (dfu_session_active) {
         if (radio_power_state != RADIO_AWAKE || spi_retry_pending ||
             spi_input_queue_count != 0 || battery_spi_pending ||
@@ -1536,6 +1529,7 @@ static void radio_power_task(void)
     if (radio_power_state == RADIO_WAKING) {
         if ((int32_t)(now - radio_transition_after_ms) < 0) return;
 
+        bool const had_wake_inputs = (radio_wake_queue_count != 0);
         uint8_t const released[KBD_REPORT_LEN] = { 0 };
         uint8_t consumer[KBD_REPORT_LEN] = {
             (uint8_t)previous_consumer_usage,
@@ -1555,9 +1549,19 @@ static void radio_power_task(void)
             }
             (void)spi_queue_input(pending.type, pending.data);
         }
-        (void)spi_queue_input(LINK_TYPE_KEYBOARD,
-                              previous_output_valid ? previous_output_report : released);
-        (void)spi_queue_input(LINK_TYPE_CONSUMER, consumer);
+
+        /* If waking without fresh queued inputs, only transmit state if a
+         * key or consumer usage is actively held. Never inject empty release
+         * frames that would trigger useless +8 dBm RF bursts. */
+        if (!had_wake_inputs) {
+            if (!keyboard_report_is_released()) {
+                (void)spi_queue_input(LINK_TYPE_KEYBOARD,
+                                      previous_output_valid ? previous_output_report : released);
+            }
+            if (previous_consumer_usage != 0) {
+                (void)spi_queue_input(LINK_TYPE_CONSUMER, consumer);
+            }
+        }
         return;
     }
 
