@@ -10,6 +10,8 @@
 #include "hardware/pwm.h"
 #include "hardware/flash.h"
 #include "hardware/watchdog.h"
+#include "hardware/structs/watchdog.h"
+#include "hardware/structs/psm.h"
 #include "pico/flash.h"
 #include "bsp/board_api.h"
 #include "tusb.h"
@@ -774,8 +776,8 @@ static bool dfu_staged_image_vectors_valid(void)
 
 /* Called from the core 0 main loop once core 1 has requested the swap, so
  * multicore_reset_core1() runs in its documented core 0 direction and only
- * one core exists from here on.  The watchdog is fed inside the loop because
- * a full image swap can exceed one watchdog period. */
+ * one core exists from here on. The watchdog is disabled for the bounded
+ * erase/program transaction and re-armed by the SRAM restart helper below. */
 static uint8_t dfu_swap_sram_buffer[128 * 1024];
 
 /* IMPORTANT: erase/program of Slot 0 (flash offset 0) destroys the running
@@ -785,7 +787,54 @@ static uint8_t dfu_swap_sram_buffer[128 * 1024];
  * watchdog is disabled BEFORE the first erase and the whole swap runs
  * watchdog-free; erase+program of 128 KB completes well within a single
  * transaction with interrupts masked. flash_range_erase/program are
- * RAM-resident SDK functions. */
+ * RAM-resident SDK functions.
+ *
+ * The restart helper below is deliberately kept as raw SRAM code. DO NOT
+ * CHANGE its SRAM-only implementation or the IRQ-masked reset invariant:
+ * after Slot 0 is erased, SDK calls may resolve into the old XIP image and
+ * IRQ vectors are stale. Preserve this memo for future code changes once the
+ * final reboot path is confirmed working on the target hardware.
+ * HARDWARE VALIDATED 2026-10-05: payload 74120, CRC32 0xED0CD8FB;
+ * OTA restart succeeded and PIO USB keyboard returned immediately to working
+ * state without a power cycle. */
+
+/* RP2040 watchdog reboot sequence, expressed only as MMIO so it remains
+ * valid after the old XIP image has been erased. The SDK's _watchdog_enable()
+ * resets every watchdog-selected block except ROSC/XOSC, clears debug pause,
+ * loads the 2 s timeout (RP2040 watchdog ticks at 2x), and enables it. The
+ * final trigger performs a normal flash boot and clears scratch4. */
+static void __no_inline_not_in_flash_func(dfu_restart_from_sram)(void)
+{
+    volatile uint32_t *const watchdog_ctrl =
+        (volatile uint32_t *)(WATCHDOG_BASE + WATCHDOG_CTRL_OFFSET);
+    volatile uint32_t *const watchdog_load =
+        (volatile uint32_t *)(WATCHDOG_BASE + WATCHDOG_LOAD_OFFSET);
+    volatile uint32_t *const watchdog_scratch4 =
+        (volatile uint32_t *)(WATCHDOG_BASE + WATCHDOG_SCRATCH4_OFFSET);
+    volatile uint32_t *const psm_wdsel =
+        (volatile uint32_t *)(PSM_BASE + PSM_WDSEL_OFFSET);
+
+    /* Keep the normal flash path selected and stop any previous watchdog. */
+    *watchdog_ctrl &= ~WATCHDOG_CTRL_ENABLE_BITS;
+    *watchdog_scratch4 = 0u;
+
+    /* Reset all watchdog-selected blocks, except ROSC and XOSC. */
+    *psm_wdsel |= PSM_WDSEL_BITS & ~(PSM_WDSEL_ROSC_BITS | PSM_WDSEL_XOSC_BITS);
+
+    /* Do not pause during debug; this is the SDK's pause_on_debug=false path. */
+    *watchdog_ctrl &= ~(WATCHDOG_CTRL_PAUSE_DBG0_BITS |
+                        WATCHDOG_CTRL_PAUSE_DBG1_BITS |
+                        WATCHDOG_CTRL_PAUSE_JTAG_BITS);
+    *watchdog_load = RP2040_WATCHDOG_TIMEOUT_MS * 2000u;
+    *watchdog_ctrl |= WATCHDOG_CTRL_ENABLE_BITS;
+    *watchdog_ctrl |= WATCHDOG_CTRL_TRIGGER_BITS;
+
+    /* The reset must win while interrupts remain masked; never return into
+     * code or a vector table that may have been erased/replaced. */
+    for (;;) {
+        __asm volatile("nop");
+    }
+}
 
 static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
 {
@@ -821,21 +870,10 @@ static void __no_inline_not_in_flash_func(dfu_apply_and_reboot)(uint32_t size)
         flash_range_program(off, dfu_swap_sram_buffer + off, FLASH_PAGE_SIZE);
     }
 
-    restore_interrupts(ints);
-
-    /* Re-enable the watchdog before the reboot: watchdog_disable() stops
-     * the counter, and on some boards watchdog_reboot() issued with the
-     * watchdog fully disabled leaves the chip in a powered-down wedge (no
-     * BOOTSEL, no USB) until a manual power cycle. Re-arm the 2 s window
-     * so the reboot lands back into the ROM reliably. */
-    watchdog_enable(RP2040_WATCHDOG_TIMEOUT_MS, true);
-    watchdog_update();
-
-    /* 4. Reboot RP2040 into the newly installed firmware */
-    watchdog_reboot(0, 0, 0);
-    while (1) {
-        tight_loop_contents();
-    }
+    /* 4. Re-arm and trigger a normal flash boot from SRAM. Keep interrupts
+     * masked through reset: restoring them would dispatch stale vectors from
+     * the erased old image before the watchdog reset takes effect. */
+    dfu_restart_from_sram();
 }
 
 static void dfu_process_command(struct link_ack_frame const *ack)
@@ -3491,21 +3529,6 @@ int main(void)
     multicore_launch_core1(worker_core1_main);
     printf("[INIT] SPI/battery/RGB worker initialized on core 1\n");
 
-    /* Force physical USB bus reset (SE0 for 50 ms) on D+/D- pins before tuh_init()
-     * so that any previously enumerated keyboard (e.g. after soft reboot / OTA update)
-     * is forced back to Address 0 (Default state) and re-enumerates cleanly without
-     * requiring a power cycle. */
-    gpio_init(USB_HOST_DP_PIN);
-    gpio_init(USB_HOST_DP_PIN + 1);
-    gpio_set_dir(USB_HOST_DP_PIN, GPIO_OUT);
-    gpio_set_dir(USB_HOST_DP_PIN + 1, GPIO_OUT);
-    gpio_put(USB_HOST_DP_PIN, 0);
-    gpio_put(USB_HOST_DP_PIN + 1, 0);
-    sleep_ms(50);
-    gpio_set_dir(USB_HOST_DP_PIN, GPIO_IN);
-    gpio_set_dir(USB_HOST_DP_PIN + 1, GPIO_IN);
-    sleep_ms(20);
-
     /* Core 0 is dedicated to PIO-USB/TinyUSB host timing and immediate
      * endpoint re-arm. No SPI, ADC, radio or battery work runs here. */
     pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
@@ -3513,6 +3536,8 @@ int main(void)
     tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION,
                   &pio_cfg);
     tuh_hid_set_default_protocol(HID_PROTOCOL_BOOT);
+    /* TinyUSB performs the normal bus reset during enumeration; do not add a
+     * second startup SE0 pulse here. */
     tuh_init(BOARD_TUH_RHPORT);
     printf("[INIT] TinyUSB/PIO-USB host initialized on core 0\n");
 
