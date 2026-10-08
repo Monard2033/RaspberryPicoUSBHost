@@ -99,16 +99,14 @@ usb_device_t *pio_usb_host_init(const pio_usb_configuration_t *c) {
 }
 
 void pio_usb_host_stop(void) {
-  cancel_timer_flag = true;
-  while (cancel_timer_flag) {
-    continue;
+  if (timer_active) {
+    stop_timer();
   }
 }
 
 void pio_usb_host_restart(void) {
-  start_timer_flag = true;
-  while (start_timer_flag) {
-    continue;
+  if (!timer_active) {
+    start_timer(_alarm_pool);
   }
 }
 
@@ -551,14 +549,61 @@ bool pio_usb_host_endpoint_reset_toggle(uint8_t root_idx, uint8_t device_address
   return true;
 }
 
+bool pio_usb_host_endpoint_set_poll_interval(uint8_t root_idx,
+                                             uint8_t device_address,
+                                             uint8_t ep_address,
+                                             uint8_t requested_interval) {
+  endpoint_t *ep = _find_ep(root_idx, device_address, ep_address);
+  if (!ep || (ep->attr & 0x03u) != EP_ATTR_INTERRUPT ||
+      !(ep->ep_num & EP_IN)) {
+    return false;
+  }
+
+  uint8_t const interval = requested_interval < ep->descriptor_interval
+      ? ep->descriptor_interval : requested_interval;
+  uint32_t const irq_state = save_and_disable_interrupts();
+  ep->interval = interval ? interval : 1u;
+  ep->interval_counter = 0;
+  restore_interrupts(irq_state);
+  return true;
+}
+
+uint8_t pio_usb_host_device_set_interrupt_poll_interval(
+    uint8_t root_idx, uint8_t device_address, uint8_t requested_interval) {
+  uint8_t changed = 0;
+  uint32_t const irq_state = save_and_disable_interrupts();
+  for (uint8_t i = 0; i < PIO_USB_EP_POOL_CNT; ++i) {
+    endpoint_t *ep = PIO_USB_ENDPOINT(i);
+    if (ep->root_idx != root_idx || ep->dev_addr != device_address ||
+        !ep->size || (ep->attr & 0x03u) != EP_ATTR_INTERRUPT ||
+        !(ep->ep_num & EP_IN)) {
+      continue;
+    }
+    uint8_t const interval = requested_interval < ep->descriptor_interval
+        ? ep->descriptor_interval : requested_interval;
+    ep->interval = interval ? interval : 1u;
+    ep->interval_counter = 0;
+    ++changed;
+  }
+  restore_interrupts(irq_state);
+  return changed;
+}
+
 //--------------------------------------------------------------------+
 // Transaction helper
 //--------------------------------------------------------------------+
+static bool usb_in_packet_fits(endpoint_t const *ep, uint16_t len) {
+  if (ep->actual_len > ep->total_len) return false;
+  uint16_t const remaining = ep->total_len - ep->actual_len;
+  return len <= ep->size && len <= remaining;
+}
 
 static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
                                                              endpoint_t *ep) {
   int res = 0;
   uint8_t expect_pid = (ep->data_id == 1) ? USB_PID_DATA1 : USB_PID_DATA0;
+
+  ++ep->rx_attempt_count;
 
   pio_usb_bus_prepare_receive(pp);
   pio_usb_bus_send_token(pp, USB_PID_IN, ep->dev_addr, ep->ep_num);
@@ -566,35 +611,43 @@ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
 
   int receive_len = pio_usb_bus_receive_packet_and_handshake(pp, USB_PID_ACK);
   uint8_t const receive_pid = pp->usb_rx_buffer[1];
+  bool const rx_complete = (pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) != 0;
+  ep->rx_last_pid = rx_complete ? receive_pid : 0;
+  ep->rx_last_length = rx_complete ? (int16_t)receive_len : -1;
+  ep->rx_last_complete = rx_complete;
+  if (!rx_complete) {
+    ++ep->rx_no_response_count;
+    ++ep->rx_error_count;
+  }
 
   if (receive_len >= 0) {
     if (receive_pid == expect_pid) {
+      if (!usb_in_packet_fits(ep, (uint16_t)receive_len)) {
+        ++ep->rx_oversize_count;
+        pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_ERROR_BITS);
+        return -1;
+      }
       memcpy(ep->app_buf, &pp->usb_rx_buffer[2], receive_len);
+      if (rx_complete) ++ep->rx_accepted_count;
       pio_usb_ll_transfer_continue(ep, receive_len);
-    } else if (ep->ep_num == 0x81 &&
-               (receive_pid == USB_PID_DATA0 || receive_pid == USB_PID_DATA1)) {
-      /* The SONiX keyboard sends complete, absolute HID states on EP 0x81.
-       * This PIO host already ACKed the CRC-valid packet above. Discarding a
-       * DATA-toggle mismatch after that ACK can leave host and keyboard out of
-       * phase until a later state change, which looks like a dead Keyboard
-       * interface while the independent Consumer endpoint still works.
-       *
-       * Accept this one state and set the local toggle from its received PID;
-       * pio_usb_ll_transfer_continue() flips it for the next expected packet.
-       * Higher-level keyboard-state deduplication prevents any duplicate key
-       * edge from being forwarded beyond the RP2040. */
-      ep->data_id = receive_pid == USB_PID_DATA1 ? 1 : 0;
-      memcpy(ep->app_buf, &pp->usb_rx_buffer[2], receive_len);
-      pio_usb_ll_transfer_continue(ep, receive_len);
+    } else if (receive_pid == USB_PID_DATA0 || receive_pid == USB_PID_DATA1) {
+      /* A duplicate DATA packet was already ACKed by the transaction helper.
+       * Discard it and keep the expected toggle per USB 2.0 section 8.6. */
+      ++ep->rx_toggle_mismatch_count;
     } else {
       // DATA0/1 mismatched, 0 for re-try next frame
     }
   } else if (receive_pid == USB_PID_NAK) {
-    // NAK try again next frame
+    if (rx_complete) ++ep->rx_nak_count;
   } else if (receive_pid == USB_PID_STALL) {
+    if (rx_complete) ++ep->rx_stall_count;
     pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_STALLED_BITS);
   } else {
+    if (receive_pid == USB_PID_DATA0 || receive_pid == USB_PID_DATA1) {
+      ++ep->rx_toggle_mismatch_count;
+    }
     res = -1;
+    ++ep->rx_error_count;
     if ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
       res = -2;
     }

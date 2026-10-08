@@ -26,6 +26,8 @@ void pio_usb_device_task(void);
 
 // Common functions
 endpoint_t *pio_usb_get_endpoint(usb_device_t *device, uint8_t idx);
+endpoint_t *pio_usb_find_endpoint(uint8_t dev_addr, uint8_t ep_address);
+endpoint_t *pio_usb_find_interrupt_in_endpoint(uint8_t dev_addr, uint8_t ordinal);
 int pio_usb_get_in_data(endpoint_t *ep, uint8_t *buffer, uint8_t len);
 int pio_usb_set_out_data(endpoint_t *ep, const uint8_t *buffer, uint8_t len);
 
