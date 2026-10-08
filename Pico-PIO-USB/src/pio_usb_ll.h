@@ -223,6 +223,15 @@ bool pio_usb_host_endpoint_abort_transfer(uint8_t root_idx, uint8_t device_addre
                                           uint8_t ep_address);
 bool pio_usb_host_endpoint_reset_toggle(uint8_t root_idx, uint8_t device_address,
                                         uint8_t ep_address);
+/* Change only the schedule of an interrupt-IN endpoint.  The descriptor
+ * interval remains the floor; this never affects control or OUT endpoints. */
+bool pio_usb_host_endpoint_set_poll_interval(uint8_t root_idx,
+                                             uint8_t device_address,
+                                             uint8_t ep_address,
+                                             uint8_t requested_interval);
+uint8_t pio_usb_host_device_set_interrupt_poll_interval(uint8_t root_idx,
+                                                        uint8_t device_address,
+                                                        uint8_t requested_interval);
 
 //--------------------------------------------------------------------
 // Device Controller functions

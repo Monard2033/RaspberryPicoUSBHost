@@ -13,7 +13,7 @@ This firmware is part of the 3-tier custom wireless keyboard project:
 
 ### Primary Release Artifacts
 - **Firmware Binary**: [`firmware/WirelessKeyboard.uf2`](firmware/WirelessKeyboard.uf2)
-- **SHA-256 Checksum**: `B5D6648AE805D4E2FA4B50BF3EB4223CE8851FC9AAE9F0E654EB87BE12F36DDC`
+- **SHA-256 Checksum**: `485D73F01EEF2493DD415A1E74643D9061B5E056CE2C43C2F221EA0D42DC605D`
 - **Wireless OTA Package**: [`firmware/WirelessKeyboard_OTA.wkota`](firmware/WirelessKeyboard_OTA.wkota)
 
 ---
@@ -42,41 +42,48 @@ This firmware is part of the 3-tier custom wireless keyboard project:
 
 ---
 
-## PROHIBITED IMPLEMENTATIONS (hard-won rules - do not reintroduce)
+## Sonix routing validation and current test boundary
 
-### 1. NEVER send a runtime `SET_REPORT` / EP0 control transfer to the physical keyboard
+The descriptor-driven Sonix FS300 routing record, capture evidence, and release
+artifact locations are maintained in
+[`docs/SONIX_DIAGNOSTIC.md`](docs/SONIX_DIAGNOSTIC.md). The 2026-10-08 hardware
+run validated immediate NumLock LED response, normal typing, and simultaneous
+multi-key input through the previously failing rollover case with payload size
+77,416 bytes and CRC32 `0xE929F70F`. The physical application report is true
+full NKRO within the captured 21-byte report, while the established 8-byte SPI
+link still exposes six ordinary key slots downstream.
 
-**Rule:** after enumeration completes and the keyboard's interrupt IN endpoint (EP `0x81`)
-starts streaming, EP0 must stay silent for the whole session. No `SET_REPORT`, no
-`SET_PROTOCOL`, no LED sync, no "one-shot boot kick", not even while all keys are released.
+### 1. Sonix rollover symptom and verified cause
 
-**Why (2026-09-13, confirmed on hardware):** `tuh_hid_set_report(..., HID_REPORT_TYPE_OUTPUT, ...)`
-issued ~300 ms after mount - i.e. *after* 1 kHz streaming had already started - poisons the
-Sonix SN32 keyboard's EP1. After that transfer the keyboard accepts up to 3 simultaneous keys
-and **freezes permanently on a >=4-key rollover burst**. Observed pattern: type fast and
-continuously right after boot -> fine; stop for ~5 s, then press >=4 keys (e.g. `AWDVA`) ->
-the keyboard dies until a power cycle.
+The earlier symptom looked like a keyboard freeze after the LED state changed:
+four or more simultaneous keys stopped arriving while Consumer Control volume
+events continued and the device did not re-enumerate. The diagnostic capture
+showed normal NAK activity on boot EP `0x81`; the actual keyboard reports had
+moved to application EP `0x83`, Report ID `1`, and the old instance filter
+ignored them. Consumer Control remained Report ID `3`.
 
-**Exact symptom (use it to recognise this bug):** only the keyboard endpoint stops. Consumer /
-media keys keep working (volume, play/pause), the RGB battery indication and the nRF sleep
-blink are normal, and there is **no USB re-enumeration**. The RP2040 itself has not crashed.
+There is no evidence that EP0 `SET_REPORT` corrupts the Sonix silicon, and the
+capture does not establish a silicon failure mechanism. The fix parses the HID
+descriptor for every instance, routes the application keyboard bitmap by its
+declared Report ID and bit offsets, and preserves global latest-valid state with
+delivery deduplication across the BOOT-to-application handoff. LED output stays
+on the BOOT target and is synchronized through the validated path.
 
-**There is no recovery in this firmware, by design of the current code:**
-- `keyboard_halt_recovery_pending` is only ever assigned `false`, so
-  `CLEAR_FEATURE(ENDPOINT_HALT)` is never sent and a genuine EP halt is permanent.
-- `pio_usb_host_endpoint_reset_toggle()` returns `false` whenever the endpoint already has a
-  transfer armed (`Pico-PIO-USB/src/pio_usb_host.c`), i.e. always, while streaming. "Realigning
-  the toggle after SET_REPORT" therefore does nothing.
-- TinyUSB reports a STALL as a normal zero-length completion, so the HID callback just re-arms
-  in a loop instead of surfacing an error.
+The Sonix MCU lights NumLock by itself at power-up, so the baseline remains a useful rollback
+reference. Direct hardware testing confirms that the validated build also updates the NumLock
+LED immediately during normal operation. The earlier Gemini explanation that EP0
+`SET_REPORT` corrupts the silicon or that LED synchronization must remain disabled
+is obsolete and is not part of the current diagnosis.
 
-**It is also unnecessary:** the Sonix MCU lights NumLock by itself at power-up. The physical LED
-is already correct without any host involvement. If LED sync is ever attempted again, it must not
-touch EP0 at runtime (see `skills/sonix-led-quiesce-sync/SKILL.md` for the full record).
+**Status:** the production candidate is hardware-validated for immediate NumLock LED response,
+normal typing, and multi-key rollover. The BOOT-to-application transition is routed by parsed
+descriptors across all HID instances: keyboard Report ID 1 arrives on EP `0x83`, while Consumer
+Report ID 3 remains independent. Global latest-valid state and delivery deduplication preserve
+release handoff across the BOOT and application interfaces.
 
-**Status:** guard `#define KEYBOARD_LED_SYNC_ENABLED 0` at the top of `keyboard_led_task()`
-(`WirelessKeyboard.c`). Keep it 0. Do not "fix" it back on because the physical NumLock LED
-looks off - the SN32 owns that LED.
+The RP2040 radio bridge still normalizes the physical keyboard stream to the existing
+8-byte boot report, so the end-to-end transport exposes at most six ordinary key slots.
+That transport limit is separate from the physical full-NKRO report.
 
 ### 2. Look-alike freeze: nRF SPI slave not arming MISO has no recovery either
 
