@@ -65,6 +65,9 @@ typedef struct {
 
   volatile uint8_t attr;
   volatile uint8_t interval;
+  /* Descriptor-advertised polling period.  interval may be temporarily
+   * widened by the application while the device is idle. */
+  volatile uint8_t descriptor_interval;
   volatile uint8_t interval_counter;
   volatile uint8_t data_id; // data0 or data1
 
@@ -80,6 +83,18 @@ typedef struct {
   uint8_t *app_buf;
   uint16_t total_len;
   uint16_t actual_len;
+  /* Low-overhead host diagnostics; counters are intentionally silent. */
+  uint32_t rx_nak_count;
+  uint32_t rx_stall_count;
+  uint32_t rx_toggle_mismatch_count;
+  uint32_t rx_oversize_count;
+  uint32_t rx_attempt_count;
+  uint32_t rx_accepted_count;
+  uint32_t rx_error_count;
+  uint32_t rx_no_response_count;
+  volatile uint8_t rx_last_pid;
+  volatile int16_t rx_last_length;
+  volatile bool rx_last_complete;
 } endpoint_t;
 
 typedef enum {

@@ -241,7 +241,9 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
 
       if (handshake == USB_PID_ACK) {
         // Only ACK if crc matches
-        if (idx >= 4 && crc_match) {
+        /* Do not ACK a CRC-valid packet that overflowed the receive buffer:
+         * the host cannot safely copy it into the endpoint buffer. */
+        if (idx >= 4 && idx <= rx_buf_len && crc_match) {
           pio_usb_bus_usb_transfer(pp, ack_encoded, 5);
           return idx - 4;
         }
@@ -411,6 +413,30 @@ endpoint_t *pio_usb_get_endpoint(usb_device_t *device, uint8_t idx) {
   return NULL;
 }
 
+endpoint_t *pio_usb_find_endpoint(uint8_t dev_addr, uint8_t ep_address) {
+  for (uint8_t i = 0; i < PIO_USB_EP_POOL_CNT; ++i) {
+    endpoint_t *ep = PIO_USB_ENDPOINT(i);
+    if (ep->dev_addr == dev_addr && ep->ep_num == ep_address && ep->size) {
+      return ep;
+    }
+  }
+  return NULL;
+}
+
+endpoint_t *pio_usb_find_interrupt_in_endpoint(uint8_t dev_addr,
+                                               uint8_t ordinal) {
+  uint8_t seen = 0;
+  for (uint8_t i = 0; i < PIO_USB_EP_POOL_CNT; ++i) {
+    endpoint_t *ep = PIO_USB_ENDPOINT(i);
+    if (ep->dev_addr != dev_addr || !ep->size || !(ep->ep_num & EP_IN) ||
+        (ep->attr & 0x03u) != EP_ATTR_INTERRUPT) {
+      continue;
+    }
+    if (seen++ == ordinal) return ep;
+  }
+  return NULL;
+}
+
 int __no_inline_not_in_flash_func(pio_usb_get_in_data)(endpoint_t *ep,
                                                        uint8_t *buffer,
                                                        uint8_t len) {
@@ -450,7 +476,8 @@ void __no_inline_not_in_flash_func(pio_usb_ll_configure_endpoint)(
   ep->size = d->max_size[0] | (d->max_size[1] << 8);
   ep->ep_num = d->epaddr;
   ep->attr = d->attr;
-  ep->interval = d->interval;
+  ep->descriptor_interval = d->interval ? d->interval : 1u;
+  ep->interval = ep->descriptor_interval;
   ep->interval_counter = 0;
   ep->data_id = 0;
 }

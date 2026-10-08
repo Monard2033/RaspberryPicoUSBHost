@@ -24,6 +24,14 @@
 #define RUNTIME_LOGGING 0
 #endif
 
+/* Strict OTA DFU receiver. The WirelessKeyboardSafe CMake target compiles
+ * this file with the value 0: no DFU state machine, no flash writers, and
+ * no reaction to any DFU ack payload — absolute immunity to a stray
+ * flash_ota.exe. The main target keeps 1 (dormant unless addressed). */
+#ifndef WIRELESS_KEYBOARD_OTA_SUPPORT
+#define WIRELESS_KEYBOARD_OTA_SUPPORT 0
+#endif
+
 /* PIO-USB's full-speed receiver (usb_rx.pio) samples at 96 MHz, so clk_sys
  * must stay >= 96 MHz for a valid SM divider. 96 MHz is the lowest safe
  * setting; override with -DRP2040_SYS_CLOCK_KHZ=120000 to restore the
@@ -32,16 +40,24 @@
 #define RP2040_SYS_CLOCK_KHZ 96000u
 #endif
 
-#if !RUNTIME_LOGGING
-#define printf(...) do { } while (0)
+#if WIRELESS_KEYBOARD_OTA_SUPPORT
+/* Declared before the logging macro so every runtime print, including calls
+ * made from Core 0 HID callbacks and the Core 1 SPI worker, can be silenced
+ * while DFU is moving pages.  stdio is a shared UART mutex and per-frame
+ * diagnostics otherwise starve the reverse-ACK/flash pipeline. */
+static volatile bool dfu_session_active;
+#if RUNTIME_LOGGING
+static bool dfu_uart_log_allowed(void)
+{
+    return !dfu_session_active;
+}
+#endif
 #endif
 
-/* Strict OTA DFU receiver. The WirelessKeyboardSafe CMake target compiles
- * this file with the value 0: no DFU state machine, no flash writers, and
- * no reaction to any DFU ack payload — absolute immunity to a stray
- * flash_ota.exe. The main target keeps 1 (dormant unless addressed). */
-#ifndef WIRELESS_KEYBOARD_OTA_SUPPORT
-#define WIRELESS_KEYBOARD_OTA_SUPPORT 0
+#if !RUNTIME_LOGGING
+#define printf(...) do { } while (0)
+#elif WIRELESS_KEYBOARD_OTA_SUPPORT
+#define printf(...) do { if (dfu_uart_log_allowed()) printf(__VA_ARGS__); } while (0)
 #endif
 
 /*--------------------------------------------------------------------+
@@ -100,7 +116,9 @@
 #define RADIO_INACTIVITY_MS (5u * 60u * 1000u)
 #endif
 #define RADIO_OFF_SETTLE_MS 10u
-#define RADIO_BOOT_WAIT_MS  250u
+/* Experimental post-CSN boot guard: queued inputs stay held during wake.
+ * Validate wake after >=5 min idle; restore 250u if this 100u trial fails. */
+#define RADIO_BOOT_WAIT_MS  100u
 #define RADIO_WAKE_QUEUE_DEPTH 128u
 #define SPI_INPUT_QUEUE_DEPTH 128u
 #define RADIO_SLEEP_BLINK_COUNT 4u
@@ -114,7 +132,11 @@
 #define SPI_ACK_POLL_QUIET_MS 20u
 #define OTA_RADIO_DISCOVERY_MS 30000u
 #define DFU_APPLY_DELAY_MS 1500u
+#define DFU_SESSION_TIMEOUT_MS 60000u
 #define KEYBOARD_HID_STALL_RECOVERY_MS 250u
+#define HID_ACTIVE_POLL_INTERVAL_MS 1u
+#define HID_IDLE_POLL_INTERVAL_MS 8u
+#define HID_INPUT_IDLE_TIMEOUT_MS 60000u
 #define SONIX_KEYBOARD_EP_IN 0x81u
 #define PIO_USB_ROOT_INDEX 0u
 #define RP2040_WATCHDOG_TIMEOUT_MS 2000u
@@ -205,6 +227,12 @@
 #define NULL_MOVEMENT_ENABLED 1 /* Null Movement (Snap Tap / SOCD Last Win) enabled for A/D and W/S */
 #endif
 
+#ifndef KEYBOARD_LED_SYNC_ENABLED
+#define KEYBOARD_LED_SYNC_ENABLED 1
+#endif
+
+#define KEYBOARD_SE0_WATCHDOG_TIMEOUT_MS 500u
+
 /*--------------------------------------------------------------------+
  *  USB keyboard state
  *--------------------------------------------------------------------*/
@@ -226,8 +254,10 @@ static uint32_t          keyboard_last_report_ms;
 static uint32_t          keyboard_recovery_after_ms;
 static bool              keyboard_halt_recovery_pending;
 static bool              keyboard_halt_recovery_in_progress;
+static uint8_t           keyboard_consecutive_failed_count;
 #if HID_DIAGNOSTIC_LOG
 static uint32_t          keyboard_last_diagnostic_ms;
+static uint32_t          hid_diagnostic_last_summary_ms;
 #endif
 
 struct link_input_frame {
@@ -260,6 +290,16 @@ struct consumer_field {
     bool is_array;
 };
 
+struct keyboard_input_layout {
+    uint8_t report_id;
+    uint16_t modifier_bit_offset;
+    uint8_t modifier_bit_size;
+    uint16_t key_bitmap_bit_offset;
+    uint16_t key_bitmap_bit_count;
+    bool has_modifier;
+    bool has_key_bitmap;
+};
+
 struct hid_instance_state {
     uint8_t dev_addr;
     uint8_t report_count;
@@ -271,6 +311,8 @@ struct hid_instance_state {
     uint8_t led_output_report_len;
     uint16_t led_output_bit_offsets[3];
     bool has_led_output;
+    struct keyboard_input_layout keyboard_layout;
+    bool has_keyboard_layout;
 };
 
 static struct hid_instance_state hid_instances[CFG_TUH_HID];
@@ -307,6 +349,25 @@ static uint32_t hid_activity_hash[CFG_TUH_HID];
 static uint16_t hid_activity_len[CFG_TUH_HID];
 static bool hid_activity_valid[CFG_TUH_HID];
 static bool hid_receive_rearm_pending[CFG_TUH_HID];
+static uint32_t hid_last_real_activity_ms;
+static bool hid_poll_idle;
+static bool hid_keyboard_held;
+static uint8_t hid_last_delivered_keyboard_global[KBD_REPORT_LEN];
+static bool hid_last_delivered_keyboard_global_valid;
+static uint8_t hid_last_keyboard_global[KBD_REPORT_LEN];
+static bool hid_last_keyboard_global_valid;
+static bool hid_consumer_held;
+static bool hid_consumer_held_by_instance[CFG_TUH_HID];
+static uint32_t hid_poll_fast_grace_until_ms;
+static bool hid_poll_fast_grace_active;
+static uint8_t hid_last_keyboard_report[CFG_TUH_HID][KBD_REPORT_LEN];
+static bool hid_last_keyboard_valid[CFG_TUH_HID];
+static uint16_t hid_last_consumer_usage[CFG_TUH_HID];
+static bool hid_last_consumer_valid[CFG_TUH_HID];
+static uint8_t hid_last_delivered_keyboard[CFG_TUH_HID][KBD_REPORT_LEN];
+static bool hid_last_delivered_keyboard_valid[CFG_TUH_HID];
+static uint16_t hid_last_delivered_consumer[CFG_TUH_HID];
+static bool hid_last_delivered_consumer_valid[CFG_TUH_HID];
 static void led_pwm_enable(bool enable);
 
 /* PIO-USB is timing-sensitive: core 0 owns the TinyUSB/PIO-USB host callbacks
@@ -482,14 +543,16 @@ static bool remote_keyboard_led_valid;
 
 /* Locally simulated keyboard lock state. */
 static volatile uint8_t  keyboard_led_state;
+static volatile uint8_t  keyboard_target_led_state = HID_LED_NUM_LOCK;
+static uint8_t           keyboard_rendered_led_state = 0xFF;
+#if KEYBOARD_LED_SYNC_ENABLED
 static uint8_t           keyboard_led_tx_report[MAX_LED_OUTPUT_REPORT_LEN];
 static uint8_t           keyboard_led_tx_state;
+#endif
 static uint8_t           keyboard_lock_pressed;
 static volatile bool     keyboard_led_update_pending;
 static volatile bool     keyboard_led_transfer_active;
 static volatile uint32_t keyboard_led_retry_after_ms;
-static uint32_t          keyboard_led_boot_kick_ms;
-static bool              keyboard_led_boot_kick_done;
 
 static bool              battery_tx_pending;
 static bool              battery_material_step;
@@ -587,12 +650,12 @@ static uint8_t dfu_last_chunk_seq;
 static uint8_t dfu_last_status;
 static uint8_t dfu_last_detail;
 static uint32_t dfu_last_status_value;
-static bool dfu_session_active;
 static bool dfu_crc_received;
 static bool dfu_image_verified;
 static bool dfu_last_command_valid;
 static bool dfu_apply_pending;
 static uint32_t dfu_apply_after_ms;
+static uint32_t dfu_last_progress_ms;
 static volatile bool dfu_apply_requested;
 static volatile uint32_t dfu_apply_size;
 static uint8_t dfu_boot_report_count;
@@ -713,6 +776,31 @@ static void dfu_reset_session(void)
     dfu_image_verified = false;
     dfu_last_chunk_seq = 0u;
     dfu_boot_report_count = 20u;
+}
+
+/* A START enables the high-rate DFU poll path and suppresses the normal
+ * radio/battery worker.  A vanished host must therefore have a bounded way
+ * back to the ordinary idle path.  Only accepted session progress refreshes
+ * this clock; QUERY, retries, and duplicate DATA frames do not. */
+static void dfu_note_session_progress(uint32_t now)
+{
+    dfu_last_progress_ms = now;
+    radio_last_activity_ms = now;
+}
+
+static void dfu_timeout_task(void)
+{
+    if (!dfu_session_active || dfu_apply_pending || dfu_apply_requested) {
+        return;
+    }
+
+    uint32_t const now = board_millis();
+    if ((uint32_t)(now - dfu_last_progress_ms) < DFU_SESSION_TIMEOUT_MS) {
+        return;
+    }
+
+    dfu_reset_session();
+    dfu_apply_pending = false;
 }
 
 static bool dfu_flush_page(void)
@@ -881,10 +969,6 @@ static void dfu_process_command(struct link_ack_frame const *ack)
     uint8_t const command = ack->data[0];
     uint8_t const command_session = ack->data[1];
 
-    /* Any DFU traffic keeps the radio awake; a five-minute mid-session
-     * System OFF would otherwise kill the update silently. */
-    radio_last_activity_ms = board_millis();
-
     /* The reverse ACK path can redeliver one command while its reply is
      * still queued.  Replay the stored reply instead of double-applying. */
     if (dfu_last_command_valid &&
@@ -925,6 +1009,7 @@ static void dfu_process_command(struct link_ack_frame const *ack)
         dfu_session = command_session;
         dfu_total_size = image_size;
         dfu_session_active = true;
+        dfu_note_session_progress(board_millis());
         dfu_reply(DFU_STATUS_OK, 0, 0);
         return;
     }
@@ -970,6 +1055,7 @@ static void dfu_process_command(struct link_ack_frame const *ack)
             ((uint32_t)ack->data[4] << 16) |
             ((uint32_t)ack->data[5] << 24);
         dfu_crc_received = true;
+        dfu_note_session_progress(board_millis());
         dfu_reply(DFU_STATUS_OK, 0, 0);
         return;
     }
@@ -995,6 +1081,7 @@ static void dfu_process_command(struct link_ack_frame const *ack)
             return;
         }
         dfu_last_chunk_seq = chunk_seq;
+        dfu_note_session_progress(board_millis());
         for (uint8_t i = 2u; i < 7u &&
              dfu_bytes_accepted < dfu_total_size; ++i) {
             dfu_page_buffer[dfu_page_buffer_len++] = ack->data[i];
@@ -1049,6 +1136,7 @@ static void dfu_process_command(struct link_ack_frame const *ack)
             dfu_reply(DFU_STATUS_ERR_CRC, 0, actual_crc);
         } else {
             dfu_image_verified = true;
+            dfu_note_session_progress(board_millis());
             dfu_reply(DFU_STATUS_VERIFIED, 100u, actual_crc);
         }
         return;
@@ -1183,6 +1271,7 @@ static void spi_process_ack(uint8_t const rx[LINK_FRAME_LEN])
 
     if (keyboard_led_state != remote_keyboard_led_state) {
         keyboard_led_state = remote_keyboard_led_state;
+        keyboard_target_led_state = remote_keyboard_led_state;
         keyboard_led_update_pending = true;
     }
 #if HID_DIAGNOSTIC_LOG
@@ -1507,6 +1596,7 @@ static bool hid_report_changed(uint8_t instance,
 static void radio_note_activity(void)
 {
     radio_last_activity_ms = board_millis();
+    hid_last_real_activity_ms = radio_last_activity_ms;
     if (radio_power_state == RADIO_SYSTEM_OFF ||
         radio_power_state == RADIO_POWERING_OFF) {
         radio_wake_requested = true;
@@ -1762,6 +1852,96 @@ static void parse_consumer_fields(struct hid_instance_state *state,
     state->has_consumer = state->consumer_field_count != 0;
 }
 
+/* Capture the bit layout of a real Keyboard application report.  Offsets are
+ * relative to the report payload (the Report ID byte is stripped by
+ * hid_report_info_for_input()).  This is deliberately descriptor driven: the
+ * first byte is not guessed to be a Report ID. */
+static void parse_keyboard_input_layout(struct hid_instance_state *state,
+                                        uint8_t const *desc, uint16_t len)
+{
+    uint16_t usage_page = 0;
+    uint8_t report_size = 0, report_count = 0, report_id = 0;
+    uint16_t input_offsets[256] = { 0 };
+    uint16_t usage_min = 0, usage_max = 0;
+    bool usage_min_valid = false, usage_max_valid = false;
+    bool keyboard_application = false;
+
+    for (uint16_t pos = 0; pos < len;) {
+        uint8_t const prefix = desc[pos++];
+        if (prefix == 0xFE) {
+            if (pos + 2 > len) break;
+            uint8_t const long_size = desc[pos++];
+            pos++;
+            pos = (uint16_t)((pos + long_size <= len) ? pos + long_size : len);
+            continue;
+        }
+        uint8_t const size_code = prefix & 0x03u;
+        uint8_t const size = size_code == 3 ? 4 : size_code;
+        uint8_t const type = (prefix >> 2) & 0x03u;
+        uint8_t const tag = (prefix >> 4) & 0x0Fu;
+        if (pos + size > len) break;
+        uint32_t const value = hid_item_value(desc + pos, size);
+        pos += size;
+
+        if (type == 1) {
+            if (tag == 0) usage_page = (uint16_t)value;
+            else if (tag == 7) report_size = (uint8_t)value;
+            else if (tag == 8) report_id = (uint8_t)value;
+            else if (tag == 9) report_count = (uint8_t)value;
+            continue;
+        }
+        if (type == 2) {
+            if (tag == 1) { usage_min = (uint16_t)value; usage_min_valid = true; }
+            else if (tag == 2) { usage_max = (uint16_t)value; usage_max_valid = true; }
+            else if (tag == 0 && usage_page == HID_USAGE_PAGE_DESKTOP &&
+                     value == HID_USAGE_DESKTOP_KEYBOARD) {
+                keyboard_application = true;
+            }
+            continue;
+        }
+        if (type != 0) continue;
+        if (tag == 10) { /* Collection */
+            continue;
+        }
+        if (tag == 12) { /* End Collection */
+            keyboard_application = false;
+            continue;
+        }
+        if (tag == 8) { /* Input */
+            uint16_t const base = input_offsets[report_id];
+            bool const constant = (value & 0x01u) != 0;
+            bool const variable = (value & 0x02u) != 0;
+            bool const matching_report = keyboard_application &&
+                usage_page == HID_USAGE_PAGE_KEYBOARD;
+            if (!constant && matching_report && report_size != 0) {
+                if (variable && report_size == 1 && usage_min_valid &&
+                    usage_min == 0xE0u && usage_max_valid && usage_max == 0xE7u) {
+                    state->keyboard_layout.report_id = report_id;
+                    state->keyboard_layout.modifier_bit_offset = base;
+                    state->keyboard_layout.modifier_bit_size = report_count;
+                    state->keyboard_layout.has_modifier = true;
+                    state->has_keyboard_layout = true;
+                } else if (variable && report_size == 1 && usage_min_valid &&
+                           usage_min == 0u && usage_max_valid && usage_max <= 0xFFu) {
+                    state->keyboard_layout.report_id = report_id;
+                    state->keyboard_layout.key_bitmap_bit_offset = base;
+                    state->keyboard_layout.key_bitmap_bit_count = report_count;
+                    state->keyboard_layout.has_key_bitmap = true;
+                    state->has_keyboard_layout = true;
+                }
+            }
+            input_offsets[report_id] = (uint16_t)(base +
+                (uint16_t)report_size * report_count);
+        }
+        usage_min_valid = false;
+        usage_max_valid = false;
+    }
+    if (!state->keyboard_layout.has_modifier ||
+        !state->keyboard_layout.has_key_bitmap) {
+        state->has_keyboard_layout = false;
+    }
+}
+
 /* Locate the Num/Caps/Scroll LED bits in the keyboard's real Output report.
  * Report IDs and bit positions are independent from the Input report, so the
  * common one-byte/same-ID layout is only a fallback. */
@@ -1852,9 +2032,11 @@ static void parse_keyboard_led_output(struct hid_instance_state *state,
         return;
     }
 
-    uint16_t const output_bytes =
+    uint16_t const payload_bytes =
         (uint16_t)((output_offsets[selected_report_id] + 7u) / 8u);
-    if (output_bytes == 0 || output_bytes > MAX_LED_OUTPUT_REPORT_LEN) {
+    uint16_t const output_bytes = payload_bytes +
+        (selected_report_id != 0 ? 1u : 0u);
+    if (payload_bytes == 0 || output_bytes > MAX_LED_OUTPUT_REPORT_LEN) {
         return;
     }
 
@@ -1999,15 +2181,17 @@ static bool keyboard_boot_report_has_error(
  * Outputs standard 8-byte normalized report [modifier, 0, key1..key6].
  * Returns true if valid keyboard report decoded.
  */
-static bool keyboard_decode_report(uint8_t const *report, uint16_t len,
+static bool keyboard_decode_report(struct hid_instance_state const *state,
+                                   tuh_hid_report_info_t const *info,
+                                   uint8_t const *report, uint16_t len,
                                    uint8_t output[KBD_REPORT_LEN])
 {
     if (report == NULL || len == 0) return false;
 
     memset(output, 0, KBD_REPORT_LEN);
 
-    /* Case 1: Standard 8-byte boot keyboard report */
-    if (len == KBD_REPORT_LEN) {
+    /* The BOOT protocol is fixed and unnumbered. */
+    if (info != NULL && info->report_id == 0 && len == KBD_REPORT_LEN) {
         memcpy(output, report, KBD_REPORT_LEN);
         output[1] = 0; /* Clear reserved byte */
         if (keyboard_boot_report_has_error(output)) {
@@ -2017,102 +2201,74 @@ static bool keyboard_decode_report(uint8_t const *report, uint16_t len,
         return true;
     }
 
-    /* Case 2: 9-byte report (1 byte Report ID + standard 8-byte 6KRO) */
-    if (len == 9) {
-        output[0] = report[1]; /* Modifier */
+    /* A numbered boot-style report is passed with its ID already removed. */
+    if (info != NULL && info->report_id != 0 && !state->has_keyboard_layout &&
+        len == KBD_REPORT_LEN) {
+        memcpy(output, report, KBD_REPORT_LEN);
         output[1] = 0;
-        memcpy(output + 2, report + 3, 6);
         if (keyboard_boot_report_has_error(output)) {
             memset(output + 2, 0, KBD_REPORT_LEN - 2);
         }
         return true;
     }
 
-    /* Case 3: NKRO Bitmap report (> 9 bytes, e.g. 15, 16, 29, 32, 64 bytes) */
-    if (len >= 10) {
-        uint8_t modifier = 0;
-        uint8_t const *bitmap = NULL;
-        uint16_t bitmap_len = 0;
+    if (state == NULL || info == NULL || !state->has_keyboard_layout ||
+        info->report_id != state->keyboard_layout.report_id) return false;
 
-        /* Check if report has a Report ID prefix in byte 0 */
-        if (keyboard_input_report_id != 0 && report[0] == keyboard_input_report_id) {
-            modifier = report[1];
-            bitmap = report + 2;
-            bitmap_len = len - 2;
-        } else if (report[0] != 0 && report[0] <= 0x0F && len >= 12) {
-            /* Likely Report ID in byte 0, modifier in byte 1 */
-            modifier = report[1];
-            bitmap = report + 2;
-            bitmap_len = len - 2;
-        } else {
-            /* Modifier in byte 0, bitmap starts at byte 1 */
-            modifier = report[0];
-            bitmap = report + 1;
-            bitmap_len = len - 1;
-        }
-
-        output[0] = modifier;
-        output[1] = 0;
-
-        uint8_t key_idx = 2;
-
-        /* Standard USB HID NKRO key bitmap layout (0-indexed usages 0..255) */
-        for (uint16_t b = 0; b < bitmap_len && key_idx < KBD_REPORT_LEN; ++b) {
-            uint8_t const byte_val = bitmap[b];
-            if (byte_val == 0) continue;
-
-            for (uint8_t bit = 0; bit < 8 && key_idx < KBD_REPORT_LEN; ++bit) {
-                if ((byte_val & (1u << bit)) != 0) {
-                    uint16_t const usage = (uint16_t)(b * 8u + bit);
-                    if (usage >= 0x04 && usage <= 0xE7) {
-                        output[key_idx++] = (uint8_t)usage;
-                    }
-                }
-            }
-        }
-        return true;
+    struct keyboard_input_layout const *layout = &state->keyboard_layout;
+    uint16_t const total_bits = (uint16_t)(len * 8u);
+    if (!layout->has_modifier || !layout->has_key_bitmap ||
+        layout->modifier_bit_offset + layout->modifier_bit_size > total_bits ||
+        layout->key_bitmap_bit_offset + layout->key_bitmap_bit_count > total_bits) {
+        return false;
     }
 
-    /* Short or non-standard report (< 8 bytes) */
-    if (len > 0) {
-        output[0] = report[0];
-        output[1] = 0;
-        uint16_t const copy_len = len > 2 ? (len - 2 > 6 ? 6 : len - 2) : 0;
-        if (copy_len > 0) {
-            memcpy(output + 2, report + 2, copy_len);
+    output[0] = (uint8_t)read_report_bits(report,
+        len, layout->modifier_bit_offset, layout->modifier_bit_size);
+    uint8_t key_idx = 2;
+    for (uint16_t bit = 0; bit < layout->key_bitmap_bit_count &&
+         key_idx < KBD_REPORT_LEN; ++bit) {
+        uint16_t const usage = bit;
+        if (usage < 0x04u || usage > 0xE7u) continue;
+        if (read_report_bits(report, len,
+                             (uint16_t)(layout->key_bitmap_bit_offset + bit), 1) != 0) {
+            output[key_idx++] = (uint8_t)usage;
         }
-        return true;
     }
-
-    return false;
+    return true;
 }
 
 
 static void keyboard_led_reset(void)
 {
     keyboard_led_state = HID_LED_NUM_LOCK;
+    keyboard_target_led_state = HID_LED_NUM_LOCK;
+    keyboard_rendered_led_state = 0xFF;
     keyboard_lock_pressed = 0;
-    keyboard_led_update_pending = false;
+    keyboard_led_update_pending = true;
     keyboard_led_retry_after_ms = 0;
-    /* One-shot boot kick (see keyboard_led_task): request the Sonix MCU
-     * to light NumLock once the keyboard has settled after mount. */
-    keyboard_led_boot_kick_ms = board_millis();
-    keyboard_led_boot_kick_done = false;
 }
 
+#if KEYBOARD_LED_SYNC_ENABLED
 static void keyboard_led_build_output_report(uint8_t led_state)
 {
     memset(keyboard_led_tx_report, 0, sizeof(keyboard_led_tx_report));
     for (uint8_t i = 0; i < 3; ++i) {
         if ((led_state & (1u << i)) == 0) continue;
 
-        uint16_t const bit = keyboard_led_output_bit_offsets[i];
+        /* Report-ID interfaces carry the ID as the first data byte too. */
+        uint16_t const bit = (uint16_t)keyboard_led_output_bit_offsets[i] +
+                             (keyboard_led_output_report_id != 0 ? 8u : 0u);
         if (bit < (uint16_t)keyboard_led_output_report_len * 8u) {
             keyboard_led_tx_report[bit / 8u] |= (uint8_t)(1u << (bit % 8u));
         }
     }
+    if (keyboard_led_output_report_id != 0) {
+        keyboard_led_tx_report[0] = keyboard_led_output_report_id;
+    }
     keyboard_led_tx_state = led_state;
 }
+#endif
 
 static void keyboard_led_toggle_on_press(
     const uint8_t input[KBD_REPORT_LEN])
@@ -2135,7 +2291,8 @@ static void keyboard_led_toggle_on_press(
         if ((pressed_now & lock_keys[i].led) != 0 &&
             (keyboard_lock_pressed & lock_keys[i].led) == 0) {
             keyboard_led_state ^= lock_keys[i].led;
-            keyboard_led_update_pending = false;
+            keyboard_target_led_state = keyboard_led_state;
+            keyboard_led_update_pending = true;
 #if PERIODIC_DEBUG
             printf("[KBD LED] local state=0x%02x\n", keyboard_led_state);
 #endif
@@ -2145,60 +2302,57 @@ static void keyboard_led_toggle_on_press(
     keyboard_lock_pressed = pressed_now;
 }
 
-/* Pure 1000 Hz Streaming:
- * Never send SET_REPORT control transfers to the physical Sonix keyboard.
- * Keeping EP 0 quiet guarantees Endpoint 0x81 streams at 1000 Hz with
- * zero stalls, zero data-toggle collisions, and unlimited simultaneous keys. */
-/* KEYBOARD LED SYNC - DISABLED 2026-09-13.
- *
- * Root cause of the random "keyboard dies, media keys still work" freeze:
- * the one-shot SET_REPORT(Output, NumLock) below is issued ~300 ms AFTER
- * mount, i.e. while EP 0x81 is already streaming at 1 kHz. The Sonix SN32
- * accepts a control transfer on EP0 only while it is still idle during
- * enumeration; issued at runtime it poisons the keyboard's EP1, which then
- * tolerates up to 3 simultaneous keys and freezes permanently on a >=4-key
- * rollover burst (the reported "AWDVA" case). Symptom fit is exact: only
- * the keyboard endpoint dies, the Consumer/media endpoint keeps working,
- * and there is no recovery in this firmware (CLEAR_FEATURE is dead code -
- * keyboard_halt_recovery_pending is only ever assigned false - and
- * pio_usb_host_endpoint_reset_toggle() returns early whenever EP1 already
- * has a transfer armed).
- *
- * This kick is also redundant: the Sonix MCU lights NumLock ON by itself at
- * power-up. Set to 1 only for deliberate LED experiments, never in a daily
- * build. With 0 the rest of this function is unreachable but still compiled,
- * so no helper loses its last reference (-Wunused-function stays quiet). */
-#define KEYBOARD_LED_SYNC_ENABLED 0
-
-static uint32_t keyboard_led_boot_kick_ms;
-static bool     keyboard_led_boot_kick_done;
-
+/* Scenario B: True PC Host Protocol Replication for Sonix SN32 Keyboard.
+ * Delivers LED output report via asynchronous EP0 SET_REPORT transfers as soon
+ * as the previous transfer has completed. The request is submitted immediately;
+ * bus completion still determines when the next request may be issued. */
 static void keyboard_led_task(void)
 {
+#if !KEYBOARD_LED_SYNC_ENABLED
     keyboard_led_update_pending = false;
+    return;
+#else
+    if (!kbd_is_mounted || keyboard_led_transfer_active) {
+        return;
+    }
 
-    if (!KEYBOARD_LED_SYNC_ENABLED) return;
+    if (keyboard_target_led_state == keyboard_rendered_led_state) {
+        return;
+    }
 
-    if (!kbd_is_mounted || keyboard_led_boot_kick_done) return;
+#if HID_DIAGNOSTIC_LOG
+    uint32_t const now = board_millis();
+#endif
 
-    if ((uint32_t)(board_millis() - keyboard_led_boot_kick_ms) < 300u) return;
-    if (!keyboard_report_is_released()) return;
-    if ((uint32_t)(board_millis() - keyboard_last_report_ms) < 250u) return;
-    if (keyboard_led_transfer_active) return;
-
-    keyboard_led_build_output_report(HID_LED_NUM_LOCK);
-    if (tuh_hid_set_report(kbd_dev_addr, kbd_instance,
+    keyboard_led_build_output_report(keyboard_target_led_state);
+#if HID_DIAGNOSTIC_LOG
+    printf("[LED TX %lu] SET_REPORT id=%u type=%u len=%u state=%02x wire=",
+           (unsigned long)now, keyboard_led_output_report_id,
+           HID_REPORT_TYPE_OUTPUT, keyboard_led_output_report_len,
+           keyboard_led_tx_state);
+    for (uint8_t i = 0; i < keyboard_led_output_report_len; ++i) {
+        printf(" %02x", keyboard_led_tx_report[i]);
+    }
+    printf("\n");
+#endif
+    bool const submitted = tuh_hid_set_report(kbd_dev_addr, kbd_instance,
                            keyboard_led_output_report_id,
                            HID_REPORT_TYPE_OUTPUT,
                            keyboard_led_tx_report,
-                           keyboard_led_output_report_len)) {
+                           keyboard_led_output_report_len);
+#if HID_DIAGNOSTIC_LOG
+    printf("[LED SUBMIT %lu] accepted=%u\n", (unsigned long)now,
+           submitted ? 1u : 0u);
+#endif
+    if (submitted) {
         keyboard_led_transfer_active = true;
-        keyboard_led_boot_kick_done = true;
     } else {
-        /* EP0 busy: retry on the next task pass. */
-        keyboard_led_boot_kick_ms = board_millis();
+        /* TinyUSB can reject a control transfer while EP0 is busy. Keep the
+         * target dirty and retry on the next normal main-loop iteration. */
     }
+#endif
 }
+
 
 static void null_movement_reset(void)
 {
@@ -2986,12 +3140,99 @@ static void usb_descriptor_dump_task(void)
 #endif
 }
 
+#if HID_DIAGNOSTIC_LOG
+static void hid_endpoint_diagnostic_task(void)
+{
+    uint32_t const now = board_millis();
+    if ((uint32_t)(now - hid_diagnostic_last_summary_ms) < 1000u) return;
+    hid_diagnostic_last_summary_ms = now;
+    if (!kbd_is_mounted || kbd_dev_addr == 0) return;
+
+    for (uint8_t ordinal = 0; ordinal < CFG_TUH_HID; ++ordinal) {
+        endpoint_t *const ep = pio_usb_find_interrupt_in_endpoint(
+            kbd_dev_addr, ordinal);
+        if (ep == NULL) {
+            break;
+        }
+        printf("[HID EP t=%lu] dev=%u ep=0x%02x size=%u interval=%u "
+               "has_transfer=%u actual_len=%u total_len=%u expected_toggle=%u "
+               "attempts=%lu accepted=%lu nak=%lu stall=%lu mismatch=%lu "
+               "oversize=%lu error=%lu no_response=%lu last_complete=%u "
+               "last_pid=0x%02x last_len=%d\n",
+               (unsigned long)now, ep->dev_addr, ep->ep_num,
+               ep->size, ep->interval, ep->has_transfer ? 1u : 0u,
+               ep->actual_len, ep->total_len, ep->data_id,
+               (unsigned long)ep->rx_attempt_count,
+               (unsigned long)ep->rx_accepted_count,
+               (unsigned long)ep->rx_nak_count,
+               (unsigned long)ep->rx_stall_count,
+               (unsigned long)ep->rx_toggle_mismatch_count,
+               (unsigned long)ep->rx_oversize_count,
+               (unsigned long)ep->rx_error_count,
+               (unsigned long)ep->rx_no_response_count,
+               ep->rx_last_complete ? 1u : 0u, ep->rx_last_pid,
+               ep->rx_last_length);
+    }
+}
+#endif
+
 /*--------------------------------------------------------------------+
  *  USB HID host callbacks
  *--------------------------------------------------------------------*/
+static void hid_poll_note_real_activity(void)
+{
+    hid_last_real_activity_ms = board_millis();
+    if (hid_poll_idle) {
+        hid_poll_idle = false;
+        (void)pio_usb_host_device_set_interrupt_poll_interval(
+            PIO_USB_ROOT_INDEX, kbd_dev_addr, HID_ACTIVE_POLL_INTERVAL_MS);
+    }
+}
+
+static void hid_poll_force_fast(void)
+{
+    hid_poll_idle = false;
+    hid_poll_fast_grace_until_ms = board_millis() + 250u;
+    hid_poll_fast_grace_active = true;
+    (void)pio_usb_host_device_set_interrupt_poll_interval(
+        PIO_USB_ROOT_INDEX, kbd_dev_addr, HID_ACTIVE_POLL_INTERVAL_MS);
+}
+
+static bool hid_keyboard_human_state_equal(uint8_t const *a,
+                                            uint8_t const *b)
+{
+    return a[0] == b[0] && memcmp(&a[2], &b[2], KBD_REPORT_LEN - 2u) == 0;
+}
+
+static void hid_poll_policy_task(void)
+{
+    uint32_t const now = board_millis();
+    if (hid_poll_fast_grace_active &&
+        (uint32_t)(now - (hid_poll_fast_grace_until_ms - 250u)) >= 250u) {
+        hid_poll_fast_grace_active = false;
+    }
+    if (!kbd_is_mounted || hid_poll_idle || hid_keyboard_held ||
+        hid_consumer_held ||
+        hid_poll_fast_grace_active ||
+        (uint32_t)(now - hid_last_real_activity_ms) <
+            HID_INPUT_IDLE_TIMEOUT_MS) {
+        return;
+    }
+
+    if (pio_usb_host_device_set_interrupt_poll_interval(
+            PIO_USB_ROOT_INDEX, kbd_dev_addr, HID_IDLE_POLL_INTERVAL_MS) != 0) {
+        hid_poll_idle = true;
+    }
+}
+
 static void hid_receive_arm_or_defer(uint8_t dev_addr, uint8_t instance)
 {
     if (instance >= CFG_TUH_HID) return;
+
+    if (dev_addr == kbd_dev_addr && instance == kbd_instance &&
+        (keyboard_halt_recovery_pending || keyboard_halt_recovery_in_progress)) {
+        return;
+    }
 
     /* A completed interrupt-IN transfer can briefly remain busy inside the
      * host stack. Losing this one re-arm permanently stops all keyboard input,
@@ -3016,6 +3257,11 @@ static void hid_receive_rearm_task(void)
             continue;
         }
 
+        if (state->dev_addr == kbd_dev_addr && instance == kbd_instance &&
+            (keyboard_halt_recovery_pending || keyboard_halt_recovery_in_progress)) {
+            continue;
+        }
+
         if (tuh_hid_receive_report(state->dev_addr, instance)) {
             hid_receive_rearm_pending[instance] = false;
         }
@@ -3036,6 +3282,7 @@ static void keyboard_halt_recovery_complete(tuh_xfer_t *xfer)
      * the PIO scheduler in the same state before the first new IN poll. */
     pio_usb_host_endpoint_reset_toggle(PIO_USB_ROOT_INDEX, kbd_dev_addr,
                                        SONIX_KEYBOARD_EP_IN);
+    keyboard_consecutive_failed_count = 0;
     keyboard_halt_recovery_pending = false;
     keyboard_last_report_ms = board_millis();
     hid_receive_arm_or_defer(kbd_dev_addr, kbd_instance);
@@ -3095,6 +3342,46 @@ static void keyboard_hid_stall_recovery_task(void)
     keyboard_last_report_ms = now;
 }
 
+/* Hardware SE0 Watchdog kept inert to avoid false resets */
+#if 0
+static void keyboard_se0_bus_reset(void)
+{
+    printf("\n*** [WATCHDOG] Sonix controller wedged! Executing 50ms SE0 bus reset... ***\n");
+
+    root_port_t *root = PIO_USB_ROOT_PORT(0);
+    /* Signal disconnect to TinyUSB so all pending transfers fail and device unmounts cleanly */
+    root->connected = false;
+    root->suspended = true;
+    root->ints |= PIO_USB_INTS_DISCONNECT_BITS;
+
+    for (int ep_idx = 0; ep_idx < PIO_USB_EP_POOL_CNT; ep_idx++) {
+        endpoint_t *ep = PIO_USB_ENDPOINT(ep_idx);
+        if (ep->root_idx == 0 && ep->size && ep->has_transfer) {
+            pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_ERROR_BITS);
+        }
+    }
+
+    pio_usb_host_port_reset_start(0);
+    watchdog_update();
+    sleep_ms(50);
+    watchdog_update();
+    pio_usb_host_port_reset_end(0);
+
+    kbd_dev_addr = 0;
+    kbd_is_mounted = false;
+    hid_keyboard_held = false;
+    keyboard_halt_recovery_pending = false;
+    keyboard_halt_recovery_in_progress = false;
+    keyboard_consecutive_failed_count = 0;
+    keyboard_last_report_ms = board_millis();
+}
+#endif
+
+static void keyboard_watchdog_task(void)
+{
+    /* Kept inert so it doesn't falsely reset anything */
+}
+
 void tuh_mount_cb(uint8_t dev_addr)
 {
     printf("\n*** [USB] DEVICE MOUNTED: addr=%u ***\n", dev_addr);
@@ -3105,7 +3392,10 @@ void tuh_umount_cb(uint8_t dev_addr)
 {
     printf("\n*** [USB] DEVICE UNMOUNTED: addr=%u ***\n", dev_addr);
     (void)usb_host_event_push(USB_HOST_EVENT_DEVICE_UMOUNT, dev_addr, 0, NULL);
-    if (dev_addr == kbd_dev_addr) { kbd_dev_addr = 0; kbd_is_mounted = false; }
+    if (dev_addr == kbd_dev_addr) {
+        kbd_dev_addr = 0;
+        kbd_is_mounted = false;
+    }
 }
 
 static tuh_hid_report_info_t const *hid_report_info_for_input(
@@ -3139,17 +3429,22 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
     if (state != NULL) {
         memset(state, 0, sizeof(*state));
         hid_activity_valid[instance] = false;
+        hid_last_keyboard_valid[instance] = false;
+        hid_last_consumer_valid[instance] = false;
+        hid_last_delivered_keyboard_valid[instance] = false;
+        hid_last_delivered_consumer_valid[instance] = false;
         state->dev_addr = dev_addr;
         if (desc_report != NULL && desc_len != 0) {
             state->report_count = tuh_hid_parse_report_descriptor(
                 state->reports, MAX_HID_REPORTS, desc_report, desc_len);
             parse_consumer_fields(state, desc_report, desc_len);
+            parse_keyboard_input_layout(state, desc_report, desc_len);
             parse_keyboard_led_output(state, desc_report, desc_len);
         }
         printf("[HID] reports=%u consumer_fields=%u led_output=%u\n",
                state->report_count, state->consumer_field_count,
                state->has_led_output ? 1u : 0u);
-#if CONSUMER_DEBUG
+#if CONSUMER_DEBUG || HID_DIAGNOSTIC_LOG
         printf("[HID] descriptor len=%u:", desc_len);
         for (uint16_t i = 0; i < desc_len; ++i) {
             if ((i % 16u) == 0) printf("\n[HID DESC %03u]", i);
@@ -3174,18 +3469,28 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
         keyboard_led_output_bit_offsets[0] = 0;
         keyboard_led_output_bit_offsets[1] = 1;
         keyboard_led_output_bit_offsets[2] = 2;
-        /* Keep the interface in the default REPORT protocol. Do not issue a
-         * runtime SET_PROTOCOL(BOOT): this composite keyboard has separate
-         * keyboard/mouse/consumer collections and a concurrent control
-         * transfer can leave the PIO-USB HID IN path stale during rapid
-         * multi-key transitions. */
-        keyboard_uses_report_protocol = true;
+        /* Proven baseline: interface is configured as HID_PROTOCOL_BOOT prior to
+         * tuh_init(). Sonix manages its own matrix LEDs autonomously, keeping EP0 quiet
+         * and streaming input at pure 1000 Hz. */
+        keyboard_uses_report_protocol = false;
         keyboard_last_report_ms = board_millis();
         keyboard_recovery_after_ms = keyboard_last_report_ms;
         keyboard_halt_recovery_pending = false;
         keyboard_halt_recovery_in_progress = false;
+        keyboard_consecutive_failed_count = 0;
+        hid_last_real_activity_ms = board_millis();
+        hid_poll_idle = false;
+        hid_keyboard_held = false;
+        hid_last_delivered_keyboard_global_valid = false;
+        hid_last_keyboard_global_valid = false;
+        hid_consumer_held = false;
+        hid_poll_fast_grace_until_ms = 0;
+        hid_poll_fast_grace_active = false;
         keyboard_led_transfer_active = false;
-        if (state != NULL) {
+        keyboard_target_led_state = HID_LED_NUM_LOCK;
+        keyboard_rendered_led_state = 0xFF;
+        keyboard_led_update_pending = false;
+        if (state != NULL && keyboard_uses_report_protocol) {
             for (uint8_t i = 0; i < state->report_count; ++i) {
                 if (state->reports[i].usage_page == HID_USAGE_PAGE_DESKTOP &&
                     state->reports[i].usage == HID_USAGE_DESKTOP_KEYBOARD) {
@@ -3200,10 +3505,22 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance,
                        state->led_output_bit_offsets,
                        sizeof(keyboard_led_output_bit_offsets));
             } else {
-                /* Standard keyboards commonly share the Input Report ID for
-                 * one-byte LED Output; retain that safe legacy fallback. */
-                keyboard_led_output_report_id = keyboard_input_report_id;
+                /* BOOT protocol LED output is a one-byte, unnumbered report.
+                 * An input Report ID is never a valid substitute for the
+                 * output report ID when the descriptor has no LED Output. */
+                keyboard_led_output_report_id = 0;
+                keyboard_led_output_report_len = 1;
             }
+        } else if (!keyboard_uses_report_protocol) {
+            /* BOOT protocol has the fixed 8-byte keyboard report and a
+             * one-byte unnumbered LED output report. Never inherit IDs or
+             * offsets parsed from the alternate REPORT descriptor. */
+            keyboard_input_report_id = 0;
+            keyboard_led_output_report_id = 0;
+            keyboard_led_output_report_len = 1;
+            keyboard_led_output_bit_offsets[0] = 0;
+            keyboard_led_output_bit_offsets[1] = 1;
+            keyboard_led_output_bit_offsets[2] = 2;
         }
         /* The default REPORT protocol is selected before tuh_init(). Starting
          * another control transfer from this mount callback would interrupt
@@ -3224,15 +3541,35 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
                                   dev_addr, instance, NULL);
         kbd_dev_addr = 0;
         kbd_is_mounted = false;
+        keyboard_target_led_state = HID_LED_NUM_LOCK;
+        keyboard_rendered_led_state = 0xFF;
+        keyboard_led_transfer_active = false;
+        keyboard_led_update_pending = false;
         keyboard_last_report_ms = 0;
         keyboard_recovery_after_ms = 0;
         keyboard_halt_recovery_pending = false;
         keyboard_halt_recovery_in_progress = false;
+        keyboard_consecutive_failed_count = 0;
     }
     if (instance < CFG_TUH_HID) {
         hid_receive_rearm_pending[instance] = false;
         memset(&hid_instances[instance], 0, sizeof(hid_instances[instance]));
         hid_activity_valid[instance] = false;
+        hid_last_keyboard_valid[instance] = false;
+        hid_last_consumer_valid[instance] = false;
+        hid_last_delivered_keyboard_valid[instance] = false;
+        hid_last_delivered_consumer_valid[instance] = false;
+        if (instance == kbd_instance) {
+            hid_keyboard_held = false;
+        }
+        hid_consumer_held_by_instance[instance] = false;
+        hid_consumer_held = false;
+        for (uint8_t i = 0; i < CFG_TUH_HID; ++i) {
+            if (hid_consumer_held_by_instance[i]) {
+                hid_consumer_held = true;
+                break;
+            }
+        }
     }
 }
 
@@ -3240,7 +3577,6 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
                                     uint8_t report_id, uint8_t report_type,
                                     uint16_t len)
 {
-    (void)len;
     if (dev_addr != kbd_dev_addr || instance != kbd_instance ||
         report_id != keyboard_led_output_report_id ||
         report_type != HID_REPORT_TYPE_OUTPUT) {
@@ -3248,20 +3584,24 @@ void tuh_hid_set_report_complete_cb(uint8_t dev_addr, uint8_t instance,
     }
 
     keyboard_led_transfer_active = false;
-    keyboard_led_update_pending = false;
+#if HID_DIAGNOSTIC_LOG
+    printf("[LED CB %lu] dev=%u inst=%u id=%u result_len=%u expected_len=%u state=%02x\n",
+           (unsigned long)board_millis(), dev_addr, instance, report_id, len,
+           keyboard_led_output_report_len, keyboard_led_tx_state);
+#endif
+    if (len == keyboard_led_output_report_len) {
+        keyboard_rendered_led_state = keyboard_led_tx_state;
+        keyboard_led_update_pending = false;
+    } else {
+        /* A zero length is TinyUSB's failure indication. Do not claim that
+         * the LED was rendered; the target remains pending for retry. */
+        keyboard_led_update_pending = true;
+    }
     keyboard_last_report_ms = board_millis();
 
-    /* Re-align the host-side EP 0x81 IN toggle after the control transfer:
-     * the SN32 may restart its toggle when it services EP0, and a mismatched
-     * toggle is the leading suspect for the >= 4-key wedges seen during the
-     * LED experiments. This is the same re-alignment the CLEAR_FEATURE
-     * recovery path performs. */
-    pio_usb_host_endpoint_reset_toggle(PIO_USB_ROOT_INDEX, kbd_dev_addr,
-                                       SONIX_KEYBOARD_EP_IN);
-
-    /* Cleanly re-arm keyboard interrupt-IN report after control transfer completion */
-    hid_receive_rearm_pending[instance] = false;
-    (void)tuh_hid_receive_report(dev_addr, instance);
+    /* Cleanly re-arm keyboard interrupt-IN report after control transfer completion.
+     * USB 2.0 Spec §8.6: EP 0x81 data toggles are preserved without resetting. */
+    hid_receive_arm_or_defer(dev_addr, instance);
 }
 
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
@@ -3272,16 +3612,22 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
     bool const hid_changed = hid_report_changed(instance, report, len);
     (void)hid_changed;
 
-#if CONSUMER_DEBUG
+#if CONSUMER_DEBUG || HID_DIAGNOSTIC_LOG
     static uint8_t previous_raw[CFG_TUH_HID][64];
     static uint16_t previous_raw_len[CFG_TUH_HID];
+    static uint32_t raw_last_log_ms;
     bool const raw_changed = instance >= CFG_TUH_HID || len > 64 ||
         previous_raw_len[instance] != len ||
         memcmp(previous_raw[instance], report, len) != 0;
-    if (raw_changed) {
+    bool const raw_log_due = (uint32_t)(board_millis() - raw_last_log_ms) >= 20u;
+    if (raw_changed && raw_log_due) {
         printf("[HID RAW] dev=%u inst=%u len=%u:", dev_addr, instance, len);
-        for (uint16_t i = 0; i < len; ++i) printf(" %02x", report[i]);
+        uint16_t const log_len = len > 64u ? 64u : len;
+        for (uint16_t i = 0; i < log_len; ++i) printf(" %02x", report[i]);
         printf("\n");
+        raw_last_log_ms = board_millis();
+    }
+    if (raw_changed) {
         if (instance < CFG_TUH_HID && len <= 64) {
             memcpy(previous_raw[instance], report, len);
             previous_raw_len[instance] = len;
@@ -3299,25 +3645,75 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
     bool const consumer_report = info != NULL &&
         info->usage_page == HID_USAGE_PAGE_CONSUMER_CONTROL &&
         info->usage == HID_USAGE_CONSUMER_CONTROL;
+    bool const keyboard_report = (info != NULL &&
+        info->usage_page == HID_USAGE_PAGE_DESKTOP &&
+        info->usage == HID_USAGE_DESKTOP_KEYBOARD) ||
+        (info != NULL && info->report_id == 0 &&
+         tuh_hid_interface_protocol(dev_addr, instance) == HID_ITF_PROTOCOL_KEYBOARD);
 
-    if (dev_addr == kbd_dev_addr && instance == kbd_instance) {
+    /* Hardware validated 2026-10-08 on Sonix FS300: the keyboard stream
+     * moves from BOOT EP81 to application EP83 Report ID 1 while the shared
+     * Consumer stream remains Report ID 3. Classify usage per descriptor
+     * report across every HID instance; never restore an instance==kbd_instance
+     * filter or infer a bitmap from len. The global release deduplication below
+     * is part of source handoff between the BOOT and application streams. */
+    if (dev_addr == kbd_dev_addr && keyboard_report) {
         bool const keyboard_xfer_failed = len == 0;
         if (keyboard_xfer_failed) {
-            /* TinyUSB's HID callback exposes both a real STALL and a transient
-             * PIO transport/CRC failure as a zero-length completion. Most
-             * failures are not a STALL, so issuing CLEAR_FEATURE first leaves
-             * EP 0x81 unpolled during a key burst. The completed transfer is
-             * already released by TinyUSB: arm it again immediately below.
-             * A genuine STALL will surface again and remains visible to the
-             * periodic host recovery, without blocking normal input. */
-            keyboard_halt_recovery_pending = false;
-            keyboard_recovery_after_ms = board_millis();
+            hid_poll_force_fast();
+            keyboard_consecutive_failed_count++;
+            if (keyboard_consecutive_failed_count >= 3 &&
+                !keyboard_halt_recovery_in_progress &&
+                !keyboard_halt_recovery_pending) {
+                keyboard_halt_recovery_pending = true;
+                keyboard_recovery_after_ms = board_millis();
+            }
         } else {
+            keyboard_consecutive_failed_count = 0;
             keyboard_last_report_ms = board_millis();
             uint8_t normalized[KBD_REPORT_LEN];
-            if (keyboard_decode_report(report, len, normalized)) {
-                (void)usb_host_event_push(USB_HOST_EVENT_KEYBOARD_REPORT,
-                                          dev_addr, instance, normalized);
+            if (keyboard_decode_report(state, info, payload, payload_len, normalized)) {
+                bool const changed = !hid_last_keyboard_global_valid ||
+                    !hid_keyboard_human_state_equal(
+                        hid_last_keyboard_global, normalized);
+                hid_last_keyboard_valid[instance] = true;
+                memcpy(hid_last_keyboard_report[instance], normalized,
+                       KBD_REPORT_LEN);
+                hid_last_keyboard_global_valid = true;
+                memcpy(hid_last_keyboard_global, normalized, KBD_REPORT_LEN);
+                hid_keyboard_held = false;
+                if (normalized[0] != 0) hid_keyboard_held = true;
+                for (uint8_t i = 2; i < KBD_REPORT_LEN; ++i) {
+                    if (normalized[i] != 0) {
+                        hid_keyboard_held = true;
+                        break;
+                    }
+                }
+                if (changed) hid_poll_note_real_activity();
+
+                bool released = true;
+                if (normalized[0] != 0) released = false;
+                for (uint8_t i = 2; i < KBD_REPORT_LEN; ++i) {
+                    if (normalized[i] != 0) {
+                        released = false;
+                        break;
+                    }
+                }
+                bool const duplicate_release = released &&
+                    hid_last_delivered_keyboard_global_valid &&
+                    memcmp(hid_last_delivered_keyboard_global, normalized,
+                           KBD_REPORT_LEN) == 0;
+                if (!duplicate_release) {
+                    if (usb_host_event_push(USB_HOST_EVENT_KEYBOARD_REPORT,
+                                            dev_addr, instance, normalized)) {
+                        memcpy(hid_last_delivered_keyboard_global, normalized,
+                               KBD_REPORT_LEN);
+                        hid_last_delivered_keyboard_global_valid = true;
+                        memcpy(hid_last_delivered_keyboard[instance],
+                               normalized, KBD_REPORT_LEN);
+                        hid_last_delivered_keyboard_valid[instance] = true;
+                    }
+                }
             }
 #if HOT_PATH_DEBUG
             if (len >= KBD_REPORT_LEN) {
@@ -3330,7 +3726,7 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
         }
 #if HID_DIAGNOSTIC_LOG
         if (hid_changed &&
-            (uint32_t)(keyboard_last_report_ms - keyboard_last_diagnostic_ms) >= 5u) {
+            (uint32_t)(keyboard_last_report_ms - keyboard_last_diagnostic_ms) >= 20u) {
             uint8_t const b0 = len > 0 ? report[0] : 0;
             uint8_t const b1 = len > 1 ? report[1] : 0;
             uint8_t const b2 = len > 2 ? report[2] : 0;
@@ -3349,11 +3745,31 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
 
     if (consumer_report && state != NULL) {
         uint16_t const usage = decode_consumer_usage(state, report, len);
+        bool const changed = !hid_last_consumer_valid[instance] ||
+            hid_last_consumer_usage[instance] != usage;
+        hid_last_consumer_valid[instance] = true;
+        hid_last_consumer_usage[instance] = usage;
+        hid_consumer_held_by_instance[instance] = usage != 0;
+        hid_consumer_held = false;
+        for (uint8_t i = 0; i < CFG_TUH_HID; ++i) {
+            if (hid_consumer_held_by_instance[i]) {
+                hid_consumer_held = true;
+                break;
+            }
+        }
+        if (changed) hid_poll_note_real_activity();
         uint8_t consumer[KBD_REPORT_LEN] = {
             (uint8_t)usage, (uint8_t)(usage >> 8), 0, 0, 0, 0, 0, 0
         };
-        (void)usb_host_event_push(USB_HOST_EVENT_CONSUMER_REPORT,
-                                  dev_addr, instance, consumer);
+        bool const duplicate_release = usage == 0 &&
+            hid_last_delivered_consumer_valid[instance] &&
+            hid_last_delivered_consumer[instance] == 0;
+        if (!duplicate_release &&
+            usb_host_event_push(USB_HOST_EVENT_CONSUMER_REPORT,
+                                dev_addr, instance, consumer)) {
+            hid_last_delivered_consumer[instance] = usage;
+            hid_last_delivered_consumer_valid[instance] = true;
+        }
     }
 
     /* Re-arm every completed transfer, including zero-length failures. A
@@ -3466,6 +3882,7 @@ static void worker_core1_main(void)
 #endif
         spi_ack_poll_task();
 #if WIRELESS_KEYBOARD_OTA_SUPPORT
+        dfu_timeout_task();
         dfu_apply_task();
         dfu_boot_report_task();
 #endif
@@ -3475,17 +3892,11 @@ static void worker_core1_main(void)
 }
 
 /*--------------------------------------------------------------------+
- *  Onboard status LED task (link/mount heartbeat — separate from RGB)
+ *  Onboard status LED task (WeAct GP25 blue LED disabled for power savings)
  *--------------------------------------------------------------------*/
 static void led_blinking_task(void)
 {
-    static uint32_t start_ms = 0;
-    static bool led_state = false;
-    if (!blink_interval_ms) return;
-    if (board_millis() - start_ms < blink_interval_ms) return;
-    start_ms += blink_interval_ms;
-    board_led_write(led_state);
-    led_state = !led_state;
+    /* Kept off permanently to eliminate glare and save power */
 }
 
 /*--------------------------------------------------------------------+
@@ -3496,6 +3907,16 @@ int main(void)
     set_sys_clock_khz(RP2040_SYS_CLOCK_KHZ, true);
 
     board_init();
+
+    /* Force onboard blue LED (GP25) OFF permanently */
+    gpio_init(25);
+    gpio_set_dir(25, GPIO_OUT);
+    gpio_put(25, 0);
+
+    /* Disable physical KEY button (GP23) - no pulls, high impedance */
+    gpio_init(23);
+    gpio_set_dir(23, GPIO_IN);
+    gpio_disable_pulls(23);
 #if RUNTIME_LOGGING
     stdio_init_all();
     sleep_ms(100);
@@ -3559,11 +3980,16 @@ int main(void)
 
         watchdog_update();
         tuh_task();
+        hid_poll_policy_task();
         hid_receive_rearm_task();
         keyboard_halt_recovery_task();
         keyboard_hid_stall_recovery_task();
         keyboard_led_task();
+        keyboard_watchdog_task();
         usb_descriptor_dump_task();
+#if HID_DIAGNOSTIC_LOG
+        hid_endpoint_diagnostic_task();
+#endif
         led_blinking_task();
         /* PIO-USB's repeating 1 ms SOF timer, transactions, and Core 1 __sev()
          * wake WFE instantly without waiting for a hardware interrupt. */
